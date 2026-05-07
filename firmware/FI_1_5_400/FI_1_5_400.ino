@@ -54,7 +54,7 @@
 #define MAX_BRIGHT 150
 
 // To serial
-#define BAUDSerial 9600  // SOFT - FI = 360 - Alterada a macro de SERIAL para BAUDSerial para nao conflitar com SERIAL de outra library que tinha valor 1
+#define BAUDSerial 2400  // SOFT - FI = 360 - Alterada a macro de SERIAL para BAUDSerial para nao conflitar com SERIAL de outra library que tinha valor 1
 #define CMDBUFFER_SIZE 32
 
 // To time
@@ -76,7 +76,7 @@
 #define modeRCBLE1010 "AT+MODE2"
 #define roleSlaveBLE1010 "AT+ROLE0"
 #define delimitBLE1010 "AT+DELI3"
-#define baud9600BLE1010 "AT+BAUD2"
+#define baud9600BLE1010 "AT+BAUD0"
 #define actNotiBLE1010 "AT+NOTI1"
 #define preConnBLE1010 "AT+BEFC020"
 #define posConnBLE1010 "AT+AFTC028"
@@ -462,7 +462,7 @@ long startTime;
 void setup() {
     startTime = millis();
     // Inicializações necessárias
-    Serial.begin(9600);
+    Serial.begin(2400);
     // Outras inicializações, se houver
     Serial.println("Iniciando...");
     setupSerials();
