@@ -86,7 +86,7 @@ async def configurar_ble(uuid, device_name_ble, befc, aftc, modo_busca=False):
     print(f"{prefixo}: {uuid} ---")
     
     commands = [
-        "AT+SHIELD1", "AT+BAUD0", "AT+PWRM1", 
+        "AT+SHIELD1", "AT+BAUD0", "AT+PWRM1", "AT+POWE4","AT+ADVI5",    
         f"AT+BEFC{befc}", f"AT+AFTC{aftc}", 
         f"AT+NAME{device_name_ble}", "AT+NAME?"
     ]
