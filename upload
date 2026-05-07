@@ -1,0 +1,64 @@
+#!/bin/bash
+
+if [ -z "$SEED_SECRET" ]; then
+    echo "Error: SEED_SECRET environment variable is not set."
+    exit 1
+fi
+
+if [[ "$#" -lt 2 || "$#" -gt 3 ]]; then
+    echo "Usage: $0 <serial_number> <hardware_version> [mosfet_pin]"
+    exit 1
+fi
+
+SERIAL_NUMBER=$1
+HARDWARE_VERSION=$2
+HEX_FILE="bin/${HARDWARE_VERSION}.ino.hex"
+
+# Determine the MCU type
+if [[ "$HARDWARE_VERSION" == FI_1_0* ]]; then
+    MCU="m328"
+elif [[ "$HARDWARE_VERSION" == FI_1_5* ]]; then
+    MCU="m328pb"
+else
+    echo "Error: Unsupported hardware version."
+    exit 1
+fi
+
+# Check if hardware version is FI_1_0_400 and require a third parameter
+if [[ "$HARDWARE_VERSION" == "FI_1_0_400" ]]; then
+    if [[ "$#" -ne 3 || ! "$3" =~ ^[789]$ ]]; then
+        echo "Error: FI_1_0_400 requires a valid mosfet pin (7, 8, or 9) as the third parameter."
+        exit 1
+    fi
+    MOSFET_PIN=$3
+    EXTRA_FLAGS="-DpinMosfetBle=$MOSFET_PIN"
+else
+    EXTRA_FLAGS=""
+fi
+
+# Run calibration script
+./seedGenerator.py "$SERIAL_NUMBER"
+if [ $? -ne 0 ]; then
+    echo "Error: seedGenerator.py failed."
+    exit 1
+fi
+
+# Compile the firmware
+arduino-cli compile --build-property build.extra_flags="-Ifirmware/include $EXTRA_FLAGS" \
+    --build-path bin firmware/$HARDWARE_VERSION/$HARDWARE_VERSION.ino
+
+# Upload the firmware
+avrdude -P usb -c usbasp -p "$MCU" -b 19200 \
+    -U lfuse:w:0xFF:m \
+    -U hfuse:w:0xD7:m \
+    -U efuse:w:0xF7:m \
+    -U lock:w:0xCF:m \
+    -U eeprom:w:seed.bin:r \
+    -U flash:w:"$HEX_FILE":a
+
+if [ $? -eq 0 ]; then
+    echo "Flashing successful!"
+else
+    echo "Flashing failed!"
+    exit 1
+fi

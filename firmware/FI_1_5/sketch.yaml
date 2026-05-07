@@ -1,0 +1,12 @@
+profiles:
+  chavi_avr:
+    fqbn: MiniCore:avr:328
+    platforms:
+      - platform: MiniCore:avr (3.0.1)
+        platform_index_url: https://mcudude.github.io/MiniCore/package_MCUdude_MiniCore_index.json
+    libraries:
+      - LowPower_LowPowerLab (2.2)
+      - Adafruit INA219 (1.2.3)
+      - Adafruit BusIO (1.15.0)
+      - FastLED (3.6.0)
+default_profile: chavi_avr

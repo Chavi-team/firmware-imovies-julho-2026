@@ -1,0 +1,9 @@
+*.lst
+*.eep
+*.elf
+*.hex
+*.bin
+build
+bin
+**/logs
+firmware/include/SerialNumber.h
