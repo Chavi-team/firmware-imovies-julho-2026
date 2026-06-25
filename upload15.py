@@ -1,18 +1,38 @@
-#!/usr/bin/env python3
-import os
+import asyncio
 import subprocess
 import sys
-from hashlib import sha256
+import time
+import os
+import re
+from bleak import BleakScanner, BleakClient
 
-# Configuração de Segurança
-secret_key = os.getenv('SEED_SECRET', 'CHAVI')
-seedMaxRange = 429496729
+CHARACTERISTIC_UUID = '0000FFE1-0000-1000-8000-00805F9B34FB'
 
-def get_seed(serial_number, secret_key, seed_number):
-    string = f'{serial_number}{secret_key}{seed_number}'
-    return int(sha256(string.encode()).hexdigest()[:8], 16) % seedMaxRange
+ultima_resposta_versao = ""
+
+def verificar_padrao_valido(mensagem):
+    if not mensagem:
+        return False
+    msg_upper = mensagem.upper()
+    if "SOFT AT" in msg_upper or "CHAVIFI" in msg_upper:
+        return True
+    if re.search(r'\d+FI\d+', msg_upper):
+        return True
+    return False
+
+def notification_handler(sender, data):
+    global ultima_resposta_versao
+    try:
+        mensagem = data.decode('utf-8', errors='ignore').strip()
+        print(f"      📥 Retorno: {mensagem}")
+        if verificar_padrao_valido(mensagem):
+            ultima_resposta_versao = mensagem
+    except:
+        pass
 
 def calculate_hex_commands(mosfet_pin):
+    if not mosfet_pin or str(mosfet_pin).strip() == "":
+        return "000", "000"
     try:
         m_pin = int(mosfet_pin)
         mosfet_bit = m_pin - 3
@@ -27,94 +47,219 @@ def calculate_hex_commands(mosfet_pin):
         befc_hex = f"{int(''.join(map(str, bits_befc[::-1])), 2):03X}"
         aftc_hex = f"{int(''.join(map(str, bits_aftc[::-1])), 2):03X}"
         return befc_hex, aftc_hex
-    except: return "000", "000"
+    except: 
+        return "000", "000"
 
-def main():
-    while True:
-        print("\n" + "═"*60 + "\n  PROCESSO DE PRODUÇÃO CHAVI V1.5\n" + "═"*60)
-        
-        while True:
-            ch = input("Canal (CH) [ex: 002]: ").zfill(3)
-            fi = input("Firmware ID (FI) [ex: 002857]: ").zfill(6)
-            hw_in = input("Hardware Version (apenas números, ex: 15): ")
-            mosfet = input("Mosfet Pin (padrão 8): ") or "8"
-            
-            device_name_ble = f"{ch}FI{fi}"
-            device_id_full = f"CH{ch}FI{fi}"
-            firmware_folder = f"FI{hw_in}400"
-            
-            print(f"\n📢 CONFIRMAÇÃO:")
-            print(f"   ID Serial: {device_id_full}")
-            print(f"   Nome BLE:  {device_name_ble}")
-            print(f"   Pasta:     firmware/{firmware_folder}")
-            print(f"   Mosfet:    Pino {mosfet}")
-            
-            if input("\nDados corretos? (Enter=Sim / n=Não): ").lower() == '': 
-                break
+async def testar_e_filtrar_dispositivo(device, adv, candidatos_validos):
+    if adv.rssi < -75: 
+        return
 
-        # --- GERAÇÃO DE SEEDS ---
-        seeds = [get_seed(device_id_full, secret_key, i + 1) for i in range(4)]
-        befc, aftc = calculate_hex_commands(mosfet)
-
-        # --- HEADER (SerialNumber1.h) ---
-        # Criando a pasta include dentro da pasta do firmware específico
-        include_dir = os.path.abspath(f"firmware/{firmware_folder}/include")
-        os.makedirs(include_dir, exist_ok=True)
-        header_path = os.path.join(include_dir, "SerialNumber1.h")
-        
-        with open(header_path, "w") as f:
-            f.write("// ARQUIVO GERADO AUTOMATICAMENTE\n#ifndef SERIAL_NUMBER_H\n#define SERIAL_NUMBER_H\n\n")
-            f.write(f"#define SERIAL \"{device_name_ble}\"\n")
-            f.write(f"#define MY_PIN_MOSFET {mosfet}\n\n")
-            for i, s in enumerate(seeds):
-                f.write(f"#define SEED_{i+1} {s}UL\n")
-            f.write(f"\n#define AT_NAME   \"AT+NAME{device_name_ble}\\r\"\n")
-            f.write(f"#define AT_BEFC   \"AT+BEFC{befc}\\r\"\n")
-            f.write(f"#define AT_AFTC   \"AT+AFTC{aftc}\\r\"\n")
-            f.write("#define AT_SHIELD \"AT+SHIELD1\\r\"\n#define AT_BAUD \"AT+BAUD0\\r\"\n#define AT_PWRM \"AT+PWRM1\\r\"\n#endif\n")
-
-        print(f"\n✅ Header SerialNumber1.h preparado em: {include_dir}")
-
-        # --- COMPILAÇÃO E GRAVAÇÃO ---
+    respostas_locais = []
+    def filtro_callback(sender, data):
         try:
-            ino_path = os.path.abspath(f"firmware/{firmware_folder}/{firmware_folder}.ino")
+            msg = data.decode('utf-8', errors='ignore').strip()
+            if msg:
+                respostas_locais.append(msg)
+        except:
+            pass
+
+    try:
+        async with BleakClient(device.address, timeout=5.0) as client:
+            if client.is_connected:
+                await asyncio.sleep(1.0)
+                await client.start_notify(CHARACTERISTIC_UUID, filtro_callback)
+
+                # ===== FILTRA PELO AT+ADDR? =====
+                await client.write_gatt_char(CHARACTERISTIC_UUID, b"AT+ADDR?\r\n", response=False)
+                await asyncio.sleep(0.8)
+                
+                if not respostas_locais:
+                    await client.write_gatt_char(CHARACTERISTIC_UUID, b"AT+ADDR?", response=False)
+                    await asyncio.sleep(0.8)
+
+                await client.stop_notify(CHARACTERISTIC_UUID)
+
+                if respostas_locais:
+                    retorno_texto = " | ".join(respostas_locais)
+                    candidatos_validos.append((device, adv, retorno_texto))
+    except:
+        pass
+
+async def scan_and_select():
+    print("\n🔭 Procurando dispositivos (Filtro: Todos que responderem a AT+ADDR?)...")
+    devices_and_adv = await BleakScanner.discover(timeout=4.0, return_adv=True)
+    
+    if not devices_and_adv:
+        print("❌ Nenhum dispositivo Bluetooth detectado.")
+        return None
+    
+    candidatos_validos = []
+    tarefas = []
+
+    for device, adv in devices_and_adv.values():
+        tarefas.append(testar_e_filtrar_dispositivo(device, adv, candidatos_validos))
+    
+    await asyncio.gather(*tarefas)
+
+    if not candidatos_validos:
+        print("❌ Nenhuma placa respondeu ao comando AT+ADDR?.")
+        return None
+    
+    candidatos_validos.sort(key=lambda x: x[1].rssi, reverse=True)
+
+    print(f"\n{'ID':<3} | {'RSSI':<7} | {'ENDEREÇO MAC':<18} | {'RETORNO AT+ADDR?':<30} | {'NOME BLE'}")
+    print("-" * 115)
+    
+    for i, (device, adv, retorno) in enumerate(candidatos_validos):
+        nome = device.name if device.name else "[EM BRANCO]"
+        rssi = adv.rssi
+        alvo = " 🔥 [ALVO]" if rssi > -50 else ""
+        print(f"{i:<3} | {rssi:<4}dBm | {device.address:<18} | {retorno[:30]:<30} | {nome}{alvo}")
+    
+    escolha = input("\nDigite o ID da placa para iniciar a configuração AT (ou 'v' para voltar/buscar novamente): ")
+    if escolha.lower() == 'v': return "voltar"
+    
+    try:
+        idx = int(escolha)
+        return candidatos_validos[idx][0]
+    except:
+        print("❌ Seleção inválida.")
+        return None
+
+async def configurar_ble(uuid, device_name_ble, befc, aftc, modo_busca=False):
+    global ultima_resposta_versao
+    ultima_resposta_versao = ""
+    
+    prefixo = "🔍 Testando" if modo_busca else "--- 🔵 Conectando via comandos AT"
+    print(f"{prefixo}: {uuid} ---")
+    
+    commands = [
+        "AT+SHIELD1", "AT+BAUD0", "AT+PWRM1",   
+        f"AT+BEFC{befc}", f"AT+AFTC{aftc}", 
+        f"AT+NAME{device_name_ble}"
+    ]
+    
+    try:
+        tm_out = 6.0 if modo_busca else 12.0
+        async with BleakClient(uuid, timeout=tm_out) as client:
+            if not client.is_connected: return False
             
-            if not os.path.exists(ino_path):
-                print(f"\n❌ ERRO: Arquivo {ino_path} não encontrado!")
-                continue
-
-            print(f"📦 Compilando {firmware_folder}...")
+            await asyncio.sleep(1.2)
+            await client.start_notify(CHARACTERISTIC_UUID, notification_handler)
             
-            # O SEGREDO ESTÁ AQUI: Passar o caminho da pasta 'include' para o compilador
-            subprocess.run([
-                "arduino-cli", "compile", 
-                "--fqbn", "arduino:avr:uno",
-                "--build-path", "bin",
-                "--build-property", f"compiler.cpp.extra_flags=\"-I{include_dir}\"",
-                ino_path
-            ], check=True)
-
-            print("🚀 Gravando via USBASP...")
-            hex_path = f"bin/{firmware_folder}.ino.hex"
+            await client.write_gatt_char(CHARACTERISTIC_UUID, b"AT+VERS?", response=False)
+            await asyncio.sleep(1.0)
             
-            subprocess.run([
-                "avrdude", "-P", "usb", "-c", "usbasp", "-p", "m328pb", "-e",
-                "-U", "flash:w:" + hex_path + ":i"
-            ], check=True)
+            if not verificar_padrao_valido(ultima_resposta_versao):
+                await client.stop_notify(CHARACTERISTIC_UUID)
+                return False
 
-            print(f"\n✨ SUCESSO: Placa {device_id_full} finalizada!")
-            print("\a") 
+            if modo_busca:
+                print("   ✅ Identificado! Enviando restante das configurações...")
 
-        except subprocess.CalledProcessError as e:
-            print(f"\n❌ ERRO NA EXECUÇÃO: {e}")
-        except Exception as e:
-            print(f"\n❌ ERRO INESPERADO: {e}")
+            for cmd in commands:
+                if modo_busca and cmd == "AT+VERS?": continue
+                await client.write_gatt_char(CHARACTERISTIC_UUID, cmd.encode('utf-8'), response=False)
+                await asyncio.sleep(0.7) 
+            
+            await asyncio.sleep(0.5)
+            await client.stop_notify(CHARACTERISTIC_UUID)
+            return verificar_padrao_valido(ultima_resposta_versao)
+                
+    except:
+        return False
 
-        if input("\n--- PRÓXIMA PLACA? (Enter=Sim / s=Sair): ").lower() == 's':
-            break
+async def busca_automatica(device_name_ble, befc, aftc):
+    print("\n🕵️  Iniciando varredura automática por sinal forte...")
+    scanner_data = await BleakScanner.discover(timeout=4.0, return_adv=True)
+    
+    if not scanner_data:
+        print("❌ Nenhum sinal Bluetooth detectado.")
+        return False
+
+    candidatos = []
+    for addr in scanner_data:
+        device, adv = scanner_data[addr]
+        if adv.rssi > -65:
+            candidatos.append((device, adv.rssi))
+    
+    candidatos.sort(key=lambda x: x[1], reverse=True)
+
+    if not candidatos:
+        print("❌ Nenhuma placa encontrada com sinal forte o suficiente.")
+        return False
+
+    for dev, rssi in candidatos:
+        print(f"📡 Testando dispositivo {dev.address} (Sinal: {rssi}dBm)")
+        sucesso = await configurar_ble(dev.address, device_name_ble, befc, aftc, modo_busca=True)
+        if sucesso:
+            return True
+            
+    return False
+
+async def main():
+    manter_dados = False
+    ch, fi, hw_in, mosfet = "", "", "", ""
+    device_name_ble = ""
+    befc_hex, aftc_hex = "000", "000"
+
+    while True:
+        if not manter_dados:
+            print("\n" + "═"*60 + "\n  PROCESSO DE CONFIGURAÇÃO AT VIA BLE (SEM UPLOAD)\n" + "═"*60)
+            while True:
+                ch = input("Canal (CH): ").zfill(3)
+                fi = input("Firmware ID (FI): ").zfill(6)
+                
+                hw = f"{hw_in[0]}_{hw_in[1]}" if (len(hw_in)==2 and "_" not in hw_in) else hw_in
+                mosfet = input("Mosfet Pin (Aperte Enter se não houver): ").strip()
+                
+                device_name_ble = f"{ch}FI{fi}"
+                
+                print(f"\nCONFIRMAÇÃO CONFIGURAÇÃO: BLE NAME: {device_name_ble} | MOSFET PIN: {mosfet if mosfet else 'NENHUM (000/000)'}")
+                if input("Dados corretos? (Enter=Sim / n=Não): ").lower() == '': break
+            
+            befc_hex, aftc_hex = calculate_hex_commands(mosfet)
+
+        # Roda o scan de seleção
+        target = await scan_and_select()
+        
+        if target == "voltar" or target is None:
+            opcao = input("\n[Enter/s] Buscar Novamente / [n] Mudar dados da Configuração: ").lower()
+            if opcao == 'n':
+                manter_dados = False
+            else:
+                manter_dados = True
+            continue
+
+        manter_dados = False
+
+        # Inicia direto a transmissão Bluetooth dos comandos AT
+        while True:
+            sucesso = await configurar_ble(target.address, device_name_ble, befc_hex, aftc_hex)
+            
+            if sucesso:
+                print(f"\n🎉 SUCESSO: {device_name_ble} configurado via Bluetooth!")
+                print("\a")
+                break
+            else:
+                print(f"\n❌ FALHA NA CONEXÃO VIA COMANDOS AT.")
+                opcao = input("[r] RECONECTAR / [s] BUSCA AUTOMÁTICA / [p] PULAR: ").lower()
+                
+                if opcao == 'r':
+                    continue
+                elif opcao == 's':
+                    if await busca_automatica(device_name_ble, befc_hex, aftc_hex):
+                        print(f"\n🎉 SUCESSO via busca automática!")
+                        print("\a")
+                        break
+                    else:
+                        print("❌ Placa não encontrada na busca automática.")
+                break
+        
+        input("\n--- PRÓXIMA PLACA? (Pressione Enter) ---")
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("\nSaindo...")

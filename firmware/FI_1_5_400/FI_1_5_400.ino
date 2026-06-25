@@ -72,11 +72,14 @@
 // To receive BLE1010
 #define DelimSerial "AT+UTIM0"  // SOFT - FI = 360 - Comando para alterar comportamento de rx dados na serial, 0 = Delimitador (\n ou \r), 1 = Timeout Serial
 #define testBLE1010 "AT"        // Command AT to test
+#define pwrm "AT+PWRM1"  // 
+#define renew "AT+RENEW"  //
+#define POWE7 "AT+PWRM7"  // Command AT to power mode 7
 #define desactDefPasBLE1010 "AT+TYPE0"
 #define modeRCBLE1010 "AT+MODE2"
 #define roleSlaveBLE1010 "AT+ROLE0"
 #define delimitBLE1010 "AT+DELI3"
-#define baud9600BLE1010 "AT+BAUD0"
+#define baud9600BLE1010 "AT+BAUD2"
 #define actNotiBLE1010 "AT+NOTI1"
 #define preConnBLE1010 "AT+BEFC020"
 #define posConnBLE1010 "AT+AFTC028"
@@ -86,6 +89,8 @@
 #define lostConnecBLE1010 "AT+DROP"
 #define ENDFrameVer03 '\n'  // SOFT - FI = 360 - Final de frame para BLE v03
 #define ENDFrameVer04 '\0'  // SOFT - FI = 360 - Final de frame para BLE v04
+#define shield "AT+SHIELD0"
+#pragma 
 
 // Define os comandos BLE e as respostas esperadas para diferentes versões do BLE
 #define PFXVersaoBLE "Soft AT 5.2 ver."     // Prefixo da string de resposta da versao do BLE
@@ -197,6 +202,9 @@ void setupProduction();
 void operateProduction();
 char processCharInput(char *cmdBuffer, const char c);
 void setupCalibration();
+void operateCalibration();
+void setupConfigurationDevice();
+void flushBluetoothBuffer();
 
 // To operate
 void turnOnLEDsDelay(CRGB crgb = CRGB(MAX_BRIGHT, MAX_BRIGHT, MAX_BRIGHT), int atraso = 0);
@@ -677,14 +685,16 @@ char processCharInput(char *cmdBuffer, const char c) {
 //*****************************************************************************************************************
 
 void setupSerials() {
-    Serial.begin(BAUDSerial);     // Monitor Serial Arduino
-    // bluetooth.begin(BAUDSerial);  // Terminal BLE
-    // bluetooth.write("AT+UART1");
-    // bluetooth.write("AT+BAUD0");
-    // bluetooth.end();
-    bluetooth.begin(2400);
+    Serial.begin(BAUDSerial);     // Monitor Serial USB
+    
+    // Inicializa a comunicação serial com o módulo BLE 5.2
+    bluetooth.begin(9600);  
+    
+    // Limpa o lixo de inicialização do buffer
+    while(bluetooth.available() > 0) { 
+        bluetooth.read(); 
+    }
 }
-
 //*****************************************************************************************************************
 // Function to setup pins
 //*****************************************************************************************************************
@@ -748,7 +758,29 @@ void setupBLE01(bool prodOK) {
     //------------------------------------
     // To test commands AT BLE1010
     //------------------------------------
-    rotinaWriteBluetooth("AT+PWRM1");
+    rotinaWriteBluetooth(renew);
+
+    interfaceFI(FADEIN_FADEOUT);
+
+    rotinaWriteBluetooth(testBLE1010);
+
+    interfaceFI(FADEIN_FADEOUT);
+
+    
+    rotinaWriteBluetooth(pwrm);
+    
+    interfaceFI(FADEIN_FADEOUT);
+
+    rotinaWriteBluetooth(DelimSerial);
+
+    interfaceFI(FADEIN_FADEOUT);
+
+    rotinaWriteBluetooth(renew);
+
+    rotinaWriteBluetooth(POWE7);
+      
+    interfaceFI(FADEIN_FADEOUT);
+
     rotinaWriteBluetooth(testBLE1010);
 
     // FIXME Remover quando for implementado a interrupção por timer em interfaceFI
@@ -817,6 +849,9 @@ void setupBLE01(bool prodOK) {
     //------------------------------------
 
     rotinaWriteBluetooth(toStatePIO60);
+
+
+    rotinaWriteBluetooth(resetBLE1010);
 
     //------------------------------------
     // To set the name BLE1010
@@ -2081,6 +2116,7 @@ void clearCMDBuffer() {
 // params, char* TxData, string de dados a ser enviado,
 //         char AddData, byte que deve ser adicionado ao fim da string
 // return, none
+
 void SendDataBLE(const char *TxData, char AddData) {
     uint8_t Aux;                       // SOFT - FI = 360 - Variavel auxiliar para calculos e processamento
     char TempTx[CMDBUFFER_SIZE] = "";  // SOFT - FI = 360 - Array Temporario para armazenar string e manipular bytes de controle
@@ -2088,19 +2124,28 @@ void SendDataBLE(const char *TxData, char AddData) {
     strcpy(TempTx, TxData);        // SOFT - FI = 360 - Copia A string TxData para TempTx
     Aux = strlen(TempTx);          // SOFT - FI = 360 - Calcula tamanho da string TempTx e guarda em Aux
     TempTx[Aux++] = ENDWriteData;  // SOFT - FI = 360 - Carrega na posicao Aux do aray TempTx o byte de ENDWriteData
+    
     switch (VersBLE) {             // SOFT - FI = 360 - Verifica qual a versao do BLE para adicionar o ultimo byte corretamente e compatibilizar com o App
         case VersaoFW(0):
         case VersaoFW(1):
         case VersaoFW(2):
         case VersaoFW(3):
-            TempTx[Aux++] = ENDFrameVer03;  // SOFT - FI = 360 - Carrega na posicao Aux do aray TempTx o byte de ENDFrameVer03
+            TempTx[Aux++] = ENDFrameVer03;  // SOFT - FI = 360 - Carrega na posicao Aux do aray TempTx o byte de ENDFrameVer03 ('\n')
             break;
 
         case VersaoFW(4):
             if (AddData) {                // SOFT - FI = 360 - AddData!= 0 deve adicionar um byte no final da string TempTx, necessario para compatibilizar processos de SETUP e CALIB do app
                 TempTx[Aux++] = AddData;  // SOFT - FI = 360 - Carrega na posicao Aux do aray TempTx o byte de AddData
             }
-            TempTx[Aux++] = ENDFrameVer04;  // SOFT - FI = 360 - Carrega na posicao Aux do aray TempTx o byte de EndFrameVer04
+            TempTx[Aux++] = ENDFrameVer04;  // SOFT - FI = 360 - Carrega na posicao Aux do aray TempTx o byte de EndFrameVer04 ('\0')
+            break;
+
+        case 5: // 💡 CORREÇÃO CRÍTICA: Trata os novos módulos Soft AT 5.2 ver.05
+            if (AddData) {
+                TempTx[Aux++] = AddData;
+            }
+            // Força a quebra de linha física com '\n' compatível com a ver.05 configurada via AT+DELI0
+            TempTx[Aux++] = ENDFrameVer03; 
             break;
 
         default:
@@ -2133,4 +2178,11 @@ float readCurrentInmA() {
         current += ina219.getCurrent_mA();
     }
     return current / nSamples;
+}
+
+
+void flushBluetoothBuffer() {
+    while(bluetooth.available() > 0) {
+        bluetooth.read();
+    }
 }
