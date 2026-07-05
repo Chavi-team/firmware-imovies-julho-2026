@@ -61,7 +61,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.2.2"
+#define FW_VERSION   "2.3.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -72,10 +72,9 @@
 //                 corta de novo) — é o ciclo do FI_1_0_400 de produção.
 // Vantagem extra: acorda por CONEXÃO sem depender do pino de wake PD3.
 // Custo: com o trilho cortado o BOTÃO FÍSICO não funciona (MCU desligado).
-// LIGUE (1) só depois de provar o mecanismo na bancada com o TST-HIB:
-// se o corte funcionar mas o religamento NÃO, a fechadura só volta tirando a
-// bateria — por isso o default é 0 até o teste passar.
-#define FEATURE_HIBERNA_MOSFET  0
+// ✅ PROVADO em bancada (05/07 12:42, CH003FI003066 v2.2.2): TST-HIB cortou
+// (silêncio) e a reconexão religou o MCU com PONG imediato. LIGADO.
+#define FEATURE_HIBERNA_MOSFET  1
 
 // ---- pinos (iguais ao FI_1_5/_400 que funciona em campo) ----
 #define PIN_BLE_RX   PIN_PD4
