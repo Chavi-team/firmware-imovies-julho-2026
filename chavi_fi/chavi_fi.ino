@@ -61,7 +61,21 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.1.0"
+#define FW_VERSION   "2.2.0"
+
+// ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
+// Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
+// gate é o PIO8 do módulo BLE (PIO8 ALTO = eletrônica LIGADA):
+//   AT+PIO80  -> corta o trilho NA HORA (o MCU DESLIGA; consumo ~zero)
+//   AT+AFTC028 -> ao CONECTAR o módulo religa o PIO8 -> o MCU dá boot e atende
+//   AT+BEFC020 -> ao DESCONECTAR religa também (o MCU boota, faz manutenção e
+//                 corta de novo) — é o ciclo do FI_1_0_400 de produção.
+// Vantagem extra: acorda por CONEXÃO sem depender do pino de wake PD3.
+// Custo: com o trilho cortado o BOTÃO FÍSICO não funciona (MCU desligado).
+// LIGUE (1) só depois de provar o mecanismo na bancada com o TST-HIB:
+// se o corte funcionar mas o religamento NÃO, a fechadura só volta tirando a
+// bateria — por isso o default é 0 até o teste passar.
+#define FEATURE_HIBERNA_MOSFET  0
 
 // ---- pinos (iguais ao FI_1_5/_400 que funciona em campo) ----
 #define PIN_BLE_RX   PIN_PD4
@@ -100,6 +114,7 @@
 #define EE_SERIAL       769    // 11 chars sem "CH"
 #define EE_MOD_CFG      910    // 0xC9 = módulo já provisionado (baud+config+nome)
 #define MOD_CFG_MAGIC   0xC9
+#define EE_HIB          911    // 1 = desligou hibernando (boot seguinte = wake)
 
 // ---- protocolo ----
 #define CMD_ABRIR   1
@@ -131,6 +146,7 @@ uint8_t g_moduloVers = 0;      // 3 (ver.03), 4 (ver.04+) ou 0 (não leu)
 char serialFech[12] = {0};
 volatile bool acordouBLE = false, acordouBtn = false;
 bool moduloOk = false;
+bool g_wakeHib = false;        // este boot foi um "acordar da hibernação"
 
 // Canal de RESPOSTA (sempre BLE neste build; Stream* mantido p/ um futuro
 // modo cabo em placa com pads acessíveis).
@@ -413,6 +429,22 @@ void testeBancada(const String& t) {
     if (t.startsWith("TST-BAT"))  { enviaBateria(); return; }
     if (t.startsWith("TST-INFO")) { enviaInfo(); return; }
     if (t.startsWith("TST-ROCKY")) { melodiaRocky(); enviaLinha("OK-ROCKY"); return; }
+    // Prova do mecanismo de hibernação: manda o módulo cortar o trilho (PIO80).
+    // Se funcionar, a fechadura DESLIGA aqui (a conexão cai) e deve RELIGAR ao
+    // conectar de novo (AFTC028 sobe o PIO8 -> MCU boota). Se depois de 3s
+    // ainda estivermos vivos, o módulo não cortou -> "HIB-FALHOU".
+    if (t.startsWith("TST-HIB")) {
+        enviaLinha("OK-HIB");
+        DBGLN(F("[hib] cortando o trilho via AT+PIO80..."));
+        delay(1200);                        // a resposta sai antes do corte
+        EEPROM.update(EE_HIB, 1);
+        at("AT+PIO80", 60);
+        delay(3000);
+        EEPROM.update(EE_HIB, 0);
+        DBGLN(F("[hib] ainda vivo = modulo nao cortou"));
+        enviaLinha("HIB-FALHOU");
+        return;
+    }
     if (t.startsWith("TST-ALL"))  {
         enviaLinha("OK-BUZ-INI"); beep(120, 1500); beep(120, 2000); beep(180, 2500); enviaLinha("OK-BUZ");
         testeLeds(); enviaLinha("OK-LED");
@@ -505,6 +537,18 @@ void atenderBotao() {
 // Motor fica OUTPUT LOW (nunca Hi-Z — evita shoot-through na ponte H).
 void dormir() {
     motorPara();
+#if FEATURE_HIBERNA_MOSFET
+    // Hibernação profunda: derruba a conexão e manda o módulo cortar o trilho.
+    // Se o corte funcionar, MORREMOS AQUI; o módulo religa na próxima conexão
+    // (AFTC028) e o boot com EE_HIB=1 vai direto atender o app. Se em 3s ainda
+    // estivermos vivos (módulo não obedeceu), cai no powerDown normal.
+    at("AT+DROP", 60);
+    EEPROM.update(EE_HIB, 1);
+    at("AT+PIO80", 60);
+    delay(3000);
+    EEPROM.update(EE_HIB, 0);
+    DBGLN(F("[hib] modulo nao cortou - powerDown normal"));
+#endif
     at("AT+DROP", 60); at("AT+PIO60", 60);
     acordouBLE = false; acordouBtn = false;
     attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), isrBtn, FALLING);
@@ -551,6 +595,8 @@ void setup() {
     EEPROM.get(EE_SEED02, seed02);
     g_moduloVers = EEPROM.read(EE_VERS_BLE);
     if (g_moduloVers != 3 && g_moduloVers != 4) g_moduloVers = 0;
+    g_wakeHib = (EEPROM.read(EE_HIB) == 1);
+    if (g_wakeHib) EEPROM.update(EE_HIB, 0);
 
     DBG(F("[boot] serial=")); DBG(serialFech[0] ? serialFech : "(fabrica)");
     DBG(F(" calib=")); DBG(calibrationOk);
@@ -559,7 +605,13 @@ void setup() {
 
     // Rádio: 2400 fixo. 1º boot após gravar = provisionamento completo
     // (converge baud + config + nome + reset); boots seguintes = config leve.
+    // Boot de WAKE da hibernação = caminho RÁPIDO: o módulo já está configurado
+    // e tem um app conectado ESPERANDO — nada de config/melodia, só atender.
     bluetooth.begin(BAUD_MODULO);
+    if (g_wakeHib) {
+        DBGLN(F("[boot] wake da hibernacao - atendendo direto"));
+        return;                              // loop() atende já no 1º giro
+    }
     if (EEPROM.read(EE_MOD_CFG) != MOD_CFG_MAGIC) {
         bleProvisionar();
     } else {
@@ -578,6 +630,10 @@ void setup() {
 }
 
 void loop() {
+    if (g_wakeHib) {                     // boot veio da hibernação: o app já está
+        g_wakeHib = false;               // conectado esperando — atende primeiro
+        atenderApp();
+    }
     dormir();                            // powerDown; acorda no connect (PD3), botão
                                          // ou DADOS no RX (PCINT do SoftwareSerial)
     DBG(F("[wake] btn=")); DBG(acordouBtn); DBG(F(" ble=")); DBGLN(acordouBLE);
