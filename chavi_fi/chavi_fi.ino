@@ -538,11 +538,14 @@ void atenderBotao() {
 void dormir() {
     motorPara();
 #if FEATURE_HIBERNA_MOSFET
-    // Hibernação profunda: derruba a conexão e manda o módulo cortar o trilho.
-    // Se o corte funcionar, MORREMOS AQUI; o módulo religa na próxima conexão
-    // (AFTC028) e o boot com EE_HIB=1 vai direto atender o app. Se em 3s ainda
-    // estivermos vivos (módulo não obedeceu), cai no powerDown normal.
-    at("AT+DROP", 60);
+    // Hibernação profunda — receita EXATA do goToSleep() do FI_1_0_400 de
+    // produção (lá o LowPower.powerDown está COMENTADO: o sono da placa _400
+    // É o corte do trilho): AT+DROP -> AT+PIO61 -> AT+PIO80. Morremos no
+    // PIO80; o AFTC028 religa o trilho quando um celular conecta e o boot com
+    // EE_HIB=1 vai direto atender o app. Se em 3s ainda estivermos vivos
+    // (módulo não obedeceu o corte), cai no powerDown normal.
+    at("AT+DROP", 500);
+    at("AT+PIO61", 500);
     EEPROM.update(EE_HIB, 1);
     at("AT+PIO80", 60);
     delay(3000);
