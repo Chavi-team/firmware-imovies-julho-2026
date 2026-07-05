@@ -636,6 +636,49 @@ def act_renomear(serial, nome_errado):
     return False
 
 
+# Diagnóstico + conserto do módulo PELO AR (AT remoto): pergunta VERS/BAUD/
+# MODE/ROLE, força a UART do módulo p/ 2400 (AT+BAUD0 + RESET) e re-testa o
+# PING. Salva o caso "módulo bom mas UART em baud errado" — que é indistinguível
+# de solda quebrada até se perguntar AT+BAUD? pelo ar.
+def act_consertar_modulo(serial):
+    alvo = serial[2:] if serial.startswith("CH") else serial
+    LOG(f"🩺 Diagnóstico do módulo '{alvo}' pelo ar...", "hi")
+    try:
+        addr = BLE.scan(alvo, timeout=8.0)
+        if not addr:
+            LOG("✗ Não está anunciando. Religue a bateria.", "err"); return False
+        BLE.connect(addr)
+    except Exception as e:
+        LOG(f"✗ Erro ao conectar: {e}", "err"); return False
+    for q in ("AT+VERS?", "AT+BAUD?", "AT+MODE?", "AT+ROLE?"):
+        BLE.cmd(q, ["ver", "OK", "+", "Get"], timeout=2)   # respostas vão pro log
+        time.sleep(0.3)
+    LOG("Forçando a UART do módulo para 2400 (AT+BAUD0) + reset...", "hi")
+    BLE.cmd("AT+BAUD0", ["OK", "+"], timeout=2)
+    time.sleep(0.4)
+    BLE.cmd("AT+RESET", ["OK", "+"], timeout=2)
+    BLE.disconnect()
+    LOG("Aguardando o módulo reiniciar (4s) e re-testando o PING...", "hi")
+    time.sleep(4)
+    try:
+        addr2 = BLE.scan(alvo, timeout=10.0)
+        if not addr2:
+            LOG("✗ Sumiu do scan após o reset — religue a bateria e rode o passo 3.", "warn")
+            return False
+        BLE.connect(addr2)
+    except Exception as e:
+        LOG(f"✗ Erro ao reconectar: {e}", "err"); return False
+    for i in range(6):
+        ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=3)
+        if ok:
+            LOG("✓✓ PONG! A UART do módulo estava em baud errado — PLACA RECUPERADA. "
+                "Rode o auto-teste completo.", "ok")
+            return True
+    LOG("✗ Sem PONG mesmo com a UART forçada a 2400 e módulo comprovadamente bom "
+        "→ solda/trilha TX-RX entre módulo e MCU = DEFEITO FÍSICO (laudo fechado).", "err")
+    return False
+
+
 def act_finalizar(serial):
     if BLE.conectado():
         BLE.disconnect()
@@ -862,6 +905,14 @@ function renderSteps(){
       body:JSON.stringify({serial:SERIAL,nomeErrado:errado.trim()})}).catch(()=>{});
   };
   comp.appendChild(ren);
+  // diagnostica e conserta a UART do módulo pelo ar (baud errado etc.)
+  const con=document.createElement("button");
+  con.textContent="🩺 Consertar módulo";
+  con.onclick=async()=>{
+    await fetch("/api/consertar",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({serial:SERIAL})}).catch(()=>{});
+  };
+  comp.appendChild(con);
 }
 
 function setChip(step,state){
@@ -1036,6 +1087,9 @@ class Handler(BaseHTTPRequestHandler):
             act_finalizar(b.get("serial", "")); self._send(200, {"ok": True}); return
         if self.path == "/api/renomear":
             ok = act_renomear(b.get("serial", ""), b.get("nomeErrado", ""))
+            self._send(200, {"ok": bool(ok)}); return
+        if self.path == "/api/consertar":
+            ok = act_consertar_modulo(b.get("serial", ""))
             self._send(200, {"ok": bool(ok)}); return
         if self.path == "/api/login/generate":
             ok = BACKEND.solicitar_otp(b.get("phone", ""), CFG.get("country", "55"))
