@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.5.1"
+#define FW_VERSION   "2.6.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -351,36 +351,62 @@ void configModuloLeve() {
     if (g_moduloVers == 3) at("AT+STATUS8");  // módulos ver.03: wake por STATUS
 }
 
-// Config COMPLETA — só na 1ª vez após gravar (flag EE_MOD_CFG; o seed.bin zera
-// o byte, então toda regravação re-provisiona). Espelha a esteira at.js:
-// SHIELD1 -> BAUD0(2400) -> PWRM1 -> config -> NAME -> RESET.
+// Provisionamento COMPLETO com DESCONTAMINAÇÃO — só na 1ª vez após gravar
+// (flag EE_MOD_CFG; o seed.bin zera o byte, então toda regravação re-provisiona
+// do zero). Três passos, todos ÀS CEGAS (clones não respondem "OK" a "AT"
+// pelado — detecção por resposta dá falso-positivo/negativo; determinístico é
+// mandar em todos os bauds e deixar o baud certo obedecer):
+//
+//  PASSO 0 — RESET DE FÁBRICA do módulo (AT+RENEW / AT+DEFAULT) em TODOS os
+//    bauds. Limpa QUALQUER resíduo de provisionamentos/experimentos antigos
+//    que persiste na NVM do módulo e pode até IMPEDIR O ANÚNCIO: ROLE1
+//    (módulo virou central), IMME1 (só anuncia após AT+START), ADTY errado
+//    (anúncio não-conectável), PWRM, baud e nome tortos. Volta ao default.
+//  PASSO 1 — CONVERGE para 2400: AT+BAUD0 + AT+RESET em cada baud candidato.
+//  PASSO 2 — CONFIG COMPLETA a 2400: o lote AT da esteira de produção
+//    (SHIELD1/BAUD0/PWRM1) + anti-resíduo (ROLE0/IMME0/ADTY0/START) + a config
+//    de dados/wake (configModuloLeve) + NAME + RESET final.
+//
+// Custo: ~20s, uma vez por gravação (na bancada). A melodia de "pronta" só
+// toca no fim — o operador já espera por ela.
 void bleProvisionar() {
     DBGLN(F("[prov] provisionamento completo do modulo (1o boot)"));
     beep(50, 1200); beep(50, 1200);            // "configurando o rádio, aguarde"
-    // 1) Converge o módulo p/ 2400 ÀS CEGAS: manda AT+BAUD0+AT+RESET em cada
-    //    baud candidato. No baud real o módulo obedece; nos outros é lixo
-    //    ignorado. (Clones não respondem "OK" a "AT" pelado -> detecção por
-    //    resposta dá falso-negativo; às cegas é determinístico.)
-    if (!bleVivo()) {                          // já está em 2400? pula a varredura
-        DBGLN(F("[prov] mudo a 2400 -> varrendo bauds (AT+BAUD0+RESET as cegas)"));
-        const long cands[] = {9600, 38400, 19200, 57600, 4800};
-        for (uint8_t i = 0; i < sizeof(cands) / sizeof(long); i++) {
-            DBG(F("[prov] tentando baud ")); DBGLN(cands[i]);
-            bluetooth.begin(cands[i]);
-            delay(30);
-            at("AT", 120);                     // acorda (PWRM)
-            at("AT+BAUD0", 250);               // -> 2400
-            at("AT+RESET", 150);
-            delay(600);                        // módulo reinicia
-        }
-        bluetooth.begin(BAUD_MODULO);
-        delay(100);
+
+    static const long TODOS[] = {2400, 9600, 38400, 19200, 57600, 4800, 115200, 1200};
+    const uint8_t N = sizeof(TODOS) / sizeof(long);
+
+    // PASSO 0 — reset de fábrica às cegas (RENEW p/ HM-10, DEFAULT p/ clones;
+    // o que o módulo não conhecer ele ignora).
+    for (uint8_t i = 0; i < N; i++) {
+        bluetooth.begin(TODOS[i]);
+        delay(30);
+        at("AT", 120);                         // acorda (PWRM)
+        at("AT+RENEW", 300);
+        at("AT+DEFAULT", 300);
+        delay(400);                            // módulo re-inicializa nos defaults
     }
 
-    // 2) Config completa a 2400 (mesmo lote AT da esteira de produção).
+    // PASSO 1 — converge p/ 2400 (pós-RENEW o módulo está no baud de fábrica).
+    for (uint8_t i = 0; i < N; i++) {
+        if (TODOS[i] == 2400) continue;        // 2400 já é o alvo
+        bluetooth.begin(TODOS[i]);
+        delay(30);
+        at("AT", 120);
+        at("AT+BAUD0", 250);                   // -> 2400 (tabela deste lote)
+        at("AT+RESET", 150);
+        delay(600);                            // módulo reinicia
+    }
+    bluetooth.begin(BAUD_MODULO);
+    delay(100);
+
+    // PASSO 2 — config completa a 2400.
     at("AT+SHIELD1");
     at("AT+BAUD0");                            // reafirma (só vale após reset)
     at("AT+PWRM1");                            // sem auto-sleep do módulo
+    at("AT+ROLE0");                            // slave (ROLE1 residual = não anuncia)
+    at("AT+IMME0");                            // anuncia sozinho ao ligar
+    at("AT+ADTY0");                            // anúncio conectável
     g_moduloVers = bleLerVersao();
     DBG(F("[prov] AT+VERS? -> geracao ")); DBGLN(g_moduloVers);
     EEPROM.update(EE_VERS_BLE, g_moduloVers);
@@ -388,6 +414,7 @@ void bleProvisionar() {
     char cmd[24];
     snprintf(cmd, sizeof(cmd), "AT+NAME%s", serialFech[0] ? serialFech : "CHAVIFI");
     at(cmd, 250);
+    at("AT+START", 150);                       // se IMME1 residual, inicia o anúncio
     // Flag ANTES do reset final: se a bateria afundar durante o reset/espera,
     // o provisionamento não fica re-rodando (pesado) em todo boot.
     EEPROM.update(EE_MOD_CFG, MOD_CFG_MAGIC);
