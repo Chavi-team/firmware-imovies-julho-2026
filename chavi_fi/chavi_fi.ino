@@ -61,7 +61,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.3.2"
+#define FW_VERSION   "2.3.3"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -98,6 +98,12 @@
 #define JANELA_MS    20000     // ocioso E desconectado: dorme após isso
 #define JANELA_TST   60000     // janela estendida durante testes de bancada
 #define JANELA_MAX   600000UL  // teto absoluto acordada (10 min) — mesmo conectada
+
+// Gap entre NOTIFICAÇÕES consecutivas. ⚠️ ESTE lote de módulo ("Soft BLE 5.2")
+// IGNORA o '\n' e fatia as notificações por TEMPO: writes a <~50ms colam numa
+// notificação só (o app espera 2 -> F05). Com 60ms já separava (v2.2.x);
+// 150ms dá folga e ainda fica bem dentro do timeout de 3s do app.
+#define GAP_NOTIF_MS 150
 
 #define BTN_CURTO_MS   800     // até aqui = toque curto (toggle do motor)
 #define BTN_RESET_MS   10000   // segurar até aqui = reset total
@@ -344,7 +350,7 @@ void enviaLinha(const char* s) { io->print(s); io->print('\n'); io->flush(); del
 
 // "11" em dobro: o app espera 2 notificações — com 2 linhas o completer fecha
 // na hora. (Uma linha só também passa, mas só depois do timeout de 5s.)
-void envia11Duplo() { enviaLinha("11"); delay(120); enviaLinha("11"); }
+void envia11Duplo() { enviaLinha("11"); delay(GAP_NOTIF_MS); enviaLinha("11"); }
 
 // ---- abrir/fechar: manda o status e gira (tabela de sentido do FI_1_5) ----
 // Confirmação IGUAL à de produção: println(status + bateria) -> "1004.09"
@@ -385,7 +391,7 @@ void calibSalvar(uint8_t aberto) {
     beep(60, 2600);
     delay(1000);
     enviaLinha("11");
-    delay(120);
+    delay(GAP_NOTIF_MS);
     enviaLinha(aberto ? "2" : "1");
     motorGira(false);
     if (aberto) { delay(300); motorGira(true); }
@@ -532,15 +538,14 @@ void atenderApp() {
         if (v <= 2100000UL) {
             t0 = millis();
             unsigned long rA = random(1, 9999), rB = random(1, 9999);
-            // FRAMING DE PRODUÇÃO: cada salto numa NOTIFICAÇÃO separada, com
-            // '\n' ("%lu\n"); módulo ver.03 leva '\n' DUPLO como o FI_1_5
-            // (SEEDDelimData compat v03). Par-numa-linha duplicado fazia o
-            // app ler respA 2x -> salto2 ≈ seed1−seed2 (milhões) -> LFSR
-            // infinito -> APP CONGELADO na modal.
+            // O QUE O APP ESPERA: 2 notificações, cada uma com UM salto.
+            // Neste lote de módulo a separação é por TEMPO (GAP_NOTIF_MS) —
+            // 20ms colava os dois numa notificação só (F05); par-numa-linha
+            // duplicado fazia o app ler respA 2x e congelar no LFSR.
             char buf[16];
             snprintf(buf, sizeof(buf), (g_moduloVers == 3) ? "%lu\n" : "%lu", rA + v + seed01);
             enviaLinha(buf);
-            delay(20);
+            delay(GAP_NOTIF_MS);
             snprintf(buf, sizeof(buf), (g_moduloVers == 3) ? "%lu\n" : "%lu", rB + v + seed02);
             enviaLinha(buf);
             step = 1; continue;
