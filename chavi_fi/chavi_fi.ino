@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.5.0"
+#define FW_VERSION   "2.5.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -479,6 +479,34 @@ void testeLeds() {
     FastLED.show();
 }
 
+// Teste de motor com LAUDO ELÉTRICO: gira o pulso de bancada medindo a
+// corrente no INA219 e reporta a média. Interpretação (p/ o laudo do
+// fornecedor): ~0-15mA = circuito ABERTO (fio/motor desconectado — a ponte
+// acionou e nada fluiu); ~30-300mA = motor girando; >300mA = travado.
+void motorTesteCorrente(bool sentidoA, const char* fim) {
+    char buf[20];
+    if (inaOk) {
+        ina219.powerSave(false);
+        motorLiga(sentidoA);
+        delay(120);                          // ignora o pico de arranque
+        float soma = 0; uint16_t n = 0;
+        unsigned long t0 = millis();
+        while (millis() - t0 < (MOTOR_TST_MS - 120)) {
+            soma += fabs(ina219.getCurrent_mA()); n++;
+        }
+        motorPara();
+        ina219.powerSave(true);
+        char num[10];
+        dtostrf(n ? soma / n : 0, 0, 0, num);
+        snprintf(buf, sizeof(buf), "CORRENTE:%smA", num);
+        enviaLinha(buf);
+    } else {
+        motorGiraMs(sentidoA, MOTOR_TST_MS);
+        enviaLinha("CORRENTE:SEM-INA");
+    }
+    enviaLinha(fim);
+}
+
 void enviaBateria() {
     float v = analogRead(PIN_BAT) * (5.0f / 1024.0f);
     char buf[16], num[8];
@@ -514,8 +542,8 @@ void testeBancada(const String& t) {
         enviaLinha("OK-BUZ"); return;
     }
     if (t.startsWith("TST-LED"))  { testeLeds(); enviaLinha("OK-LED"); return; }
-    if (t.startsWith("TST-MOT1")) { enviaLinha("OK-MOT1"); delay(20); motorGiraMs(true,  MOTOR_TST_MS); enviaLinha("FIM-MOT1"); return; }
-    if (t.startsWith("TST-MOT2")) { enviaLinha("OK-MOT2"); delay(20); motorGiraMs(false, MOTOR_TST_MS); enviaLinha("FIM-MOT2"); return; }
+    if (t.startsWith("TST-MOT1")) { enviaLinha("OK-MOT1"); delay(20); motorTesteCorrente(true,  "FIM-MOT1"); return; }
+    if (t.startsWith("TST-MOT2")) { enviaLinha("OK-MOT2"); delay(20); motorTesteCorrente(false, "FIM-MOT2"); return; }
     if (t.startsWith("TST-BAT"))  { enviaBateria(); return; }
     if (t.startsWith("TST-INFO")) { enviaInfo(); return; }
     if (t.startsWith("TST-ROCKY")) { melodiaRocky(); enviaLinha("OK-ROCKY"); return; }
