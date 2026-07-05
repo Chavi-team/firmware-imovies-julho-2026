@@ -413,6 +413,11 @@ def _placa_de(mcu):
     return "fi15" if mcu == "m328pb" else "fi10"
 
 
+# Chip que REALMENTE funcionou no Gravar (o retry de assinatura pode divergir
+# do select da tela) — o Validar usa este, não o do select.
+MCU_REAL = {}
+
+
 def act_gravar(serial, mcu):
     STATUS("gravar", "run")
     os.makedirs(BIN_DIR, exist_ok=True)
@@ -441,6 +446,7 @@ def act_gravar(serial, mcu):
                          "-U", "efuse:w:0xF7:m", "-U", "lock:w:0xCF:m",
                          "-U", f"eeprom:w:{seed_bin}:r", "-U", f"flash:w:{HEX}:i"])
         if rc == 0:
+            MCU_REAL[serial] = m
             LOG(f"✓ {serial} gravada (chip {m}, placa {_placa_de(m)}). 1 bipe = viva; "
                 "aguarde a MELODIA (Rocky) = pronta. 4 bipes graves = módulo mudo.", "ok")
             STATUS("gravar", "ok"); return True
@@ -453,8 +459,20 @@ def act_gravar(serial, mcu):
 def act_validar(serial, mcu):
     STATUS("validar", "run")
     eep = os.path.join(BIN_DIR, "_verify_eeprom.bin")
-    rc, _ = _exec(["avrdude", "-P", "usb", "-c", AVR_PROG, "-p", mcu, "-b", "19200", "-B", "8",
-                   "-U", f"eeprom:r:{eep}:r"])
+    # usa o chip que o Gravar descobriu; se não houver, tenta os 3 (assinatura)
+    preferido = MCU_REAL.get(serial, mcu)
+    candidatos = [preferido] + [m for m in ("m328pb", "m328p", "m328") if m != preferido]
+    rc = 1
+    for i, m in enumerate(candidatos):
+        if i > 0:
+            LOG(f"Assinatura não bateu — relendo como {m}...", "warn")
+        rc, out = _exec(["avrdude", "-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
+                         "-U", f"eeprom:r:{eep}:r"])
+        if rc == 0:
+            MCU_REAL[serial] = m
+            break
+        if "signature" not in out.lower():
+            break
     if rc != 0 or not os.path.exists(eep):
         LOG("✗ Não consegui reler a fechadura.", "err"); STATUS("validar", "fail"); return False
     with open(eep, "rb") as f:
