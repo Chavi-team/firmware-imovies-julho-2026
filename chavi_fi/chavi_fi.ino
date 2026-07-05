@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.4.0"
+#define FW_VERSION   "2.4.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -405,13 +405,18 @@ void calibAceitar() {
     envia11Duplo();        // de 1000ms do calibrarpt1 antes de escutar)
 }
 
-// Recebeu "CALIBRACAO-FI": gira o sentido A (= rotateMotor01 do FI_1_5) para o
-// instalador ver para que lado a porta vai, e confirma.
+// Recebeu "CALIBRACAO-FI": confirma e gira o sentido A (= rotateMotor01 do
+// FI_1_5) para o instalador ver para que lado a porta vai.
+// ORDEM: o "11" sai ANTES do giro — o giro de DEMO numa fechadura sem carga
+// (bancada) nunca atinge o batente de corrente e rodaria os 10s de teto,
+// estourando o timeout do app ("Erro ao calibrar"). E a demo usa PULSO
+// determinístico (1,5s, sem INA219): ela só mostra o SENTIDO; batente por
+// corrente fica para os giros reais (abrir/fechar/retorno da calibração).
 void calibGirar() {
     beep(60, 2200);
-    motorGira(true);       // 1s de giro — o próprio giro consome o delay
-    delay(300);            // total ~1,4s após a recepção
+    delay(1150);           // o app arma o listener ~1s após escrever
     envia11Duplo();
+    motorGiraMs(true, 1500);
 }
 
 // Recebeu "PORTA-ABERTA"(1) / "PORTA-FECHADA"(0): salva o sentido e faz o giro
