@@ -593,6 +593,49 @@ def act_cadastrar(serial, mcu):
     LOG("✗ Falha ao cadastrar.", "err"); STATUS("cadastrar", "fail"); return False
 
 
+# Renomeia o MÓDULO pelo ar (AT remoto do MODE2): conecta no nome ERRADO que
+# está no scan e manda AT+NAME<serial-sem-CH> + AT+RESET direto pro módulo —
+# não passa pela UART MCU↔módulo (que é justamente o que está quebrado quando
+# o nome fica preso/corrompido, ex. '803FI002485' com bit trocado).
+def act_renomear(serial, nome_errado):
+    alvo = serial[2:] if serial.startswith("CH") else serial
+    nome_errado = nome_errado.strip()
+    if not nome_errado or nome_errado == alvo:
+        LOG("Informe o nome ERRADO exatamente como aparece no scan.", "err")
+        return False
+    LOG(f"Renomear módulo: '{nome_errado}' → '{alvo}' (AT remoto via BLE)", "hi")
+    try:
+        addr = BLE.scan(nome_errado, timeout=8.0)
+    except Exception as e:
+        LOG(f"✗ Erro no scan: {e}", "err"); return False
+    if not addr:
+        LOG(f"✗ '{nome_errado}' não está anunciando. Religue a bateria e tente de novo.", "err")
+        return False
+    try:
+        BLE.connect(addr)
+    except Exception as e:
+        LOG(f"✗ Erro ao conectar: {e}", "err"); return False
+    # Clones nem sempre respondem — manda 2x e segue (best-effort).
+    for _ in range(2):
+        BLE.cmd(f"AT+NAME{alvo}", ["OK", "NAME"], timeout=2)
+        time.sleep(0.4)
+    BLE.cmd("AT+RESET", ["OK"], timeout=2)
+    BLE.disconnect()
+    LOG("Comandos enviados. Aguardando o módulo reiniciar (4s)...", "hi")
+    time.sleep(4)
+    try:
+        addr2 = BLE.scan(alvo, timeout=10.0)
+    except Exception:
+        addr2 = None
+    if addr2:
+        LOG(f"✓ Módulo renomeado: '{alvo}' está anunciando. Use o passo 3 normalmente.", "ok")
+        return True
+    LOG("Ainda não apareceu com o nome novo — RELIGUE A BATERIA e escaneie de "
+        "novo (alguns módulos só aplicam o nome no próximo boot). Se voltar com "
+        "o nome ERRADO, o módulo não aceita AT remoto → físico.", "warn")
+    return False
+
+
 def act_finalizar(serial):
     if BLE.conectado():
         BLE.disconnect()
@@ -809,6 +852,16 @@ function renderSteps(){
   const comp=$("#comp"); comp.innerHTML="";
   for(const t of TESTES){ const b=document.createElement("button");
     b.textContent=t.label; b.onclick=()=>teste1(t); comp.appendChild(b); }
+  // renomeia o módulo pelo ar (nome residual/corrompido de gravação antiga)
+  const ren=document.createElement("button");
+  ren.textContent="🔧 Renomear módulo";
+  ren.onclick=async()=>{
+    const errado=prompt("Nome ERRADO que aparece no scan (ex.: 803FI002485):");
+    if(!errado)return;
+    await fetch("/api/renomear",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({serial:SERIAL,nomeErrado:errado.trim()})}).catch(()=>{});
+  };
+  comp.appendChild(ren);
 }
 
 function setChip(step,state){
@@ -981,6 +1034,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True}); return
         if self.path == "/api/finalize":
             act_finalizar(b.get("serial", "")); self._send(200, {"ok": True}); return
+        if self.path == "/api/renomear":
+            ok = act_renomear(b.get("serial", ""), b.get("nomeErrado", ""))
+            self._send(200, {"ok": bool(ok)}); return
         if self.path == "/api/login/generate":
             ok = BACKEND.solicitar_otp(b.get("phone", ""), CFG.get("country", "55"))
             self._send(200, {"ok": ok}); return
