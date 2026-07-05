@@ -58,10 +58,12 @@
 #include <EEPROM.h>
 #include <SoftwareSerial.h>
 #include <avr/wdt.h>
+#include <Wire.h>
+#include <Adafruit_INA219.h>
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.3.3"
+#define FW_VERSION   "2.4.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -92,7 +94,14 @@
 // SoftwareSerial no oscilador interno de 8MHz (9600 perde byte).
 #define BAUD_MODULO  2400
 
-#define MOTOR_MS     1000      // tempo de giro do motor (abrir/fechar real)
+// Motor REAL (abrir/fechar/calibração): igual ao FI_1_5 de produção — gira até
+// detectar o BATENTE pela corrente (INA219 no I2C 0x45) ou até o teto duro.
+// O pulso por tempo (MOTOR_MS) é só o FALLBACK quando o INA219 não responde.
+#define INA_ADDR          0x45
+#define MOTOR_STALL_MA    300      // corrente de batente (= stallMotor do FI_1_5)
+#define MOTOR_TIMEOUT_MS  10000    // teto duro de giro (= timeoutMotor do FI_1_5)
+#define MOTOR_ARRANQUE_MS 300      // ignora o pico de arranque (inrush > 300mA)
+#define MOTOR_MS     1000      // fallback por tempo (sem INA219)
 #define MOTOR_TST_MS 450       // pulso curto do motor no TESTE de bancada
                                // (menos energia de stall -> menos brownout)
 #define JANELA_MS    20000     // ocioso E desconectado: dorme após isso
@@ -145,6 +154,8 @@
 #endif
 
 SoftwareSerial bluetooth(PIN_BLE_TX, PIN_BLE_RX);  // (TX, RX)
+Adafruit_INA219 ina219(INA_ADDR);
+bool inaOk = false;
 CRGB leds[NUM_LEDS];
 unsigned long seed01 = 0, seed02 = 0;
 uint8_t calibrationOk = 0;
@@ -208,15 +219,36 @@ void melodiaReset() {
     for (uint8_t i = 0; i < 4; i++) beep(120, f[i]);
 }
 
-// ---- motor: gira por um tempo e para. Nada mais. ----
+// ---- motor ----
 void motorPara() { digitalWrite(PIN_MOTOR_A, LOW); digitalWrite(PIN_MOTOR_B, LOW); }
-void motorGiraMs(bool sentidoA, uint16_t ms) {
+void motorLiga(bool sentidoA) {
     if (sentidoA) { digitalWrite(PIN_MOTOR_A, HIGH); digitalWrite(PIN_MOTOR_B, LOW); }
     else          { digitalWrite(PIN_MOTOR_A, LOW);  digitalWrite(PIN_MOTOR_B, HIGH); }
+}
+// Pulso por tempo — testes de bancada e fallback sem INA219.
+void motorGiraMs(bool sentidoA, uint16_t ms) {
+    motorLiga(sentidoA);
     delay(ms);
     motorPara();
 }
-void motorGira(bool sentidoA) { motorGiraMs(sentidoA, MOTOR_MS); }
+// Giro REAL (abrir/fechar/calibração), padrão do FI_1_5 de produção: gira até
+// o BATENTE (corrente média > MOTOR_STALL_MA no INA219) ou o teto de 10s.
+// O pico de arranque é ignorado (MOTOR_ARRANQUE_MS) p/ não virar falso batente.
+// O motor NUNCA fica ligado: para no batente, no teto, ou no fallback por tempo.
+void motorGira(bool sentidoA) {
+    if (!inaOk) { motorGiraMs(sentidoA, MOTOR_MS); return; }
+    ina219.powerSave(false);
+    motorLiga(sentidoA);
+    unsigned long t0 = millis();
+    while (millis() - t0 < MOTOR_TIMEOUT_MS) {
+        float mA = 0;
+        for (uint8_t i = 0; i < 25; i++) mA += ina219.getCurrent_mA();
+        mA /= 25.0f;
+        if (millis() - t0 > MOTOR_ARRANQUE_MS && fabs(mA) > MOTOR_STALL_MA) break;
+    }
+    motorPara();
+    ina219.powerSave(true);
+}
 
 // ---- módulo BLE (sempre a 2400) ----------------------------------------------
 
@@ -428,6 +460,8 @@ void enviaInfo() {
     enviaLinha(buf);
     snprintf(buf, sizeof(buf), "MOD:%s", moduloOk ? "OK" : "SEM-AT");
     enviaLinha(buf);
+    snprintf(buf, sizeof(buf), "INA:%s", inaOk ? "OK" : "SEM");  // batente por corrente
+    enviaLinha(buf);
     snprintf(buf, sizeof(buf), "WAKE:v%02u", g_moduloVers);   // 03, 04 ou 00 (não leu)
     enviaLinha(buf);
     enviaLinha("VER:" FW_VERSION);
@@ -516,6 +550,12 @@ void atenderApp() {
             String txt = bluetooth.readString(); txt.trim(); txt.toUpperCase();
             DBG(F("[app] txt: ")); DBGLN(txt);
             if (txt.startsWith("TST-"))        { t0 = millis(); janela = JANELA_TST; testeBancada(txt); continue; }
+            // PROTOCOLO DIRETO (app novo, sem handshake): o app sonda com
+            // TST-PING ao conectar (o firmware LEGADO ignora texto — parseInt
+            // dá 0); se veio PONG, ele fala estes verbos. Confirmação idêntica
+            // à do handshake ("1004.09" = status+bateria).
+            if (txt.startsWith("ABRIR"))       { acionar(CMD_ABRIR);  return; }
+            if (txt.startsWith("FECHAR"))      { acionar(CMD_FECHAR); return; }
             if (txt.indexOf("PORTA-ABERTA")  >= 0) { calibSalvar(1); return; }
             if (txt.indexOf("PORTA-FECHADA") >= 0) { calibSalvar(0); return; }
             if (txt.indexOf("CALIBRACAO-FI") >= 0) { t0 = millis(); calibGirar(); continue; }
@@ -647,6 +687,11 @@ void setup() {
     if (calibrationOk > 1) calibrationOk = 0;
     EEPROM.get(EE_SEED01, seed01);
     EEPROM.get(EE_SEED02, seed02);
+
+    // INA219 (detecção de batente do motor). Se não responder no I2C, o giro
+    // cai no fallback por tempo — nunca trava o boot.
+    inaOk = ina219.begin();
+    if (inaOk) ina219.powerSave(true);
     g_moduloVers = EEPROM.read(EE_VERS_BLE);
     if (g_moduloVers != 3 && g_moduloVers != 4) g_moduloVers = 0;
     g_wakeHib = (EEPROM.read(EE_HIB) == 1);
