@@ -630,8 +630,17 @@ void setup() {
 }
 
 void loop() {
-    if (g_wakeHib) {                     // boot veio da hibernação: o app já está
-        g_wakeHib = false;               // conectado esperando — atende primeiro
+    // Janela de escuta logo APÓS o boot, sempre: se alguém conectou DURANTE o
+    // boot (bancada/app logo depois de gravar), o módulo já está em modo túnel
+    // (não interpreta AT) e os writes dele chegaram enquanto o setup rodava —
+    // sem esta janela o MCU ia direto dormir e o AT+DROP do dormir() ainda
+    // DERRUBAVA o cliente (visto na bancada: conectou no meio do boot, viu os
+    // nossos "AT" como dados e caiu sem PONG). Também cobre o wake da
+    // hibernação (app conectado esperando).
+    static bool primeiraVolta = true;
+    if (primeiraVolta || g_wakeHib) {
+        primeiraVolta = false;
+        g_wakeHib = false;
         atenderApp();
     }
     dormir();                            // powerDown; acorda no connect (PD3), botão
