@@ -729,7 +729,7 @@ const TESTES = [
   // manuais: só no botão avulso, NUNCA no auto-teste
   {cmd:"TST-ROCKY", label:"♪ Rocky", pergunta:"", fisico:false, manual:true},
   {cmd:"TST-HIB",  label:"⚡ Hibernar", fisico:true, manual:true,
-   pergunta:"A fechadura SE DESLIGOU (a conexão caiu ~1s após o OK-HIB)? Se SIM, reconecte no passo 3: se der PONG, o ciclo cortar/religar do MOSFET está PROVADO."},
+   pergunta:"Após o OK-HIB a conexão SEMPRE cai (é o DROP, esperado). O teste é o SOM: ficou em SILÊNCIO (= cortou; responda SIM) ou deu 3 bipes GRAVES (= não cortou; responda NÃO)? Se SIM, reconecte no passo 3: bipe de boot + PONG = ciclo cortar/religar PROVADO."},
 ];
 let SERIAL="", MCU="m328pb", busy=false;
 

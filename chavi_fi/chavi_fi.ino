@@ -61,7 +61,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.2.0"
+#define FW_VERSION   "2.2.2"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -429,20 +429,31 @@ void testeBancada(const String& t) {
     if (t.startsWith("TST-BAT"))  { enviaBateria(); return; }
     if (t.startsWith("TST-INFO")) { enviaInfo(); return; }
     if (t.startsWith("TST-ROCKY")) { melodiaRocky(); enviaLinha("OK-ROCKY"); return; }
-    // Prova do mecanismo de hibernação: manda o módulo cortar o trilho (PIO80).
-    // Se funcionar, a fechadura DESLIGA aqui (a conexão cai) e deve RELIGAR ao
-    // conectar de novo (AFTC028 sobe o PIO8 -> MCU boota). Se depois de 3s
-    // ainda estivermos vivos, o módulo não cortou -> "HIB-FALHOU".
+    // Prova do mecanismo de hibernação. LIÇÃO da bancada (12:37): com um
+    // cliente CONECTADO o módulo está em modo túnel e NÃO interpreta AT do
+    // MCU (o "AT+PIO80" apareceu como texto no cliente). Por isso a ordem de
+    // produção é DROP primeiro (derruba a conexão -> módulo volta ao modo
+    // comando) e SÓ ENTÃO o corte. Resultado audível para o operador:
+    //   silêncio após a queda      = CORTOU (reconecte: bipe de boot + PONG)
+    //   3 bipes graves após ~4s    = módulo não obedeceu o PIO80
+    //   "HIB-FALHOU-DROP" na tela  = nem o DROP derrubou (segue conectado)
     if (t.startsWith("TST-HIB")) {
         enviaLinha("OK-HIB");
-        DBGLN(F("[hib] cortando o trilho via AT+PIO80..."));
-        delay(1200);                        // a resposta sai antes do corte
+        DBGLN(F("[hib] DROP -> PIO61 -> PIO80 (receita FI_1_0_400)"));
+        delay(400);                          // a resposta sai antes do DROP
+        at("AT+DROP", 500);
+        delay(500);
+        if (digitalRead(PIN_WAKE) == HIGH) { // PD3 espelha a conexão (AFTC/BEFC)
+            enviaLinha("HIB-FALHOU-DROP");   // ainda conectado -> túnel -> sem corte
+            return;
+        }
+        at("AT+PIO61", 500);
         EEPROM.update(EE_HIB, 1);
         at("AT+PIO80", 60);
         delay(3000);
         EEPROM.update(EE_HIB, 0);
         DBGLN(F("[hib] ainda vivo = modulo nao cortou"));
-        enviaLinha("HIB-FALHOU");
+        beep(160, 400); beep(160, 400); beep(160, 400);   // 3 graves = falhou
         return;
     }
     if (t.startsWith("TST-ALL"))  {
