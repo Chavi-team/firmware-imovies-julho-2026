@@ -534,7 +534,8 @@ def act_teste1(serial, cmd):
     # giro puxa corrente e pode dar brownout que derruba o BLE antes do FIM. Com
     # OK-MOT o teste fecha antes do pico; o operador confirma o giro na modal.
     alvo = {"TST-BUZ": ["OK-BUZ"], "TST-LED": ["OK-LED"], "TST-MOT1": ["OK-MOT1"],
-            "TST-MOT2": ["OK-MOT2"], "TST-BAT": ["BAT:"]}.get(cmd, ["OK"])
+            "TST-MOT2": ["OK-MOT2"], "TST-BAT": ["BAT:"],
+            "TST-HIB": ["OK-HIB"], "TST-ROCKY": ["OK-ROCKY"]}.get(cmd, ["OK"])
     LOG(f"— {cmd}", "hi")
     ok, resp = BLE.cmd(cmd, alvo, timeout=8)
     LOG(f"  {'✓' if ok else '✗'} {cmd} firmware {'respondeu' if ok else 'não respondeu'}",
@@ -725,6 +726,10 @@ const TESTES = [
   {cmd:"TST-BAT",  label:"Bateria", pergunta:"", fisico:false},
   {cmd:"TST-MOT1", label:"Motor →", pergunta:"O motor GIROU para UM lado?", fisico:true, motor:true},
   {cmd:"TST-MOT2", label:"Motor ←", pergunta:"O motor GIROU para o OUTRO lado?", fisico:true, motor:true},
+  // manuais: só no botão avulso, NUNCA no auto-teste
+  {cmd:"TST-ROCKY", label:"♪ Rocky", pergunta:"", fisico:false, manual:true},
+  {cmd:"TST-HIB",  label:"⚡ Hibernar", fisico:true, manual:true,
+   pergunta:"A fechadura SE DESLIGOU (a conexão caiu ~1s após o OK-HIB)? Se SIM, reconecte no passo 3: se der PONG, o ciclo cortar/religar do MOSFET está PROVADO."},
 ];
 let SERIAL="", MCU="m328pb", busy=false;
 
@@ -810,6 +815,7 @@ async function autoteste(){ if(busy)return; busy=true;
   setChip("autoteste","run");
   let allok=true;
   for(const t of TESTES){
+    if(t.manual) continue;                         // Hibernar/Rocky: só no botão avulso
     if(t.motor) await sleep(1500);                 // deixa a bateria recuperar
     let r=await apiTest(t.cmd);
     if(!r.ok){                                     // sem resposta -> reconecta e refaz
