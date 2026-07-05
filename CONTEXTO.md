@@ -792,6 +792,30 @@ auto-teste completo (buzzer/LEDs/BAT 4.09/motor A e B confirmados). Compila
 input 0x01 at addr 0x0001` = contato ISP/energia marginal durante o write;
 repetir a gravação resolve (a 3066 passou na 3ª tentativa).
 
+### ✅ v2.3.0 — HIBERNAÇÃO VIA MOSFET LIGADA E VALIDADA (05/07 12:47, CH003FI003066)
+
+Sequência que fechou o ciclo (tudo em bancada, mesma tarde):
+1. **TST-HIB v2.2.0 falhou** revelando a lição: módulo **CONECTADO não
+   interpreta AT do MCU** — tunela como dado (o cliente recebeu "AT+PIO80"
+   como texto). É por isso que o goToSleep de produção manda **AT+DROP
+   primeiro** (desconecta → módulo volta ao modo comando) e só então corta.
+2. **TST-HIB v2.2.2** (DROP → checa PD3 → PIO61 → PIO80; silêncio = cortou /
+   3 graves = não cortou / HIB-FALHOU-DROP = nem desconectou): corte
+   silencioso + reconexão religou o MCU com PONG imediato. **Ciclo provado.**
+3. **v2.3.0 = FEATURE_HIBERNA_MOSFET ligada**: após a janela ociosa (20s) o
+   dormir() corta o trilho; conectar religa (AFTC028) e o boot-de-wake
+   (EE_HIB=911) pula config/melodia e atende direto. Validada de ponta a
+   ponta na 3066 (PONG, auto-teste, TST-HIB, reconexão, motores).
+
+Economia real: o corte elimina o consumo quiescente dos 3 WS2812 (~2-3mA
+contínuos) + MCU + drivers; hibernada, só o módulo BLE anunciando consome.
+Trade-off: **botão físico só funciona nos ~20s acordada** (MCU desligado no
+resto) — se incomodar, alongar a janela antes do corte.
+
+Git local em `Imoveis/firmware`: branch `versao-boa` + tag `v2.3.0-validada`
+= esta versão. Pendências: regravar a 2424 (wake-por-dados no módulo clone),
+teste ponta-a-ponta pelo app-imoveis (instalar→calibrar→abrir→fechar), botão.
+
 ## Inconsistências ainda em aberto (a confirmar em bancada)
 
 1. **Tabela de baud do clone** — confirmar qual opcode (`AT+BAUD0` vs `AT+BAUD2`)

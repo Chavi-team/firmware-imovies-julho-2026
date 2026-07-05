@@ -61,7 +61,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.3.0"
+#define FW_VERSION   "2.3.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -146,6 +146,7 @@ char serialFech[12] = {0};
 volatile bool acordouBLE = false, acordouBtn = false;
 bool moduloOk = false;
 bool g_wakeHib = false;        // este boot foi um "acordar da hibernação"
+void atenderBotao();           // usada pelo atenderApp (definida mais abaixo)
 
 // Canal de RESPOSTA (sempre BLE neste build; Stream* mantido p/ um futuro
 // modo cabo em placa com pads acessíveis).
@@ -239,6 +240,7 @@ bool bleResponde() {
 // "Vivo" de verdade: alguns clones não respondem NADA a um "AT" pelado, mas
 // respondem a uma consulta. Testa AT e depois AT+VERS? — qualquer byte = vivo.
 bool bleVivo() {
+    if (digitalRead(PIN_WAKE) == HIGH) return true;  // conectado = vivo (e AT seria tunelado)
     if (bleResponde()) return true;
     while (bluetooth.available()) bluetooth.read();
     bluetooth.print("AT+VERS?");
@@ -273,6 +275,10 @@ uint8_t bleLerVersao() {
 // PIO8 do módulo + wake no PIO6): PIO8 alto sempre (alimenta os periféricos),
 // PIO6 baixo antes / alto depois da conexão (borda que acorda o MCU no PD3).
 void configModuloLeve() {
+    // Com um cliente CONECTADO o módulo está em modo túnel: não interpreta AT
+    // e ainda REPASSA cada comando como notificação — o app receberia
+    // "AT+..." no meio do handshake e extrairia números-lixo. Pula.
+    if (digitalRead(PIN_WAKE) == HIGH) { DBGLN(F("[cfg] conectado - pula config")); return; }
     at("AT+TYPE0");    // sem pareamento
     at("AT+MODE2");    // túnel de dados (repassa os bytes pro MCU)
     at("AT+ROLE0");    // slave
@@ -478,6 +484,9 @@ void atenderApp() {
     unsigned long janela = JANELA_MS;
     uint8_t step = 0;
     while (millis() - t0 < janela) {
+        // Botão físico funciona SEMPRE que o MCU está acordado (com a
+        // hibernação, esta janela é o único momento em que ele está ligado).
+        if (digitalRead(PIN_BUTTON) == LOW) { atenderBotao(); t0 = millis(); }
         if (bluetooth.available() <= 0) continue;
         int pk = bluetooth.peek();
         if (pk == '\n' || pk == '\r' || pk == ' ' || pk == '\t') { bluetooth.read(); continue; }
@@ -501,11 +510,18 @@ void atenderApp() {
             if (v > 2100000UL) continue;
             t0 = millis();
             unsigned long rA = random(1, 9999), rB = random(1, 9999);
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%lu %lu", rA + v + seed01, rB + v + seed02);
-            // Em DOBRO: o app espera 2 notificações de salto; se a 1ª via sair
-            // truncada (módulo recém-acordado), a 2ª completa -> sem F05.
-            enviaLinha(buf); delay(60); enviaLinha(buf);
+            // FRAMING DE PRODUÇÃO: cada salto numa NOTIFICAÇÃO separada
+            // ("respA\n" e depois "respB\n"), como o FI_1_5 de campo. O app
+            // trata cada notificação como UM campo — a versão anterior (par
+            // numa linha, em dobro) fazia o app ler respA duas vezes e
+            // calcular salto2 ≈ seed1−seed2 (milhões) → LFSR infinito → o
+            // APP CONGELAVA na modal "Acionando fechadura".
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%lu", rA + v + seed01);
+            enviaLinha(buf);
+            delay(40);
+            snprintf(buf, sizeof(buf), "%lu", rB + v + seed02);
+            enviaLinha(buf);
             step = 1; continue;
         }
         if (v == CMD_ABRIR || v == CMD_FECHAR) { acionar(v); return; }
@@ -626,7 +642,13 @@ void setup() {
         return;                              // loop() atende já no 1º giro
     }
     if (EEPROM.read(EE_MOD_CFG) != MOD_CFG_MAGIC) {
-        bleProvisionar();
+        if (digitalRead(PIN_WAKE) == HIGH) {
+            // Cliente conectado no 1º boot: provisionar agora vazaria AT pro
+            // app (túnel). Fica p/ o próximo boot limpo (flag continua 0).
+            DBGLN(F("[boot] conectado - provisionamento adiado"));
+        } else {
+            bleProvisionar();
+        }
     } else {
         DBGLN(F("[boot] modulo ja provisionado - config leve"));
         configModuloLeve();
