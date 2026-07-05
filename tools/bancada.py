@@ -408,6 +408,11 @@ def _fonte_mais_nova_que_hex():
     return False
 
 
+# placa (byte 912 do seed.bin) deriva do chip: 328PB = FI 1.5; 328/328P = FI 1.0
+def _placa_de(mcu):
+    return "fi15" if mcu == "m328pb" else "fi10"
+
+
 def act_gravar(serial, mcu):
     STATUS("gravar", "run")
     os.makedirs(BIN_DIR, exist_ok=True)
@@ -418,18 +423,29 @@ def act_gravar(serial, mcu):
         if rc != 0 or not os.path.exists(HEX):
             LOG("Falha ao compilar.", "err"); STATUS("gravar", "fail"); return False
     seed_bin = _seed_bin(serial)
-    rc, _ = _exec([sys.executable, GERAR_SEED, serial, seed_bin])
+    rc, _ = _exec([sys.executable, GERAR_SEED, serial, seed_bin, _placa_de(mcu)])
     if rc != 0 or not os.path.exists(seed_bin):
         LOG("Falha ao gerar as seeds.", "err"); STATUS("gravar", "fail"); return False
     LOG("Gravando... NÃO mexa no cabo agora.", "hi")
-    rc, _ = _exec(["avrdude", "-P", "usb", "-c", AVR_PROG, "-p", mcu, "-b", "19200", "-B", "8",
-                   "-U", "lfuse:w:0xE2:m", "-U", "hfuse:w:0xD7:m",
-                   "-U", "efuse:w:0xF7:m", "-U", "lock:w:0xCF:m",
-                   "-U", f"eeprom:w:{seed_bin}:r", "-U", f"flash:w:{HEX}:i"])
-    if rc == 0:
-        LOG(f"✓ {serial} gravada. 1 bipe = viva; aguarde a MELODIA (Rocky) = "
-            "pronta para conectar. 4 bipes graves = módulo BLE mudo.", "ok")
-        STATUS("gravar", "ok"); return True
+    # Se a ASSINATURA do chip não bater com o MCU selecionado, tenta os outros
+    # (m328pb=FI1.5, m328p/m328=FI1.0 — placas antigas misturam 328 e 328P).
+    candidatos = [mcu] + [m for m in ("m328pb", "m328p", "m328") if m != mcu]
+    for i, m in enumerate(candidatos):
+        if i > 0:
+            LOG(f"Assinatura não bateu — tentando chip {m}...", "warn")
+            rc, _ = _exec([sys.executable, GERAR_SEED, serial, seed_bin, _placa_de(m)])
+            if rc != 0:
+                break
+        rc, out = _exec(["avrdude", "-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
+                         "-U", "lfuse:w:0xE2:m", "-U", "hfuse:w:0xD7:m",
+                         "-U", "efuse:w:0xF7:m", "-U", "lock:w:0xCF:m",
+                         "-U", f"eeprom:w:{seed_bin}:r", "-U", f"flash:w:{HEX}:i"])
+        if rc == 0:
+            LOG(f"✓ {serial} gravada (chip {m}, placa {_placa_de(m)}). 1 bipe = viva; "
+                "aguarde a MELODIA (Rocky) = pronta. 4 bipes graves = módulo mudo.", "ok")
+            STATUS("gravar", "ok"); return True
+        if "signature" not in out.lower():
+            break                          # falha que não é de assinatura: não insiste
     LOG("✗ Gravação falhou. Verifique bateria DENTRO e contato firme do USBasp.", "err")
     STATUS("gravar", "fail"); return False
 
@@ -655,7 +671,8 @@ PAGE = r"""<!DOCTYPE html>
       <div class="row center" style="margin-top:16px">
         <label style="color:var(--muted);font-size:14px">Placa</label>
         <select id="mcu"><option value="m328pb">m328pb (FI 1.5)</option>
-          <option value="m328p">m328p (FI 1.0)</option></select>
+          <option value="m328p">m328p (FI 1.0)</option>
+          <option value="m328">m328 (FI 1.0 chip antigo)</option></select>
       </div>
     </div>
     <button class="big" id="btn-next" style="margin-top:20px" disabled>PRÓXIMO ▶</button>

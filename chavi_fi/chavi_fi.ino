@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.4.1"
+#define FW_VERSION   "2.5.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -78,16 +78,21 @@
 // (silêncio) e a reconexão religou o MCU com PONG imediato. LIGADO.
 #define FEATURE_HIBERNA_MOSFET  1
 
-// ---- pinos (iguais ao FI_1_5/_400 que funciona em campo) ----
+// ---- pinos ----
+// COMUNS às duas gerações (FI 1.0 e FI 1.5):
 #define PIN_BLE_RX   PIN_PD4
 #define PIN_BLE_TX   PIN_PD5
 #define PIN_BUZZER   PIN_PD6
-#define PIN_LEDS     PIN_PB3
-#define PIN_MOTOR_A  PIN_PB1   // = pinTurn01 do FI_1_5 (rotateMotor01)
-#define PIN_MOTOR_B  PIN_PB2   // = pinTurn02 do FI_1_5 (rotateMotor02)
 #define PIN_BUTTON   PIN_PD2
 #define PIN_WAKE     PIN_PD3
 #define PIN_BAT      A1        // PC1, divisor da bateria
+// DIFERENTES por geração (decidido em RUNTIME pelo byte de placa na EEPROM):
+//   FI 1.5: motor PB1/PB2 (pinos 9/10), 3× WS2812 no PB3 (pino 11)
+//   FI 1.0: motor PB2/PB3 (pinos 10/11), 3 LEDs discretos nos pinos 7/8/9
+#define PIN_LEDS     PIN_PB3   // WS2812 (só FI 1.5 — no 1.0 o PB3 é o motor!)
+#define PIN_LED10_1  PIN_PD7   // LEDs discretos do FI 1.0
+#define PIN_LED10_2  PIN_PB0
+#define PIN_LED10_3  PIN_PB1
 
 // BAUD do módulo BLE = 2400, FIXO (ver cabeçalho). A esteira de produção grava
 // AT+BAUD0 (=2400 nesses clones); 2400 também é o baud mais robusto para o
@@ -130,6 +135,8 @@
 #define EE_MOD_CFG      910    // 0xC9 = módulo já provisionado (baud+config+nome)
 #define MOD_CFG_MAGIC   0xC9
 #define EE_HIB          911    // 1 = desligou hibernando (boot seguinte = wake)
+#define EE_BOARD        912    // 1 = placa FI 1.0; qualquer outro valor = FI 1.5
+                               // (gravado pelo seed.bin/gerar_seed.py conforme a placa)
 
 // ---- protocolo ----
 #define CMD_ABRIR   1
@@ -156,6 +163,9 @@
 SoftwareSerial bluetooth(PIN_BLE_TX, PIN_BLE_RX);  // (TX, RX)
 Adafruit_INA219 ina219(INA_ADDR);
 bool inaOk = false;
+bool placa10 = false;                       // true = FI 1.0 (EE_BOARD==1)
+uint8_t g_pinMotorA = PIN_PB1;              // default FI 1.5
+uint8_t g_pinMotorB = PIN_PB2;
 CRGB leds[NUM_LEDS];
 unsigned long seed01 = 0, seed02 = 0;
 uint8_t calibrationOk = 0;
@@ -182,9 +192,21 @@ void resetMCU() { wdt_enable(WDTO_15MS); while (1) {} }
 // ---- feedback sonoro/visual --------------------------------------------------
 void beep(uint16_t ms, uint16_t freq) { tone(PIN_BUZZER, freq, ms); delay(ms); noTone(PIN_BUZZER); }
 
-// LEDs de status (WS2812). Só usados em janelas com a UART ociosa (boot e
-// testes) — FastLED.show desliga IRQ e corromperia um RX BLE em andamento.
-void ledCor(const CRGB& c) { fill_solid(leds, NUM_LEDS, c); FastLED.show(); }
+// LEDs de status. FI 1.5 = WS2812 (FastLED); FI 1.0 = 3 LEDs discretos ligam/
+// desligam juntos (sem cor — o firmware antigo também os trata em bloco).
+// Só usados em janelas com a UART ociosa (boot e testes) — FastLED.show
+// desliga IRQ e corromperia um RX BLE em andamento.
+void ledCor(const CRGB& c) {
+    if (placa10) {
+        bool on = (c.r || c.g || c.b);
+        digitalWrite(PIN_LED10_1, on);
+        digitalWrite(PIN_LED10_2, on);
+        digitalWrite(PIN_LED10_3, on);
+        return;
+    }
+    fill_solid(leds, NUM_LEDS, c);
+    FastLED.show();
+}
 void piscar(const CRGB& c, uint8_t vezes, uint16_t ms = 120) {
     for (uint8_t i = 0; i < vezes; i++) {
         ledCor(c); delay(ms);
@@ -220,10 +242,10 @@ void melodiaReset() {
 }
 
 // ---- motor ----
-void motorPara() { digitalWrite(PIN_MOTOR_A, LOW); digitalWrite(PIN_MOTOR_B, LOW); }
+void motorPara() { digitalWrite(g_pinMotorA, LOW); digitalWrite(g_pinMotorB, LOW); }
 void motorLiga(bool sentidoA) {
-    if (sentidoA) { digitalWrite(PIN_MOTOR_A, HIGH); digitalWrite(PIN_MOTOR_B, LOW); }
-    else          { digitalWrite(PIN_MOTOR_A, LOW);  digitalWrite(PIN_MOTOR_B, HIGH); }
+    if (sentidoA) { digitalWrite(g_pinMotorA, HIGH); digitalWrite(g_pinMotorB, LOW); }
+    else          { digitalWrite(g_pinMotorA, LOW);  digitalWrite(g_pinMotorB, HIGH); }
 }
 // Pulso por tempo — testes de bancada e fallback sem INA219.
 void motorGiraMs(bool sentidoA, uint16_t ms) {
@@ -437,6 +459,16 @@ void calibSalvar(uint8_t aberto) {
 
 // ---- testes de bancada (GUI tools/bancada.py) ----
 void testeLeds() {
+    if (placa10) {                      // FI 1.0: acende cada LED discreto e os 3
+        const uint8_t pins[3] = {PIN_LED10_1, PIN_LED10_2, PIN_LED10_3};
+        for (uint8_t i = 0; i < 3; i++) {
+            digitalWrite(pins[i], HIGH); delay(350); digitalWrite(pins[i], LOW);
+        }
+        for (uint8_t i = 0; i < 3; i++) digitalWrite(pins[i], HIGH);
+        delay(350);
+        for (uint8_t i = 0; i < 3; i++) digitalWrite(pins[i], LOW);
+        return;
+    }
     const CRGB cores[4] = {CRGB::Red, CRGB::Green, CRGB::Blue, CRGB::White};
     for (uint8_t c = 0; c < 4; c++) {
         fill_solid(leds, NUM_LEDS, cores[c]);
@@ -466,6 +498,8 @@ void enviaInfo() {
     snprintf(buf, sizeof(buf), "MOD:%s", moduloOk ? "OK" : "SEM-AT");
     enviaLinha(buf);
     snprintf(buf, sizeof(buf), "INA:%s", inaOk ? "OK" : "SEM");  // batente por corrente
+    enviaLinha(buf);
+    snprintf(buf, sizeof(buf), "PLACA:%s", placa10 ? "1.0" : "1.5");
     enviaLinha(buf);
     snprintf(buf, sizeof(buf), "WAKE:v%02u", g_moduloVers);   // 03, 04 ou 00 (não leu)
     enviaLinha(buf);
@@ -658,9 +692,14 @@ void dormir() {
 }
 
 void setup() {
+    // PLACA primeiro de tudo: os pinos do motor dependem dela (no FI 1.0 o
+    // PB3 é motor, não LED — configurar errado chacoalharia o motor).
+    placa10 = (EEPROM.read(EE_BOARD) == 1);
+    if (placa10) { g_pinMotorA = PIN_PB2; g_pinMotorB = PIN_PB3; }
+
     pinMode(PIN_BUZZER, OUTPUT);
-    pinMode(PIN_MOTOR_A, OUTPUT);
-    pinMode(PIN_MOTOR_B, OUTPUT);
+    pinMode(g_pinMotorA, OUTPUT);
+    pinMode(g_pinMotorB, OUTPUT);
     pinMode(PIN_BUTTON, INPUT_PULLUP);
     pinMode(PIN_WAKE, INPUT);
     motorPara();
@@ -678,9 +717,17 @@ void setup() {
     // LEDs inicializados e APAGADOS. Nada aceso de forma CONTÍNUA no boot: os 3
     // WS2812 puxam corrente e, numa bateria fraca, seguravam o trilho baixo e
     // reiniciavam a fechadura em loop. Feedback visual = só PISCADAS curtas.
-    FastLED.addLeds<WS2812B, PIN_LEDS, GRB>(leds, NUM_LEDS);
-    FastLED.setBrightness(LED_BRIGHT);
-    fill_solid(leds, NUM_LEDS, CRGB::Black); FastLED.show();
+    // FI 1.0: LEDs discretos (7/8/9); o FastLED NUNCA é inicializado (o PB3 é
+    // o motor B nessa placa — bit-bang de WS2812 ali chacoalharia o motor).
+    if (placa10) {
+        pinMode(PIN_LED10_1, OUTPUT); digitalWrite(PIN_LED10_1, LOW);
+        pinMode(PIN_LED10_2, OUTPUT); digitalWrite(PIN_LED10_2, LOW);
+        pinMode(PIN_LED10_3, OUTPUT); digitalWrite(PIN_LED10_3, LOW);
+    } else {
+        FastLED.addLeds<WS2812B, PIN_LEDS, GRB>(leds, NUM_LEDS);
+        FastLED.setBrightness(LED_BRIGHT);
+        fill_solid(leds, NUM_LEDS, CRGB::Black); FastLED.show();
+    }
 
     // serial (nome BLE) + estado da EEPROM
     for (uint8_t i = 0; i < 11; i++) {

@@ -8,7 +8,12 @@ que aqui NÃO geramos SerialNumber.h nem recompilamos nada: o .hex é universal 
 o serial vai só na EEPROM (endereço 769).
 
 Uso:
-    python3 gerar_seed.py CH003FI002465 [saida.bin]
+    python3 gerar_seed.py CH003FI002465 [saida.bin] [fi10|fi15]
+
+Placa (byte 912 da EEPROM — o firmware universal decide os pinos por ele):
+    fi15 (default) = FI 1.5: motor PB1/PB2, WS2812 no PB3
+    fi10           = FI 1.0: motor PB2/PB3, LEDs discretos 7/8/9
+    Sem o argumento, o canal CH001 assume fi10 (geração 1.0 de campo).
 
 Seed (determinística do serial, igual backend DeviceSeedHelper.php):
     seed_k = int(sha256(serial + SECRET + k)[:8], 16) % 429496729   (k = 1..4)
@@ -27,7 +32,7 @@ def get_seed(serial_number: str, seed_number: int) -> int:
     return int(sha256(s.encode()).hexdigest()[:8], 16) % SEED_MAX_RANGE
 
 
-def montar_eeprom(serial_number: str) -> bytearray:
+def montar_eeprom(serial_number: str, placa: str = "fi15") -> bytearray:
     if not serial_number.startswith("CH"):
         raise SystemExit(f"Serial deve começar com 'CH': {serial_number}")
 
@@ -54,6 +59,9 @@ def montar_eeprom(serial_number: str) -> bytearray:
     # telemetria NOVA (>=900): layout=1, contadores zerados
     eeprom[900] = 0x01
 
+    # placa (912): 1 = FI 1.0 (motor PB2/PB3, LEDs discretos); 0 = FI 1.5
+    eeprom[912] = 0x01 if placa == "fi10" else 0x00
+
     return eeprom
 
 
@@ -63,12 +71,20 @@ def main():
         raise SystemExit(1)
     serial = sys.argv[1].strip().upper()
     saida = sys.argv[2] if len(sys.argv) > 2 else "seed.bin"
+    if len(sys.argv) > 3:
+        placa = sys.argv[3].strip().lower()
+        if placa not in ("fi10", "fi15"):
+            raise SystemExit(f"Placa inválida: {placa} (use fi10 ou fi15)")
+    else:
+        # canal CH001 = geração FI 1.0 de campo; demais = FI 1.5
+        placa = "fi10" if serial[2:5] == "001" else "fi15"
 
-    eeprom = montar_eeprom(serial)
+    eeprom = montar_eeprom(serial, placa)
     with open(saida, "wb") as f:
         f.write(eeprom)
 
     print(f"Serial : {serial}")
+    print(f"Placa  : {'FI 1.0' if placa == 'fi10' else 'FI 1.5'}")
     for i in range(4):
         print(f"  seed{i + 1} = {get_seed(serial, i + 1)}")
     print(f"Gravado: {saida} ({len(eeprom)} bytes)")

@@ -37,9 +37,11 @@ if [[ ! -f "$HEX" || "$SKETCH_DIR/chavi_fi.ino" -nt "$HEX" ]]; then
         "$SKETCH_DIR"
 fi
 
-# 2. Gera o seed.bin desta fechadura.
-echo ">> Gerando EEPROM (seeds + serial) de $SERIAL..."
-python3 "$HERE/gerar_seed.py" "$SERIAL" "$SEED_BIN"
+# 2. Gera o seed.bin desta fechadura (placa deriva do MCU: 328PB=FI1.5,
+#    328/328P=FI1.0 — o byte 912 diz ao firmware universal quais pinos usar).
+if [[ "$MCU" == "m328pb" ]]; then PLACA="fi15"; else PLACA="fi10"; fi
+echo ">> Gerando EEPROM (seeds + serial + placa $PLACA) de $SERIAL..."
+python3 "$HERE/gerar_seed.py" "$SERIAL" "$SEED_BIN" "$PLACA"
 
 # 3. Grava fuses + lock + flash + eeprom.
 #    lfuse=0xE2 → OSCILADOR INTERNO 8MHz (não depende do cristal externo; liga
