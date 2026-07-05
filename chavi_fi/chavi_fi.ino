@@ -61,7 +61,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.3.1"
+#define FW_VERSION   "2.3.2"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -95,8 +95,9 @@
 #define MOTOR_MS     1000      // tempo de giro do motor (abrir/fechar real)
 #define MOTOR_TST_MS 450       // pulso curto do motor no TESTE de bancada
                                // (menos energia de stall -> menos brownout)
-#define JANELA_MS    20000     // acordado ouvindo o app
+#define JANELA_MS    20000     // ocioso E desconectado: dorme após isso
 #define JANELA_TST   60000     // janela estendida durante testes de bancada
+#define JANELA_MAX   600000UL  // teto absoluto acordada (10 min) — mesmo conectada
 
 #define BTN_CURTO_MS   800     // até aqui = toque curto (toggle do motor)
 #define BTN_RESET_MS   10000   // segurar até aqui = reset total
@@ -127,7 +128,7 @@
 //   cabo VERMELHO     -> NÃO LIGA (a placa se alimenta da bateria)
 // Terminal a 9600: tools/.venv-bancada/bin/pyserial-miniterm <porta> 9600
 // Só imprime (não lê) — custo mínimo; pode ficar ligado em produção se quiser.
-#define FEATURE_SERIAL_DEBUG 1
+#define FEATURE_SERIAL_DEBUG 0
 #define DBG_BAUD 9600
 #if FEATURE_SERIAL_DEBUG
   #define DBG(...)   Serial.print(__VA_ARGS__)
@@ -346,9 +347,14 @@ void enviaLinha(const char* s) { io->print(s); io->print('\n'); io->flush(); del
 void envia11Duplo() { enviaLinha("11"); delay(120); enviaLinha("11"); }
 
 // ---- abrir/fechar: manda o status e gira (tabela de sentido do FI_1_5) ----
+// Confirmação IGUAL à de produção: println(status + bateria) -> "1004.09"
+// (status 1000/2000 somado à tensão, float com 2 casas).
 void acionar(unsigned long cmd) {
     bool sentidoA = (cmd == CMD_ABRIR) ? (calibrationOk == 1) : (calibrationOk == 0);
-    enviaLinha(sentidoA ? "1000" : "2000");
+    float vb = analogRead(PIN_BAT) * (5.0f / 1024.0f);
+    char num[16];
+    dtostrf((sentidoA ? 1000.0f : 2000.0f) + vb, 0, 2, num);
+    enviaLinha(num);
     motorGira(sentidoA);
 }
 
@@ -481,12 +487,20 @@ void atenderApp() {
     DBGLN(F("[app] acordou - ouvindo (20s)"));
     bluetooth.setTimeout(150);
     unsigned long t0 = millis();
+    unsigned long tAbs = millis();
     unsigned long janela = JANELA_MS;
     uint8_t step = 0;
-    while (millis() - t0 < janela) {
+    while (millis() - t0 < janela && millis() - tAbs < JANELA_MAX) {
         // Botão físico funciona SEMPRE que o MCU está acordado (com a
         // hibernação, esta janela é o único momento em que ele está ligado).
         if (digitalRead(PIN_BUTTON) == LOW) { atenderBotao(); t0 = millis(); }
+        // Cliente CONECTADO (PD3 alto) mantém a janela viva: o INSTALL do app
+        // fica conectado por bem mais de 20s (QR codes, telas) e o timeout
+        // antigo derrubava a sessão no meio (AT+DROP) -> F05 no calibrar.
+        // Desconectou -> zera o handshake (rodada nova do app começa do zero)
+        // e aí sim os 20s ociosos contam até dormir/hibernar.
+        if (digitalRead(PIN_WAKE) == HIGH) t0 = millis();
+        else if (step != 0) step = 0;
         if (bluetooth.available() <= 0) continue;
         int pk = bluetooth.peek();
         if (pk == '\n' || pk == '\r' || pk == ' ' || pk == '\t') { bluetooth.read(); continue; }
@@ -506,26 +520,32 @@ void atenderApp() {
         unsigned long v = (unsigned long)bluetooth.parseInt();
         if (v == 0) continue;
         DBG(F("[app] num: ")); DBGLN(v);
-        if (step == 0) {                       // desafio N -> responde os 2 saltos
-            if (v > 2100000UL) continue;
+        // Comandos primeiro (1/2/190720)...
+        if (v == CMD_ABRIR || v == CMD_FECHAR) { acionar(v); return; }
+        if (v == TOK_CALIB) { t0 = millis(); calibAceitar(); step = 1; continue; }
+        // ...e QUALQUER número na faixa de desafio (0..2,1M) vale como NOVO
+        // desafio, mesmo com handshake em andamento: o app faz retry/rodadas
+        // (reconecta e manda desafio novo) e o firmware antigo ficava PRESO
+        // esperando tokens — o desafio da rodada nova era ignorado e o app
+        // "pensava" para sempre. Tokens de verdade são 32 bits (quase nunca
+        // caem nessa faixa) e, se caírem, saltos extras são inócuos.
+        if (v <= 2100000UL) {
             t0 = millis();
             unsigned long rA = random(1, 9999), rB = random(1, 9999);
-            // FRAMING DE PRODUÇÃO: cada salto numa NOTIFICAÇÃO separada
-            // ("respA\n" e depois "respB\n"), como o FI_1_5 de campo. O app
-            // trata cada notificação como UM campo — a versão anterior (par
-            // numa linha, em dobro) fazia o app ler respA duas vezes e
-            // calcular salto2 ≈ seed1−seed2 (milhões) → LFSR infinito → o
-            // APP CONGELAVA na modal "Acionando fechadura".
+            // FRAMING DE PRODUÇÃO: cada salto numa NOTIFICAÇÃO separada, com
+            // '\n' ("%lu\n"); módulo ver.03 leva '\n' DUPLO como o FI_1_5
+            // (SEEDDelimData compat v03). Par-numa-linha duplicado fazia o
+            // app ler respA 2x -> salto2 ≈ seed1−seed2 (milhões) -> LFSR
+            // infinito -> APP CONGELADO na modal.
             char buf[16];
-            snprintf(buf, sizeof(buf), "%lu", rA + v + seed01);
+            snprintf(buf, sizeof(buf), (g_moduloVers == 3) ? "%lu\n" : "%lu", rA + v + seed01);
             enviaLinha(buf);
-            delay(40);
-            snprintf(buf, sizeof(buf), "%lu", rB + v + seed02);
+            delay(20);
+            snprintf(buf, sizeof(buf), (g_moduloVers == 3) ? "%lu\n" : "%lu", rB + v + seed02);
             enviaLinha(buf);
             step = 1; continue;
         }
-        if (v == CMD_ABRIR || v == CMD_FECHAR) { acionar(v); return; }
-        if (v == TOK_CALIB) { t0 = millis(); calibAceitar(); step = 1; continue; }
+        // fora da faixa = token (bypass: ignorado)
     }
 }
 
