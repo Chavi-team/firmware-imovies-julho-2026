@@ -87,6 +87,28 @@ def seeds_de(serial):
     return [get_seed(serial, k) for k in range(1, 5)]
 
 
+# BEFC/AFTC a partir do pino do MOSFET (idêntico ao AT.py do dev): o gate do
+# MOSFET (alimenta periféricos/MCU) fica ALTO antes e depois da conexão; o PIO6
+# (wake) fica BAIXO antes e ALTO depois -> a borda que acorda o MCU.
+#   pino MOSFET 8 -> BEFC020 / AFTC028  (90% das FIs). Campo configurável.
+def calcular_hex_befc_aftc(mosfet_pin):
+    try:
+        m_pin = int(mosfet_pin)
+        mosfet_bit = m_pin - 3          # PIO3 = bit0
+        bits_befc = [0] * 12
+        bits_aftc = [0] * 12
+        if 0 <= mosfet_bit < 12:
+            bits_befc[mosfet_bit] = 1
+            bits_aftc[mosfet_bit] = 1
+        bits_befc[3] = 0                # PIO6 (wake) BAIXO antes da conexão
+        bits_aftc[3] = 1                # PIO6 ALTO depois -> borda de wake
+        befc_hex = f"{int(''.join(map(str, bits_befc[::-1])), 2):03X}"
+        aftc_hex = f"{int(''.join(map(str, bits_aftc[::-1])), 2):03X}"
+        return befc_hex, aftc_hex
+    except Exception:
+        return "020", "028"             # fallback = pino 8
+
+
 # Gera o seed.bin INTERNAMENTE (espelho do gerar_seed.py — no pacote não há
 # interpretador Python para subprocess). Layout idêntico ao seedGenerator legado.
 def gerar_seed_bin(serial, placa, caminho):
@@ -379,6 +401,77 @@ class Ble:
             return False, "(BLE não conectado)"
         return self._call(self._cmd(texto, alvos, timeout), timeout=timeout + 15)
 
+    # ---- provisionamento do módulo POR BLE (backup baud-agnóstico) ----
+    # Scan AMPLO: acha o módulo virgem ("Soft AT"/"MLT-BT05"), de fábrica CHAVIFI,
+    # já com o serial, ou por \d+FI\d+. Pega o de sinal MAIS FORTE (a fechadura na
+    # bancada é a mais perto) e loga os candidatos.
+    async def _scan_prov(self, alvo, timeout):
+        from bleak import BleakScanner
+        LOG(f"Procurando módulo p/ provisionar (serial {alvo} ou de fábrica, {timeout:.0f}s)...", "hi")
+        devs = await BleakScanner.discover(timeout=timeout, return_adv=True)
+        melhor = None
+        for addr, (dev, adv) in devs.items():
+            nome = (adv.local_name or dev.name or "")
+            up = nome.upper()
+            uuids = [u.lower() for u in (adv.service_uuids or [])]
+            ffe0 = any("ffe0" in u for u in uuids)
+            match = (nome == alvo or "SOFT AT" in up or "MLT-BT05" in up
+                     or up.startswith("CHAVIFI") or re.search(r"\d+FI\d+", up) or ffe0)
+            if nome or ffe0:
+                LOG(f"  {'★' if match else '·'} {nome or '(sem nome)'}  {dev.address}  rssi={adv.rssi}")
+            if match:
+                peso = (10_000 if nome == alvo else 0) + adv.rssi   # serial exato ganha; senão RSSI
+                if melhor is None or peso > melhor[0]:
+                    melhor = (peso, dev.address, nome)
+        if melhor:
+            LOG(f"  → escolhido: {melhor[2] or '(sem nome)'}  {melhor[1]}")
+            return melhor[1]
+        return None
+
+    def scan_prov(self, alvo, timeout=8.0):
+        return self._call(self._scan_prov(alvo, timeout), timeout=timeout + 20)
+
+    # Conecta, manda a sequência AT (uma por vez, lendo a resposta) e desconecta.
+    # Baud-agnóstico: em MODE2 o módulo interpreta AT vindos do rádio (BLE).
+    async def _provisionar_at(self, addr, comandos):
+        from bleak import BleakClient
+        if self.client and self.client.is_connected:
+            await self.client.disconnect()
+        self.client = BleakClient(addr)
+        await self.client.connect()
+        rx = {"txt": "", "ev": asyncio.Event()}
+
+        def cb(_c, data: bytearray):
+            r = data.decode("utf-8", errors="ignore").strip("\x00\r\n ")
+            if r:
+                rx["txt"] = r
+                rx["ev"].set()
+
+        await self.client.start_notify(CHR_FFE1, cb)
+        await asyncio.sleep(1.2)
+        ok_all = True
+        for cmd in comandos:
+            rx["txt"] = ""; rx["ev"].clear()
+            await self.client.write_gatt_char(CHR_FFE1, cmd.encode("utf-8"), response=False)
+            try:
+                await asyncio.wait_for(rx["ev"].wait(), timeout=2.0)
+                LOG(f"  📤 {cmd:<22} → 📥 {rx['txt']}")
+            except asyncio.TimeoutError:
+                LOG(f"  📤 {cmd:<22} → ⏳ (sem resposta)", "warn")
+                if cmd != "AT+RESET":     # o RESET derruba a conexão: sem resposta é NORMAL
+                    ok_all = False
+            await asyncio.sleep(0.5)
+        for fn in (lambda: self.client.stop_notify(CHR_FFE1), lambda: self.client.disconnect()):
+            try:
+                await fn()
+            except Exception:
+                pass
+        self.client = None
+        return ok_all
+
+    def provisionar_at(self, addr, comandos):
+        return self._call(self._provisionar_at(addr, comandos), timeout=60)
+
 
 # ---------------------------------------------------------------------------
 # Backend
@@ -581,6 +674,46 @@ def act_validar(serial, mcu):
 
 _GRAVA_TS = 0.0   # timestamp do fim da última gravação (p/ esperar o boot)
 BOOT_ESPERA_S = 30   # boot + provisionamento + melodia levam ~24s; margem p/ 30s
+
+def act_provisionar(serial, mcu, mosfet_pin):
+    # BACKUP baud-agnóstico: provisiona o módulo MANDANDO A SEQUÊNCIA AT POR BLE
+    # (método do AT.py do dev). Serve p/ o caso raro em que o auto-provisionamento
+    # do firmware não fecha (módulo em estado exótico). Alvo = padrão NOVO: 9600
+    # (AT+BAUD2) + PWRM0 (auto-sleep OFF; a 9600 não há wake-por-dado) + BEFC/AFTC
+    # (gate do MOSFET + wake) + nome = serial.
+    STATUS("provisionar", "run")
+    alvo = serial[2:] if serial.startswith("CH") else serial
+    befc, aftc = calcular_hex_befc_aftc(mosfet_pin)
+    LOG(f"Provisionando módulo por BLE (pino MOSFET={mosfet_pin} → BEFC{befc}/AFTC{aftc})...", "hi")
+    comandos = [
+        "AT+SHIELD1",
+        "AT+BAUD2",              # 9600 (padrão de fábrica = auto-cura no reset)
+        "AT+PWRM0",              # auto-sleep OFF (sempre acordado)
+        f"AT+BEFC{befc}",
+        f"AT+AFTC{aftc}",
+        f"AT+NAME{alvo}",
+        "AT+RESET",              # aplica o baud/config novos
+    ]
+    BLE.disconnect(); time.sleep(1.0)
+    try:
+        addr = BLE.scan_prov(alvo, timeout=8.0)
+    except Exception as e:
+        LOG(f"✗ Erro no scan BLE: {e}", "err"); STATUS("provisionar", "fail"); return False
+    if not addr:
+        LOG("✗ Módulo não encontrado. Ele anuncia como 'Soft AT' (virgem) ou pelo serial. "
+            "Religue a bateria e tente de novo.", "err")
+        STATUS("provisionar", "fail"); return False
+    try:
+        ok = BLE.provisionar_at(addr, comandos)
+    except Exception as e:
+        LOG(f"✗ Erro ao provisionar: {e}", "err"); STATUS("provisionar", "fail"); return False
+    if ok:
+        LOG("✓ Módulo provisionado por BLE (9600 + PWRM0 + wake + nome). "
+            "Religue a bateria (Rocky) e siga p/ o passo Conectar.", "ok")
+        STATUS("provisionar", "ok"); return True
+    LOG("⚠️ Provisionamento parcial (algum AT sem resposta). Pode repetir.", "warn")
+    STATUS("provisionar", "fail"); return False
+
 
 def act_conectar(serial, mcu):
     STATUS("conectar", "run")
@@ -902,6 +1035,12 @@ PAGE = r"""<!DOCTYPE html>
         <select id="mcu"><option value="m328pb">FI 1.5</option>
           <option value="m328p">FI 1.0</option></select>
       </div>
+      <div class="row center" style="margin-top:12px">
+        <label style="color:var(--muted);font-size:14px">Pino MOSFET</label>
+        <input id="mosfet" inputmode="numeric" maxlength="2" value="8"
+          style="width:60px;text-align:center"
+          title="Pino do MOSFET do módulo BLE. 90% das FIs = 8. Só mude se a placa usar outro.">
+      </div>
     </div>
     <button class="big" id="btn-next" style="margin-top:20px" disabled>PRÓXIMO ▶</button>
   </div>
@@ -1037,6 +1176,12 @@ function renderSteps(){
       body:JSON.stringify({serial:SERIAL})}).catch(()=>{});
   };
   comp.appendChild(con);
+  // BACKUP: provisiona o módulo POR BLE (sequência AT do parque em 9600). Só se
+  // o firmware não auto-provisionou (4 beeps / sem PONG) — normalmente NÃO precisa.
+  const prov=document.createElement("button");
+  prov.textContent="⚙️ Provisionar módulo (BLE)";
+  prov.onclick=()=>runStep("provisionar");
+  comp.appendChild(prov);
 }
 
 function setChip(step,state){
@@ -1047,8 +1192,9 @@ function setChip(step,state){
 
 async function runStep(step){
   if(busy)return; busy=true;
+  const mosfet=($("#mosfet")&&$("#mosfet").value)||"8";
   const r=await fetch("/api/step",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({step,serial:SERIAL,mcu:MCU})}).then(r=>r.json()).catch(()=>({ok:false}));
+    body:JSON.stringify({step,serial:SERIAL,mcu:MCU,mosfet})}).then(r=>r.json()).catch(()=>({ok:false}));
   busy=false;
   if(r && r.need_login){ abrirLogin(); }
 }
@@ -1227,6 +1373,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _step(self, b):
         step, serial, mcu = b.get("step"), b.get("serial", ""), b.get("mcu", "m328pb")
+        if step == "provisionar":
+            r = act_provisionar(serial, mcu, b.get("mosfet", "8"))
+            return {"ok": bool(r)}
         fn = {"gravar": act_gravar, "validar": act_validar, "conectar": act_conectar,
               "autoteste": act_autoteste, "cadastrar": act_cadastrar}.get(step)
         if not fn:
