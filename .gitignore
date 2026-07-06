@@ -9,3 +9,5 @@ packaging/dist/
 packaging/build/
 packaging/.venv-build/
 packaging/avrdude/
+.DS_Store
+**/.DS_Store
