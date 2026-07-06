@@ -497,6 +497,11 @@ def act_validar(serial, mcu):
 def act_conectar(serial, mcu):
     STATUS("conectar", "run")
     alvo = serial[2:] if serial.startswith("CH") else serial
+    # Desconecta a sessão anterior ANTES do scan: dispositivo conectado NÃO
+    # anuncia — escanear ainda conectado dava "não encontrada" falso (visto na
+    # 2584, cujo módulo não aceita AT+DROP e a conexão nunca caía sozinha).
+    BLE.disconnect()
+    time.sleep(1.0)
     try:
         addr = BLE.scan(alvo, timeout=8.0)
     except Exception as e:
