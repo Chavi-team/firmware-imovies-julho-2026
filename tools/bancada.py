@@ -500,17 +500,9 @@ def act_gravar(serial, mcu):
                 gerar_seed_bin(serial, _placa_de(m), seed_bin)
             except Exception:
                 break
-        # CRISTAL EXTERNO 16MHz (a placa TEM — schema): OBRIGATÓRIO p/
-        # SoftwareSerial a 9600 (baud de fábrica do módulo) ser confiável. O RC
-        # de 8MHz não fala 9600 bem -> não convertia o módulo (ficava mudo).
-        #   lfuse: 328PB=0xFF, 328/328P=0xF7 (16MHz, CKDIV8 off)
-        #   efuse: 0xF7 (BOD; 2.7V p/ reintroduzir depois de estabilizar)
-        #   hfuse: 0xD7 (EESAVE liga, sem bootloader) | lock: 0xCF
-        lfuse = "0xFF" if m == "m328pb" else "0xF7"
-        efuse = "0xF7"
         rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
-                        "-U", f"lfuse:w:{lfuse}:m", "-U", "hfuse:w:0xD7:m",
-                        "-U", f"efuse:w:{efuse}:m", "-U", "lock:w:0xCF:m",
+                        "-U", "lfuse:w:0xE2:m", "-U", "hfuse:w:0xD7:m",
+                        "-U", "efuse:w:0xF7:m", "-U", "lock:w:0xCF:m",
                         "-U", f"eeprom:w:{seed_bin}:r", "-U", f"flash:w:{HEX}:i"])
         if rc == 0:
             MCU_REAL[serial] = m

@@ -1,6 +1,6 @@
 profiles:
   chavi_fi:
-    fqbn: MiniCore:avr:328:bootloader=no_bootloader,clock=16MHz_external,BOD=2v7,eeprom=keep,LTO=Os_flto
+    fqbn: MiniCore:avr:328:bootloader=no_bootloader,clock=8MHz_internal,BOD=2v7,eeprom=keep,LTO=Os_flto
     platforms:
       - platform: MiniCore:avr (3.0.1)
         platform_index_url: https://mcudude.github.io/MiniCore/package_MCUdude_MiniCore_index.json
