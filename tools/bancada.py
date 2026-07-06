@@ -40,7 +40,16 @@ ROOT = os.path.dirname(HERE)
 # os arquivos de trabalho (config, logs, seeds) ficam AO LADO do executável.
 FROZEN = bool(getattr(sys, "frozen", False))
 RES = getattr(sys, "_MEIPASS", HERE)
-WORK = os.path.dirname(os.path.abspath(sys.executable)) if FROZEN else HERE
+if FROZEN:
+    _exe = os.path.abspath(sys.executable)
+    if ".app/Contents/MacOS" in _exe:
+        # dentro de um bundle .app (read-only): grava no Home do usuário
+        WORK = os.path.expanduser("~/Chavi-FI-Bancada")
+        os.makedirs(WORK, exist_ok=True)
+    else:
+        WORK = os.path.dirname(_exe)          # pasta descompactada (gravável)
+else:
+    WORK = HERE
 
 SKETCH_DIR = os.path.join(ROOT, "chavi_fi")
 BIN_DIR = os.path.join(WORK, "bancada-arquivos") if FROZEN else os.path.join(ROOT, "bin")
@@ -1222,14 +1231,35 @@ def main():
     srv = ThreadingHTTPServer(("127.0.0.1", porta), Handler)
     url = f"http://127.0.0.1:{porta}/"
     print(f">> Bancada Chavi FI em {url}")
-    if not os.environ.get("BANCADA_NO_BROWSER"):
-        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    # Servidor numa thread daemon; a GUI (webview) precisa da MAIN thread no macOS.
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     threading.Timer(1.0, _checar_ferramentas).start()
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        print("\n>> encerrando")
+
+    if os.environ.get("BANCADA_NO_BROWSER"):        # modo teste/headless
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
         CABO.fechar()
+        return
+
+    # JANELA NATIVA PRÓPRIA (pywebview: WKWebView no Mac / WebView2 no Windows).
+    # Bloqueia até fechar a janela. Fallback: navegador padrão.
+    try:
+        import webview
+        webview.create_window("Chavi FI — Bancada", url, width=940, height=860,
+                              min_size=(760, 640))
+        webview.start()                             # bloqueia; retorna ao fechar
+    except Exception as e:
+        print(f">> Janela nativa indisponível ({e}); abrindo no navegador.")
+        webbrowser.open(url)
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+    CABO.fechar()
 
 
 if __name__ == "__main__":

@@ -31,7 +31,9 @@ a = Analysis(
     pathex=[TOOLS],
     binaries=[],
     datas=datas,
-    hiddenimports=["bleak", "serial", "serial.tools.list_ports", "requests"],
+    hiddenimports=["bleak", "serial", "serial.tools.list_ports", "requests",
+                   "webview", "webview.platforms.cocoa", "webview.platforms.winforms",
+                   "objc", "Foundation", "WebKit", "AppKit"],
     hookspath=[],
     runtime_hooks=[],
     excludes=["tkinter", "matplotlib", "numpy", "PIL"],
@@ -47,7 +49,7 @@ exe = EXE(
     exclude_binaries=True,
     name="Chavi-Fi-Imoveis-Setup",
     debug=False, bootloader_ignore_signals=False, strip=False,
-    upx=True, console=True,
+    upx=True, console=False,   # janela nativa (webview) — sem terminal preto
     disable_windowed_traceback=False, argv_emulation=False,
     target_arch=None, codesign_identity=None, entitlements_file=None,
 )
@@ -56,3 +58,19 @@ coll = COLLECT(
     strip=False, upx=True, upx_exclude=[],
     name="Chavi-Fi-Imoveis-Setup",
 )
+
+# No macOS, empacota num BUNDLE .app (ícone no Dock, sem terminal preto).
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="Chavi-Fi-Imoveis-Setup.app",
+        icon=None,
+        bundle_identifier="com.chavi.fi.setup",
+        info_plist={
+            "NSHighResolutionCapable": True,
+            "LSBackgroundOnly": False,
+            "NSBluetoothAlwaysUsageDescription":
+                "Testar as fechaduras por Bluetooth na bancada.",
+            "CFBundleName": "Chavi FI Setup",
+        },
+    )

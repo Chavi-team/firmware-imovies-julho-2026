@@ -19,17 +19,21 @@ echo "== 2/4 avrdude standalone =="
 echo "== 3/4 venv de build + PyInstaller =="
 BV="$HERE/.venv-build"
 [[ -d "$BV" ]] || /usr/bin/python3 -m venv "$BV"
-"$BV/bin/pip" install --quiet --upgrade pip pyinstaller bleak pyserial requests
+"$BV/bin/pip" install --quiet --upgrade pip pyinstaller bleak pyserial requests \
+  pywebview pyobjc-framework-WebKit pyobjc-framework-Cocoa
 
 echo "== 4/4 empacotando =="
 rm -rf "$HERE/build" "$HERE/dist"
 "$BV/bin/pyinstaller" --clean --distpath "$HERE/dist" --workpath "$HERE/build" \
   "$HERE/chavi_fi_setup.spec"
 
-# instruções ao lado do app + zip
-cp "$HERE/LEIA-ME.txt" "$HERE/dist/Chavi-Fi-Imoveis-Setup/" 2>/dev/null || true
+# empacota o .app (janela nativa) + instruções. Remove o atributo de quarentena
+# para reduzir o atrito do Gatekeeper no destino.
 cd "$HERE/dist"
-zip -rqy Chavi-Fi-Imoveis-Setup-mac.zip Chavi-Fi-Imoveis-Setup
+xattr -cr "Chavi-Fi-Imoveis-Setup.app" 2>/dev/null || true
+cp "$HERE/LEIA-ME.txt" .
+rm -f Chavi-Fi-Imoveis-Setup-mac.zip
+zip -rqy Chavi-Fi-Imoveis-Setup-mac.zip Chavi-Fi-Imoveis-Setup.app LEIA-ME.txt
 echo ">> PRONTO: packaging/dist/Chavi-Fi-Imoveis-Setup-mac.zip"
-echo ">> Distribua o .zip; no Mac de destino: descompactar e rodar o app"
+echo ">> No Mac de destino: descompactar e rodar o app Chavi-Fi-Imoveis-Setup"
 echo "   (1ª vez: botão direito ▸ Abrir, por causa do Gatekeeper)."

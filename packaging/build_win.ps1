@@ -32,7 +32,7 @@ if (-not (Test-Path "$avr\avrdude.exe")) {
 Write-Host "== 3/4 venv + PyInstaller ==" -ForegroundColor Cyan
 $BV = "$HERE\.venv-build"
 if (-not (Test-Path $BV)) { python -m venv $BV }
-& "$BV\Scripts\pip.exe" install --quiet --upgrade pip pyinstaller bleak pyserial requests
+& "$BV\Scripts\pip.exe" install --quiet --upgrade pip pyinstaller bleak pyserial requests pywebview
 
 Write-Host "== 4/4 empacotando ==" -ForegroundColor Cyan
 Remove-Item -Recurse -Force "$HERE\build","$HERE\dist" -ErrorAction SilentlyContinue
