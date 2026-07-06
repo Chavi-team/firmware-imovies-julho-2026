@@ -34,11 +34,31 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # ---------------------------------------------------------------------------
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+
+# EMPACOTADO (PyInstaller / Chavi-Fi-Imoveis-Setup): os recursos somente-
+# leitura (hex pré-compilado, avrdude) vêm de dentro do bundle (_MEIPASS);
+# os arquivos de trabalho (config, logs, seeds) ficam AO LADO do executável.
+FROZEN = bool(getattr(sys, "frozen", False))
+RES = getattr(sys, "_MEIPASS", HERE)
+WORK = os.path.dirname(os.path.abspath(sys.executable)) if FROZEN else HERE
+
 SKETCH_DIR = os.path.join(ROOT, "chavi_fi")
-BIN_DIR = os.path.join(ROOT, "bin")
-HEX = os.path.join(BIN_DIR, "chavi_fi.ino.hex")
-GERAR_SEED = os.path.join(HERE, "gerar_seed.py")
-CFG_PATH = os.path.join(HERE, ".bancada.json")
+BIN_DIR = os.path.join(WORK, "bancada-arquivos") if FROZEN else os.path.join(ROOT, "bin")
+HEX = os.path.join(RES, "chavi_fi.ino.hex") if FROZEN else os.path.join(BIN_DIR, "chavi_fi.ino.hex")
+CFG_PATH = os.path.join(WORK, ".bancada.json")
+
+
+def _avrdude_cmd():
+    """avrdude embutido no pacote (com o próprio .conf) ou o do PATH."""
+    exe = "avrdude.exe" if os.name == "nt" else "avrdude"
+    bundled = os.path.join(RES, "avrdude", exe)
+    if os.path.exists(bundled):
+        cmd = [bundled]
+        conf = os.path.join(RES, "avrdude", "avrdude.conf")
+        if os.path.exists(conf):
+            cmd += ["-C", conf]
+        return cmd
+    return ["avrdude"]
 
 SEED_MAX_RANGE = 429496729
 SEED_SECRET = os.getenv("SEED_SECRET", "CHAVI")
@@ -56,6 +76,29 @@ def get_seed(serial, k):
 
 def seeds_de(serial):
     return [get_seed(serial, k) for k in range(1, 5)]
+
+
+# Gera o seed.bin INTERNAMENTE (espelho do gerar_seed.py — no pacote não há
+# interpretador Python para subprocess). Layout idêntico ao seedGenerator legado.
+def gerar_seed_bin(serial, placa, caminho):
+    eeprom = bytearray(1024)
+    eeprom[1] = 0x01     # setupSeedOk
+    eeprom[101] = 0x01   # warning sound
+    eeprom[102] = 0x01   # light warning
+    eeprom[104] = 0x01   # button
+    eeprom[105] = 0x01   # auto close
+    eeprom[150] = 0x01   # setupProductionOk
+    s11 = serial[2:]
+    eeprom[769:769 + len(s11)] = s11.encode()
+    for i in range(4):
+        a = 10 * i + 5
+        eeprom[a:a + 4] = get_seed(serial, i + 1).to_bytes(4, "little")
+    eeprom[900] = 0x01   # layout de telemetria
+    eeprom[912] = 0x01 if placa == "fi10" else 0x00   # byte de PLACA
+    with open(caminho, "wb") as f:
+        f.write(eeprom)
+    LOG(f"seed.bin gerado: {serial} placa={'FI 1.0' if placa == 'fi10' else 'FI 1.5'} "
+        f"seeds={seeds_de(serial)}")
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +149,7 @@ BUS = Bus()
 
 # Log server-side: TODA linha vai para tools/bancada-live.log (o assistente pode
 # ler direto, sem depender de download). Recriado a cada boot do servidor.
-LIVE_LOG = os.path.join(HERE, "bancada-live.log")
+LIVE_LOG = os.path.join(WORK, "bancada-live.log")
 try:
     open(LIVE_LOG, "w").close()
 except Exception:
@@ -421,16 +464,22 @@ MCU_REAL = {}
 def act_gravar(serial, mcu):
     STATUS("gravar", "run")
     os.makedirs(BIN_DIR, exist_ok=True)
-    if _fonte_mais_nova_que_hex():
+    if FROZEN:
+        # Pacote: usa o .hex EMBUTIDO (pré-compilado) — sem arduino-cli.
+        if not os.path.exists(HEX):
+            LOG("Pacote sem o firmware embutido (.hex) — pacote corrompido.", "err")
+            STATUS("gravar", "fail"); return False
+    elif _fonte_mais_nova_que_hex():
         LOG("Firmware mudou (ou 1ª vez) — compilando antes de gravar...", "warn")
         rc, _ = _exec(["arduino-cli", "compile", "--profile", "chavi_fi",
                        "--build-path", BIN_DIR, SKETCH_DIR])
         if rc != 0 or not os.path.exists(HEX):
             LOG("Falha ao compilar.", "err"); STATUS("gravar", "fail"); return False
     seed_bin = _seed_bin(serial)
-    rc, _ = _exec([sys.executable, GERAR_SEED, serial, seed_bin, _placa_de(mcu)])
-    if rc != 0 or not os.path.exists(seed_bin):
-        LOG("Falha ao gerar as seeds.", "err"); STATUS("gravar", "fail"); return False
+    try:
+        gerar_seed_bin(serial, _placa_de(mcu), seed_bin)
+    except Exception as e:
+        LOG(f"Falha ao gerar as seeds: {e}", "err"); STATUS("gravar", "fail"); return False
     LOG("Gravando... NÃO mexa no cabo agora.", "hi")
     # Se a ASSINATURA do chip não bater com o MCU selecionado, tenta os outros
     # (m328pb=FI1.5, m328p/m328=FI1.0 — placas antigas misturam 328 e 328P).
@@ -438,13 +487,14 @@ def act_gravar(serial, mcu):
     for i, m in enumerate(candidatos):
         if i > 0:
             LOG(f"Assinatura não bateu — tentando chip {m}...", "warn")
-            rc, _ = _exec([sys.executable, GERAR_SEED, serial, seed_bin, _placa_de(m)])
-            if rc != 0:
+            try:
+                gerar_seed_bin(serial, _placa_de(m), seed_bin)
+            except Exception:
                 break
-        rc, out = _exec(["avrdude", "-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
-                         "-U", "lfuse:w:0xE2:m", "-U", "hfuse:w:0xD7:m",
-                         "-U", "efuse:w:0xF7:m", "-U", "lock:w:0xCF:m",
-                         "-U", f"eeprom:w:{seed_bin}:r", "-U", f"flash:w:{HEX}:i"])
+        rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
+                        "-U", "lfuse:w:0xE2:m", "-U", "hfuse:w:0xD7:m",
+                        "-U", "efuse:w:0xF7:m", "-U", "lock:w:0xCF:m",
+                        "-U", f"eeprom:w:{seed_bin}:r", "-U", f"flash:w:{HEX}:i"])
         if rc == 0:
             MCU_REAL[serial] = m
             LOG(f"✓ {serial} gravada (chip {m}, placa {_placa_de(m)}). 1 bipe = viva; "
@@ -466,8 +516,8 @@ def act_validar(serial, mcu):
     for i, m in enumerate(candidatos):
         if i > 0:
             LOG(f"Assinatura não bateu — relendo como {m}...", "warn")
-        rc, out = _exec(["avrdude", "-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
-                         "-U", f"eeprom:r:{eep}:r"])
+        rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
+                        "-U", f"eeprom:r:{eep}:r"])
         if rc == 0:
             MCU_REAL[serial] = m
             break
@@ -1148,20 +1198,32 @@ def _porta_livre(inicio=8765):
 
 
 def _checar_ferramentas():
-    for t in ("arduino-cli", "avrdude"):
-        p = shutil.which(t)
-        LOG(("✓ " if p else "✗ ") + f"{t}: {p or 'NÃO encontrado no PATH'}",
+    av = _avrdude_cmd()
+    if os.path.sep in av[0]:
+        LOG(f"✓ avrdude embutido no pacote: {av[0]}", "ok")
+    else:
+        p = shutil.which("avrdude")
+        LOG(("✓ " if p else "✗ ") + f"avrdude: {p or 'NÃO encontrado no PATH'}",
+            "ok" if p else "err")
+    if FROZEN:
+        LOG(f"✓ firmware embutido: {os.path.basename(HEX)}"
+            f" ({os.path.getsize(HEX)} bytes)" if os.path.exists(HEX)
+            else "✗ firmware embutido AUSENTE", "ok" if os.path.exists(HEX) else "err")
+    else:
+        p = shutil.which("arduino-cli")
+        LOG(("✓ " if p else "✗ ") + f"arduino-cli: {p or 'NÃO encontrado no PATH'}",
             "ok" if p else "err")
 
 
 def main():
-    if not os.path.exists(SKETCH_DIR):
+    if not FROZEN and not os.path.exists(SKETCH_DIR):
         print(f"Sketch não encontrado em {SKETCH_DIR}", file=sys.stderr); sys.exit(1)
     porta = _porta_livre()
     srv = ThreadingHTTPServer(("127.0.0.1", porta), Handler)
     url = f"http://127.0.0.1:{porta}/"
     print(f">> Bancada Chavi FI em {url}")
-    threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    if not os.environ.get("BANCADA_NO_BROWSER"):
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     threading.Timer(1.0, _checar_ferramentas).start()
     try:
         srv.serve_forever()

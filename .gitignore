@@ -3,3 +3,9 @@ tools/.venv-bancada/
 tools/.bancada.json
 tools/bancada-live.log
 __pycache__/
+
+# pacotes de bancada (buildados localmente)
+packaging/dist/
+packaging/build/
+packaging/.venv-build/
+packaging/avrdude/

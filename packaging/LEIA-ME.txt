@@ -1,0 +1,41 @@
+CHAVI-FI-IMOVEIS-SETUP — Bancada de gravação de fechaduras FI
+==============================================================
+
+O QUE É
+  Estação portátil para gravar o firmware nas fechaduras Chavi FI (1.0 e 1.5)
+  e testá-las. Não precisa instalar nada (Python, avrdude e o firmware já vêm
+  embutidos). Funciona em Mac e Windows.
+
+COMO USAR
+  1. Conecte o gravador USBasp no USB.
+     - Windows: se for a 1ª vez, instale o driver do USBasp com o "Zadig"
+       (zadig.akeo.ie) -> selecione o USBasp -> Install Driver (libusbK).
+     - Mac: nada a instalar.
+  2. Abra o programa:
+     - Mac: botão DIREITO no app "Chavi-Fi-Imoveis-Setup" -> Abrir (só na 1ª
+       vez, por causa do Gatekeeper). Depois é 2 cliques.
+     - Windows: 2 cliques em "Chavi-Fi-Imoveis-Setup.exe".
+  3. Abre uma página no navegador (a bancada). Se não abrir sozinha, acesse o
+     endereço http://127.0.0.1:8765 mostrado na janela preta.
+  4. Digite o número de série (CH + 3 dígitos + FI + 6 dígitos), escolha a
+     PLACA (FI 1.5 ou FI 1.0) e siga os passos: Gravar -> Validar ->
+     Conectar (BLE) -> Auto-teste -> Cadastrar.
+
+REGRAS DE OURO
+  - Bateria DENTRO da fechadura ao gravar (o USBasp não alimenta o MCU na 1.5).
+  - Na FI 1.0: MANTENHA o USBasp plugado até ouvir a MELODIA (o rádio precisa
+    de energia para terminar a configuração).
+  - Contato firme do USBasp (header 2x3). Se a gravação falhar por
+    "target does not answer" / "verification mismatch", é contato: repita.
+  - 1 bipe = viva | melodia = pronta | 4 bipes graves = módulo BLE suspeito.
+
+CADASTRO NO SISTEMA (opcional)
+  Precisa de internet e de um telefone de ADMIN (login por código no WhatsApp).
+
+ARQUIVOS GERADOS (ao lado do programa)
+  bancada-arquivos\  -> seeds e verificações
+  bancada-live.log   -> registro de tudo (mande para o suporte se algo falhar)
+  .bancada.json      -> login salvo
+
+SUPORTE: mande o bancada-live.log + o número de série + o que a fechadura
+tocou/piscou.
