@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.6.3"
+#define FW_VERSION   "2.7.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -370,23 +370,32 @@ uint8_t bleLerVersao() {
 void configModuloLeve() {
     // Com um cliente CONECTADO o módulo está em modo túnel: não interpreta AT
     // e ainda REPASSA cada comando como notificação — o app receberia
-    // "AT+..." no meio do handshake e extrairia números-lixo. Pula.
-    if (digitalRead(PIN_WAKE) == HIGH) { DBGLN(F("[cfg] conectado - pula config")); return; }
+    // "AT+..." no meio do handshake e extrairia números-lixo.
+    // ⚠️ EXCEÇÃO placa 1.0: NÃO pular — nela esta função também SEGURA O TRILHO
+    // DE ENERGIA (gate do mosfet num PIO do módulo). Pular com PD3 alto era um
+    // dos motivos das 1.0 mortas (relatório FI10_ANALISE §2).
+    if (!placa10 && digitalRead(PIN_WAKE) == HIGH) {
+        DBGLN(F("[cfg] conectado - pula config")); return;
+    }
+    at("AT+PWRM1");    // ANTES de tudo: tira o auto-sleep (senão o 1º AT só acorda)
     at("AT+TYPE0");    // sem pareamento
     at("AT+MODE2");    // túnel de dados (repassa os bytes pro MCU)
     at("AT+ROLE0");    // slave
     at("AT+DELI3");    // delimitador '\n' nos 2 sentidos
     at("AT+NOTI1");    // notify ligado
-    // MOSFET do trilho de energia: na 1.5_400 o gate é o PIO8; na 1.0_400 pode
-    // ser PIO7, 8 OU 9 (a esteira at.js suportava os três). Na placa 1.0
-    // erguemos os TRÊS — imediato (PIOx1, religa o trilho JÁ) e persistente
-    // (BEFC070/AFTC078 = bits 7+8+9 altos + wake no PIO6). ⚠️ Foi a falta disto
-    // que "matou" as 1.0 após o AT+RENEW: o reset de fábrica derrubou o PIO do
-    // MOSFET e o módulo cortou a energia do próprio MCU (viva só via USBasp).
     if (placa10) {
-        at("AT+PIO71"); at("AT+PIO81"); at("AT+PIO91");
-        at("AT+BEFC070");
-        at("AT+AFTC078");
+        // GATE DO MOSFET que alimenta o MCU. O pino NÃO é fixo: a esteira at.js
+        // suporta PIO 4/5/6/7 (default 4) e o upload antigo usava 7/8/9.
+        // Erguemos TODOS os candidatos — imediato (PIOx1 religa o trilho JÁ) e
+        // persistente na NVM (BEFCFF7 = todos os PIOs altos ANTES da conexão,
+        // menos o bit3=PIO6 p/ o wake; AFTCFFF = todos altos DEPOIS). Ligar
+        // PIOs não-usados é inócuo (não há nada neles); o que importa é o gate
+        // certo subir seja qual for. Isto substitui o BEFC070 (que zerava
+        // 4/5!) — a causa provável do resgate ter falhado (relatório §2).
+        at("AT+PIO41"); at("AT+PIO51"); at("AT+PIO71");
+        at("AT+PIO81"); at("AT+PIO91");
+        at("AT+BEFCFF7");
+        at("AT+AFTCFFF");
     } else {
         at("AT+BEFC020");  // MOSFET(PIO8)=1, wake(PIO6)=0 antes da conexão
         at("AT+AFTC028");  // MOSFET(PIO8)=1, wake(PIO6)=1 depois -> borda de wake
@@ -422,15 +431,34 @@ void bleProvisionar() {
     static const long TODOS[] = {2400, 9600, 38400, 19200, 57600, 4800, 115200, 1200};
     const uint8_t N = sizeof(TODOS) / sizeof(long);
 
-    // PASSO 0 — reset de fábrica às cegas (RENEW p/ HM-10, DEFAULT p/ clones;
-    // o que o módulo não conhecer ele ignora).
-    for (uint8_t i = 0; i < N; i++) {
-        bluetooth.begin(TODOS[i]);
-        delay(30);
-        at("AT", 120);                         // acorda (PWRM)
-        at("AT+RENEW", 300);
-        at("AT+DEFAULT", 300);
-        delay(400);                            // módulo re-inicializa nos defaults
+    // PASSO 0 — reset de fábrica às cegas (RENEW/DEFAULT). ⚠️ SÓ na placa 1.5.
+    // NA PLACA 1.0 O RENEW É VENENO: ele apaga o AT+BEFC da NVM que segura o
+    // gate do MOSFET de energia -> o módulo corta a alimentação do próprio MCU
+    // no meio do provisionamento (causa-raiz das 0718/0629 mortas — relatório
+    // FI10_ANALISE §1; nenhum firmware/esteira legado jamais usou RENEW). Na
+    // 1.0 a config leve abaixo já reconfigura tudo e PRESERVA o BEFC.
+    if (!placa10) {
+        for (uint8_t i = 0; i < N; i++) {
+            bluetooth.begin(TODOS[i]);
+            delay(30);
+            at("AT", 120);                     // acorda (PWRM)
+            at("AT+RENEW", 300);
+            at("AT+DEFAULT", 300);
+            delay(400);                        // módulo re-inicializa nos defaults
+        }
+    } else {
+        // 1.0: primeiro RELIGA O TRILHO em todos os bauds (wake longo + PWRM1 +
+        // ergue os PIOs candidatos do gate), antes de qualquer coisa que
+        // pudesse cortar a energia. Sem RENEW.
+        for (uint8_t i = 0; i < N; i++) {
+            bluetooth.begin(TODOS[i]);
+            delay(30);
+            for (uint8_t k = 0; k < 6; k++) at("AT", 40);   // acorda o PWRM
+            at("AT+PWRM1", 120);
+            at("AT+PIO41", 60); at("AT+PIO51", 60); at("AT+PIO71", 60);
+            at("AT+PIO81", 60); at("AT+PIO91", 60);
+            at("AT+BEFCFF7", 80); at("AT+AFTCFFF", 80);
+        }
     }
 
     // PASSO 1 — converge p/ 2400 (pós-RENEW o módulo está no baud de fábrica).
@@ -776,20 +804,20 @@ void atenderBotao() {
 void dormir() {
     motorPara();
 #if FEATURE_HIBERNA_MOSFET
-    // Hibernação profunda — receita EXATA do goToSleep() do FI_1_0_400 de
-    // produção (lá o LowPower.powerDown está COMENTADO: o sono da placa _400
-    // É o corte do trilho): AT+DROP -> AT+PIO61 -> AT+PIO80. Morremos no
-    // PIO80; o AFTC028 religa o trilho quando um celular conecta e o boot com
-    // EE_HIB=1 vai direto atender o app. Se em 3s ainda estivermos vivos
-    // (módulo não obedeceu o corte), cai no powerDown normal.
-    at("AT+DROP", 500);
-    at("AT+PIO61", 500);
-    EEPROM.update(EE_HIB, 1);
-    at("AT+PIO80", 60);
-    if (placa10) { at("AT+PIO70", 60); at("AT+PIO90", 60); }  // mosfet 1.0: pino 7/8/9
-    delay(3000);
-    EEPROM.update(EE_HIB, 0);
-    DBGLN(F("[hib] modulo nao cortou - powerDown normal"));
+    // Hibernação profunda por corte do trilho — receita do goToSleep() do
+    // FI_1_0_400. ⚠️ DESLIGADA na placa 1.0: o pino do gate ainda não está
+    // confirmado (4/5/7/8/9) e um corte que não religue deixa a fechadura
+    // MORTA (é o que estamos combatendo). Na 1.0, sono = powerDown normal, que
+    // NÃO corta a energia (relatório FI10_ANALISE §3 recomenda até validar).
+    if (!placa10) {
+        at("AT+DROP", 500);
+        at("AT+PIO61", 500);
+        EEPROM.update(EE_HIB, 1);
+        at("AT+PIO80", 60);
+        delay(3000);
+        EEPROM.update(EE_HIB, 0);
+        DBGLN(F("[hib] modulo nao cortou - powerDown normal"));
+    }
 #endif
     at("AT+DROP", 60); at("AT+PIO60", 60);
     acordouBLE = false; acordouBtn = false;
