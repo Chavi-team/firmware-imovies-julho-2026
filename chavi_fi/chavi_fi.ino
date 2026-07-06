@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.7.5"
+#define FW_VERSION   "2.7.6"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -397,6 +397,14 @@ void configModuloLeve() {
     }
     at("AT+PWRM1");    // ANTES de tudo: tira o auto-sleep (senão o 1º AT só acorda)
     at("AT+TYPE0");    // sem pareamento
+    // NOME reafirmado a CADA boot (como o changeName do FI_1_5) e ANTES do
+    // MODE2 — em MODE2 (túnel) alguns clones ignoram o AT+NAME. Sem isto, o
+    // nome só era tentado no 1º boot e, se falhasse, ficava o de fábrica.
+    if (serialFech[0]) {
+        char nm[24];
+        snprintf(nm, sizeof(nm), "AT+NAME%s", serialFech);
+        at(nm, 200);
+    }
     at("AT+MODE2");    // túnel de dados (repassa os bytes pro MCU)
     at("AT+ROLE0");    // slave
     at("AT+DELI3");    // delimitador '\n' nos 2 sentidos
@@ -503,10 +511,21 @@ void bleProvisionar() {
     g_moduloVers = bleLerVersao();
     DBG(F("[prov] AT+VERS? -> geracao ")); DBGLN(g_moduloVers);
     EEPROM.update(EE_VERS_BLE, g_moduloVers);
+    // O AT+NAME é enviado DENTRO do configModuloLeve, ANTES do AT+MODE2 (em
+    // MODE2 o clone ignora o NAME) — e é reafirmado em todo boot. Reforço extra
+    // aqui em VÁRIOS BAUDS às cegas: se a convergência de baud não fechou, o
+    // nome pega no baud certo mesmo assim (nos outros bauds é lixo inócuo).
+    if (serialFech[0]) {
+        char nm[24];
+        snprintf(nm, sizeof(nm), "AT+NAME%s", serialFech);
+        const long bd[] = {2400, 9600, 38400, 19200, 57600, 4800};
+        for (uint8_t i = 0; i < sizeof(bd) / sizeof(long); i++) {
+            bluetooth.begin(bd[i]); delay(30);
+            at("AT", 50); at(nm, 180);
+        }
+        bluetooth.begin(BAUD_MODULO); delay(100);
+    }
     configModuloLeve();
-    char cmd[24];
-    snprintf(cmd, sizeof(cmd), "AT+NAME%s", serialFech[0] ? serialFech : "CHAVIFI");
-    at(cmd, 250);
     at("AT+START", 150);                       // se IMME1 residual, inicia o anúncio
     // Flag ANTES do reset final: se a bateria afundar durante o reset/espera,
     // o provisionamento não fica re-rodando (pesado) em todo boot.
