@@ -779,9 +779,10 @@ PAGE = r"""<!DOCTYPE html>
       <div class="seeds" id="seeds"></div>
       <div class="row center" style="margin-top:16px">
         <label style="color:var(--muted);font-size:14px">Placa</label>
-        <select id="mcu"><option value="m328pb">m328pb (FI 1.5)</option>
-          <option value="m328p">m328p (FI 1.0)</option>
-          <option value="m328">m328 (FI 1.0 chip antigo)</option></select>
+        <!-- só a GERAÇÃO da placa; o chip exato (328/328P/328PB) a gravação
+             descobre sozinha pelo retry de assinatura -->
+        <select id="mcu"><option value="m328pb">FI 1.5</option>
+          <option value="m328p">FI 1.0</option></select>
       </div>
     </div>
     <button class="big" id="btn-next" style="margin-top:20px" disabled>PRÓXIMO ▶</button>
