@@ -692,9 +692,17 @@ def act_gravar(serial, mcu):
     # Mensagem conforme a CAUSA (não adianta insistir clicando):
     low = out.lower()
     if "cannot find usb device" in low or "unable to open port" in low or "no usb" in low:
-        LOG("✗ O GRAVADOR sumiu da USB (não é a fechadura). ⇒ TIRE o USBasp do Mac, "
-            "espere 5s e RECONECTE (direto, sem hub). Clicar de novo NÃO resolve — "
-            "o USBasp travou e precisa ser religado.", "err")
+        if os.name == "nt":
+            LOG("✗ O Windows NÃO enxerga o gravador USBasp. Causa mais comum: o "
+                "DRIVER do USBasp não está instalado nesta máquina. ⇒ Instale o "
+                "driver com o Zadig (zadig.akeo.ie): abra o Zadig, selecione o "
+                "'USBasp' na lista e instale o 'libusbK' (ou WinUSB). É uma vez só "
+                "por computador. Se já instalou, tire e reconecte o USBasp (sem hub). "
+                "Clicar de novo NÃO resolve.", "err")
+        else:
+            LOG("✗ O GRAVADOR sumiu da USB (não é a fechadura). ⇒ TIRE o USBasp do "
+                "computador, espere 5s e RECONECTE (direto, sem hub). Clicar de novo "
+                "NÃO resolve — o USBasp travou e precisa ser religado.", "err")
     elif "does not answer" in low or "initialization failed" in low:
         LOG("✗ O chip não respondeu ao gravador. ⇒ Firme o cabo no conector ISP da "
             "placa e confirme a BATERIA dentro. Depois clique Gravar de novo.", "err")
