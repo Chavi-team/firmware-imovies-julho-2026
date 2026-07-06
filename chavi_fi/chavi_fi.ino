@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.7.3"
+#define FW_VERSION   "2.7.4"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -540,13 +540,31 @@ void enviaStatus(bool sentidoA) {
     enviaLinha(num);
 }
 
+// ANTI-DUPLICATA: se um comando de acionamento chega logo após outro, é uma
+// REEXECUÇÃO espúria (o app reenvia quando o AT+DROP do dormir() derruba a
+// conexão antes de ele confirmar o status; ou o loop() reentra no atenderApp).
+// Dentro da janela, o firmware NÃO gira de novo — só reconfirma o status
+// (o app precisa dele p/ parar de tentar). 6s cobre o giro+recuo mais lento;
+// o app tem cooldown de 4,5s entre comandos legítimos, então não atrapalha.
+#define ANTIDUP_MS 6000UL
+unsigned long g_ultimoAcionamentoMs = 0;
+
+bool acionamentoDuplicado() {
+    unsigned long agora = millis();
+    if (g_ultimoAcionamentoMs && agora - g_ultimoAcionamentoMs < ANTIDUP_MS) return true;
+    return false;
+}
+
 // HANDSHAKE COM SALTOS (app legado/cascata): manda o status ANTES de girar —
 // o app legado usa o status como confirmação rápida (timeout curto) e desconecta;
 // ele não espera o fim do giro. Mantido p/ não quebrar a base instalada.
 void acionar(unsigned long cmd) {
     bool sentidoA = (cmd == CMD_ABRIR) ? (calibrationOk == 1) : (calibrationOk == 0);
     enviaStatus(sentidoA);
+    if (acionamentoDuplicado()) return;   // reenvio: já confirmou, não gira 2x
+    g_ultimoAcionamentoMs = millis();
     motorGira(sentidoA);
+    g_ultimoAcionamentoMs = millis();     // o giro consumiu tempo; re-marca
 }
 
 // PROTOCOLO DIRETO (verbos ABRIR/FECHAR do app novo): gira PRIMEIRO (até o
@@ -555,8 +573,15 @@ void acionar(unsigned long cmd) {
 // é o "avisar quando parar". O app espera esta notificação com timeout longo.
 void acionarVerbo(unsigned long cmd) {
     bool sentidoA = (cmd == CMD_ABRIR) ? (calibrationOk == 1) : (calibrationOk == 0);
+    if (acionamentoDuplicado()) {         // reenvio dentro da janela: NÃO gira,
+        enviaStatus(sentidoA);            // só reconfirma p/ o app parar de tentar
+        return;
+    }
+    g_ultimoAcionamentoMs = millis();
     motorGira(sentidoA);      // gira até o fim de curso + recuo (motor PARA aqui)
-    enviaStatus(sentidoA);    // status = "terminei de girar"
+    g_ultimoAcionamentoMs = millis();     // re-marca no FIM (o giro levou tempo)
+    delay(120);               // garante o pacote do status transmitido...
+    enviaStatus(sentidoA);    // ...antes do AT+DROP do dormir(). "terminei de girar"
 }
 
 // ---- calibração (espelha FI_1_5, com o timing que o app precisa) ----
