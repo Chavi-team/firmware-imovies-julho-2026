@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.7.1"
+#define FW_VERSION   "2.7.2"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -532,16 +532,31 @@ void enviaLinha(const char* s) { io->print(s); io->print('\n'); io->flush(); del
 // na hora. (Uma linha só também passa, mas só depois do timeout de 5s.)
 void envia11Duplo() { enviaLinha("11"); delay(GAP_NOTIF_MS); enviaLinha("11"); }
 
-// ---- abrir/fechar: manda o status e gira (tabela de sentido do FI_1_5) ----
-// Confirmação IGUAL à de produção: println(status + bateria) -> "1004.09"
-// (status 1000/2000 somado à tensão, float com 2 casas).
-void acionar(unsigned long cmd) {
-    bool sentidoA = (cmd == CMD_ABRIR) ? (calibrationOk == 1) : (calibrationOk == 0);
+// status "1004.09" = 1000/2000 (sentido) + bateria (float 2 casas), igual produção.
+void enviaStatus(bool sentidoA) {
     float vb = analogRead(PIN_BAT) * (5.0f / 1024.0f);
     char num[16];
     dtostrf((sentidoA ? 1000.0f : 2000.0f) + vb, 0, 2, num);
     enviaLinha(num);
+}
+
+// HANDSHAKE COM SALTOS (app legado/cascata): manda o status ANTES de girar —
+// o app legado usa o status como confirmação rápida (timeout curto) e desconecta;
+// ele não espera o fim do giro. Mantido p/ não quebrar a base instalada.
+void acionar(unsigned long cmd) {
+    bool sentidoA = (cmd == CMD_ABRIR) ? (calibrationOk == 1) : (calibrationOk == 0);
+    enviaStatus(sentidoA);
     motorGira(sentidoA);
+}
+
+// PROTOCOLO DIRETO (verbos ABRIR/FECHAR do app novo): gira PRIMEIRO (até o
+// batente + recuo) e manda o status SÓ QUANDO O MOTOR PARA. Assim o app
+// confirma "concluído" no momento exato em que a fechadura terminou de girar —
+// é o "avisar quando parar". O app espera esta notificação com timeout longo.
+void acionarVerbo(unsigned long cmd) {
+    bool sentidoA = (cmd == CMD_ABRIR) ? (calibrationOk == 1) : (calibrationOk == 0);
+    motorGira(sentidoA);      // gira até o fim de curso + recuo (motor PARA aqui)
+    enviaStatus(sentidoA);    // status = "terminei de girar"
 }
 
 // ---- calibração (espelha FI_1_5, com o timing que o app precisa) ----
@@ -553,18 +568,16 @@ void calibAceitar() {
     envia11Duplo();        // de 1000ms do calibrarpt1 antes de escutar)
 }
 
-// Recebeu "CALIBRACAO-FI": confirma e gira o sentido A (= rotateMotor01 do
-// FI_1_5) para o instalador ver para que lado a porta vai.
-// ORDEM: o "11" sai ANTES do giro — o giro de DEMO numa fechadura sem carga
-// (bancada) nunca atinge o batente de corrente e rodaria os 10s de teto,
-// estourando o timeout do app ("Erro ao calibrar"). E a demo usa PULSO
-// determinístico (1,5s, sem INA219): ela só mostra o SENTIDO; batente por
-// corrente fica para os giros reais (abrir/fechar/retorno da calibração).
+// Recebeu "CALIBRACAO-FI": confirma e gira EXATAMENTE como uma abertura real —
+// motorGira faz o giro até o fim de curso (corrente) + recuo. O "11" sai ANTES
+// do giro (o app já recebe a confirmação e não estoura o timeout enquanto o
+// motor gira). Numa fechadura sem carga na bancada o giro vai até o teto de
+// tempo; instalada, para no batente — idêntico ao abrir/fechar.
 void calibGirar() {
     beep(60, 2200);
     delay(1150);           // o app arma o listener ~1s após escrever
     envia11Duplo();
-    motorGiraMs(true, 1500);
+    motorGira(true);       // giro REAL (batente + recuo), não mais pulso fixo
 }
 
 // Recebeu "PORTA-ABERTA"(1) / "PORTA-FECHADA"(0): salva o sentido e faz o giro
@@ -747,8 +760,8 @@ void atenderApp() {
             // TST-PING ao conectar (o firmware LEGADO ignora texto — parseInt
             // dá 0); se veio PONG, ele fala estes verbos. Confirmação idêntica
             // à do handshake ("1004.09" = status+bateria).
-            if (txt.startsWith("ABRIR"))       { acionar(CMD_ABRIR);  return; }
-            if (txt.startsWith("FECHAR"))      { acionar(CMD_FECHAR); return; }
+            if (txt.startsWith("ABRIR"))       { acionarVerbo(CMD_ABRIR);  return; }
+            if (txt.startsWith("FECHAR"))      { acionarVerbo(CMD_FECHAR); return; }
             if (txt.indexOf("PORTA-ABERTA")  >= 0) { calibSalvar(1); return; }
             if (txt.indexOf("PORTA-FECHADA") >= 0) { calibSalvar(0); return; }
             if (txt.indexOf("CALIBRACAO-FI") >= 0) { t0 = millis(); calibGirar(); continue; }
