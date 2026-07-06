@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.8.5"
+#define FW_VERSION   "2.9.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -94,17 +94,18 @@
 #define PIN_LED10_2  PIN_PB0
 #define PIN_LED10_3  PIN_PB1
 
-// BAUD do módulo BLE = AT+BAUD0 = "2400 SLOW". ⚠️ NÃO é um 2400 qualquer: o
-// manual (pág.22-23) distingue BAUD0="2400 slow" de BAUD1="2400", e o "acordar
-// por dado" (AT+UART1 + AT+PWRM) **só funciona em BAUD0**. Em qualquer outro
-// baud (inclusive 9600=AT+BAUD2) o módulo só acorda por PULSO no pino Wake — foi
-// por isso que o 9600 matou a comunicação. Portanto BAUD0 é OBRIGATÓRIO p/ a
-// arquitetura de wake por dado.
-// CLOCK: 8MHz RC INTERNO (domínio PROVADO em bancada com PONG na v2.1.0/2.7.6).
-// A placa TEM cristal de 16MHz (schema1/2), mas o timing "slow" do BAUD0 casou
-// com o SoftwareSerial a 8MHz; migrar p/ 16MHz é otimização a validar à parte.
-#define BAUD_MODULO  2400
-#define AT_BAUD_CMD  "AT+BAUD0"    // -> 2400 slow (único baud com wake por dado)
+// BAUD do módulo BLE = 9600 (AT+BAUD2) = PADRÃO DE FÁBRICA do módulo (manual
+// pág.8/22). ⭐ PROVA (MS BLE Explorer na CH003FI002734): AT+BAUD? -> "OK+Get2"
+// = 9600. O módulo SAI DE FÁBRICA em 9600; forçá-lo a 2400 exige falar 9600 com
+// ele, e SoftwareSerial a 9600 no RC de 8MHz é marginal -> a conversão falhava e
+// o módulo ficava mudo p/ o MCU. Usar 9600 NATIVO elimina a briga: é a config de
+// referência do fabricante (Arduino a 16MHz + SoftwareSerial 9600, manual pág.12).
+// CLOCK: CRISTAL EXTERNO 16MHz (a placa TEM — schema1/2: X1 16MHz + 22pF). É
+// OBRIGATÓRIO p/ SoftwareSerial a 9600 ser confiável (o RC de 8MHz não dá conta).
+// Sem 2400-slow, o "wake por dado" some — mas com AT+PWRM0 (auto-sleep OFF) o
+// módulo não dorme, então não precisamos dele.
+#define BAUD_MODULO  9600
+#define AT_BAUD_CMD  "AT+BAUD2"    // -> 9600 (padrão de fábrica do módulo)
 
 // Motor REAL (abrir/fechar/calibração): igual ao FI_1_5 de produção — gira até
 // detectar o BATENTE pela corrente (INA219 no I2C 0x45) ou até o teto duro.
@@ -402,13 +403,14 @@ void configModuloLeve() {
     if (!placa10 && digitalRead(PIN_WAKE) == HIGH) {
         DBGLN(F("[cfg] conectado - pula config")); return;
     }
-    // AT+PWRM1 = auto-sleep do módulo LIGADO (manual pág.39). Combinado com
-    // AT+BAUD0 (2400 slow) + AT+UART1 (padrão), o módulo dorme e ACORDA SOZINHO
-    // quando chega dado na UART — é a arquitetura de "wake por dados" (manual
-    // pág.23: só funciona em 2400 slow; em qualquer outro baud precisaria de
-    // pulso no pino Wake). O 1º byte só acorda e se perde; por isso o protocolo
-    // retenta / manda em dobro.
-    at("AT+PWRM1");
+    // ⭐ AT+PWRM0 = auto-sleep do módulo DESLIGADO (manual pág.39). O firmware
+    // ANTIGO mandava PWRM1 achando que DESLIGAVA o sleep — mas PWRM1 LIGA. Com o
+    // sleep ligado o módulo cochilava e o 1º byte de cada troca só o acordava e
+    // se PERDIA: no boot o AT sumia (4 bipes graves = "mudo") e na operação o
+    // "P" do "PONG" sumia (app recebia "ONG" != "PONG" -> sem PONG p/ sempre).
+    // PWRM0 mantém o módulo sempre acordado e responsivo. O MCU continua dormindo
+    // (powerDown) — a economia real de bateria está nele, não no módulo.
+    at("AT+PWRM0");
     at("AT+TYPE0");    // sem pareamento
     // NOME reafirmado a CADA boot (como o changeName do FI_1_5). Fica ANTES do
     // MODE2 por garantia (nome só era tentado no 1º boot antes; se falhasse,
@@ -486,23 +488,23 @@ void bleProvisionar() {
         for (uint8_t i = 0; i < N; i++) {
             bluetooth.begin(TODOS[i]);
             delay(30);
-            for (uint8_t k = 0; k < 6; k++) at("AT", 40);   // acorda o PWRM
-            at("AT+PWRM1", 120);
+            for (uint8_t k = 0; k < 6; k++) at("AT", 40);   // acorda o módulo
+            at("AT+PWRM0", 120);   // auto-sleep OFF (sempre acordado)
             at("AT+PIO41", 60); at("AT+PIO51", 60); at("AT+PIO71", 60);
             at("AT+PIO81", 60); at("AT+PIO91", 60);
             at("AT+BEFCFF7", 80); at("AT+AFTCFFF", 80);
         }
     }
 
-    // PASSO 1 — CONVERGE p/ BAUD_MODULO (2400): em cada baud candidato manda
-    // AT+BAUD0 (=2400 no clone) + AT+RESET. No baud atual do módulo o comando
-    // pega e ele passa a 2400; nos outros é lixo inócuo. Espelha o
-    // baudBLE da esteira de produção (at.js).
+    // PASSO 1 — CONVERGE p/ BAUD_MODULO (9600): em cada baud candidato manda
+    // AT+BAUD2 (=9600) + AT+RESET. Como o módulo já vem de fábrica em 9600, na
+    // prática isto REAFIRMA 9600; se algum módulo veio de outro baud, o comando
+    // pega no baud atual dele e ele passa a 9600 (nos demais é lixo inócuo).
     for (uint8_t i = 0; i < N; i++) {
         bluetooth.begin(TODOS[i]);
         delay(30);
-        for (uint8_t k = 0; k < 3; k++) at("AT", 40);   // acorda (PWRM)
-        at(AT_BAUD_CMD, 250);                  // -> 2400
+        for (uint8_t k = 0; k < 3; k++) at("AT", 40);   // acorda o módulo
+        at(AT_BAUD_CMD, 250);                  // -> 9600
         at("AT+RESET", 150);
         delay(600);                            // módulo reinicia no baud novo
     }
@@ -513,7 +515,7 @@ void bleProvisionar() {
     // PASSO 2 — config completa no baud alvo.
     at("AT+SHIELD1");
     at(AT_BAUD_CMD);                           // reafirma (só vale após reset)
-    at("AT+PWRM1");                            // sem auto-sleep do módulo
+    at("AT+PWRM0");                            // auto-sleep OFF (sempre acordado)
     at("AT+ROLE0");                            // slave (ROLE1 residual = não anuncia)
     at("AT+IMME0");                            // anuncia sozinho ao ligar
     at("AT+ADTY0");                            // anúncio conectável

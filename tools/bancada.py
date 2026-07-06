@@ -500,14 +500,13 @@ def act_gravar(serial, mcu):
                 gerar_seed_bin(serial, _placa_de(m), seed_bin)
             except Exception:
                 break
-        # Fuses do domínio de clock PROVADO (v2.1.0/2.7.6 = PONG ok): RC INTERNO
-        # 8MHz, o mesmo p/ os 2 chips. A placa tem cristal 16MHz (schema), mas o
-        # "2400 slow" (AT+BAUD0) casou com o SoftwareSerial a 8MHz; 16MHz é
-        # otimização a validar isoladamente.
-        #   lfuse: 0xE2 (RC interno 8MHz, CKDIV8 off) — NÃO usa o cristal
-        #   efuse: 0xF7 (valor da v2.7.6; BOD 2.7V p/ reintroduzir à parte)
+        # CRISTAL EXTERNO 16MHz (a placa TEM — schema): OBRIGATÓRIO p/
+        # SoftwareSerial a 9600 (baud de fábrica do módulo) ser confiável. O RC
+        # de 8MHz não fala 9600 bem -> não convertia o módulo (ficava mudo).
+        #   lfuse: 328PB=0xFF, 328/328P=0xF7 (16MHz, CKDIV8 off)
+        #   efuse: 0xF7 (BOD; 2.7V p/ reintroduzir depois de estabilizar)
         #   hfuse: 0xD7 (EESAVE liga, sem bootloader) | lock: 0xCF
-        lfuse = "0xE2"
+        lfuse = "0xFF" if m == "m328pb" else "0xF7"
         efuse = "0xF7"
         rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
                         "-U", f"lfuse:w:{lfuse}:m", "-U", "hfuse:w:0xD7:m",

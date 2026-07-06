@@ -43,16 +43,16 @@ if [[ "$MCU" == "m328pb" ]]; then PLACA="fi15"; else PLACA="fi10"; fi
 echo ">> Gerando EEPROM (seeds + serial + placa $PLACA) de $SERIAL..."
 python3 "$HERE/gerar_seed.py" "$SERIAL" "$SEED_BIN" "$PLACA"
 
-# 3. Grava fuses + lock + flash + eeprom. Domínio de clock PROVADO em bancada
-#    (v2.1.0/2.7.6 = PONG ok): OSCILADOR RC INTERNO 8MHz, o mesmo p/ os 2 chips.
-#      lfuse : 0xE2 = RC interno 8MHz, CKDIV8 off (8MHz cheios). NÃO usa o cristal.
+# 3. Grava fuses + lock + flash + eeprom. CRISTAL EXTERNO 16MHz (a placa TEM —
+#    schema): OBRIGATÓRIO p/ SoftwareSerial a 9600 (baud de fábrica do módulo)
+#    ser confiável. O RC de 8MHz não fala 9600 bem -> não convertia o módulo.
+#      lfuse : 16MHz cristal, CKDIV8 off. 328PB=0xFF, 328/328P=0xF7
 #      hfuse : 0xD7 = EESAVE liga (seeds sobrevivem ao chip-erase), sem bootloader
-#      efuse : 0xF7 (valor da v2.7.6). BOD 2.7V fica p/ reintroduzir à parte.
+#      efuse : 0xF7 (BOD; reintroduzir 2.7V à parte depois de estabilizar)
 #      lock  : 0xCF
-#    ⚠️ A placa TEM cristal 16MHz (schema), mas o "2400 slow" (AT+BAUD0) casou
-#    com o SoftwareSerial a 8MHz; 16MHz é otimização a validar isoladamente.
-LFUSE=0xE2; EFUSE=0xF7
-echo ">> Gravando via USBasp (RC interno 8MHz; lfuse=$LFUSE efuse=$EFUSE)..."
+if [[ "$MCU" == "m328pb" ]]; then LFUSE=0xFF; else LFUSE=0xF7; fi
+EFUSE=0xF7
+echo ">> Gravando via USBasp (cristal 16MHz; lfuse=$LFUSE efuse=$EFUSE)..."
 avrdude -P usb -c usbasp -p "$MCU" -b 19200 -B 8 \
     -U lfuse:w:$LFUSE:m \
     -U hfuse:w:0xD7:m \
