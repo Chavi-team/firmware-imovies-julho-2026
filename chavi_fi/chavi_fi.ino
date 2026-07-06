@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.7.4"
+#define FW_VERSION   "2.7.5"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -605,6 +605,19 @@ void calibGirar() {
     motorGira(true);       // giro REAL (batente + recuo), não mais pulso fixo
 }
 
+// Recebeu "CALIB-DEMO" (PROTOCOLO DIRETO, app novo): gira REAL e responde "11"
+// SÓ QUANDO O MOTOR PARA — assim o app confirma no fim do giro (sincronizado),
+// igual ao abrir/fechar. Resolve o "app fica pensando até o timeout": o "11"
+// chega no momento exato em que a fechadura terminou. O app espera com timeout
+// longo (15s). NÃO usar no handshake legado (que tem timeout curto e exige o
+// "11" antes) — por isso é um verbo separado do "CALIBRACAO-FI".
+void calibDemoDireto() {
+    beep(60, 2200);
+    motorGira(true);       // giro real (batente + recuo) — motor PARA aqui
+    delay(120);            // garante o pacote antes de qualquer AT+DROP
+    envia11Duplo();        // "11" = terminei de girar
+}
+
 // Recebeu "PORTA-ABERTA"(1) / "PORTA-FECHADA"(0): salva o sentido e faz o giro
 // de retorno como o FI_1_5 (FECHADA: volta; ABERTA: volta e vai de novo).
 void calibSalvar(uint8_t aberto) {
@@ -789,6 +802,7 @@ void atenderApp() {
             if (txt.startsWith("FECHAR"))      { acionarVerbo(CMD_FECHAR); return; }
             if (txt.indexOf("PORTA-ABERTA")  >= 0) { calibSalvar(1); return; }
             if (txt.indexOf("PORTA-FECHADA") >= 0) { calibSalvar(0); return; }
+            if (txt.indexOf("CALIB-DEMO")    >= 0) { t0 = millis(); calibDemoDireto(); continue; }
             if (txt.indexOf("CALIBRACAO-FI") >= 0) { t0 = millis(); calibGirar(); continue; }
             continue;
         }
