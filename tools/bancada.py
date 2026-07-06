@@ -81,6 +81,9 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
 BANCADA_VERSION = "2.9.8"                 # versão desta bancada (bump a cada release)
+# Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
+# cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
+FIRMWARE_VERSION = "2.9.9"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 
 # snapshot compartilhado (preenchido em background; lido pelo endpoint)
@@ -567,7 +570,8 @@ class Backend:
 
     def cadastrar(self, serial):
         payload = {"serial_number": serial, "name": serial,
-                   "version": "000", "device_type_id": 1}
+                   "version": "000", "device_type_id": 1,
+                   "firmware_version": FIRMWARE_VERSION}   # grava em devices.firmware_version
         r = self._req("POST", "/admin/devices", json=payload,
                       headers={"Accept": "application/json",
                                "Authorization": f"Bearer {self.token}"})
