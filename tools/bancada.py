@@ -500,8 +500,10 @@ def act_gravar(serial, mcu):
                 gerar_seed_bin(serial, _placa_de(m), seed_bin)
             except Exception:
                 break
+        # lfuse = CRISTAL EXTERNO 16MHz (MiniCore): 328PB=0xFF, 328/328P=0xF7.
+        lfuse = "0xFF" if m == "m328pb" else "0xF7"
         rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
-                        "-U", "lfuse:w:0xE2:m", "-U", "hfuse:w:0xD7:m",
+                        "-U", f"lfuse:w:{lfuse}:m", "-U", "hfuse:w:0xD7:m",
                         "-U", "efuse:w:0xF7:m", "-U", "lock:w:0xCF:m",
                         "-U", f"eeprom:w:{seed_bin}:r", "-U", f"flash:w:{HEX}:i"])
         if rc == 0:

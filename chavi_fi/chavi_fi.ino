@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.7.6"
+#define FW_VERSION   "2.8.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -94,10 +94,13 @@
 #define PIN_LED10_2  PIN_PB0
 #define PIN_LED10_3  PIN_PB1
 
-// BAUD do módulo BLE = 2400, FIXO (ver cabeçalho). A esteira de produção grava
-// AT+BAUD0 (=2400 nesses clones); 2400 também é o baud mais robusto para o
-// SoftwareSerial no oscilador interno de 8MHz (9600 perde byte).
-#define BAUD_MODULO  2400
+// BAUD do módulo BLE = 9600, com CRISTAL EXTERNO 16MHz (config da FROTA DE
+// PRODUÇÃO, provada em ~1000 fechaduras). Com clock preciso do cristal, 9600
+// é confiável no SoftwareSerial (o que falhava era 9600 no RC interno de 8MHz,
+// impreciso — por isso o 2400 anterior). AT+BAUD2 = 9600 nos clones "Soft AT
+// 5.2" (igual ao baud9600BLE1010 do firmware antigo FI_1_5).
+#define BAUD_MODULO  9600
+#define AT_BAUD_CMD  "AT+BAUD2"    // -> 9600 nos clones deste lote
 
 // Motor REAL (abrir/fechar/calibração): igual ao FI_1_5 de produção — gira até
 // detectar o BATENTE pela corrente (INA219 no I2C 0x45) ou até o teto duro.
@@ -487,13 +490,13 @@ void bleProvisionar() {
         }
     }
 
-    // PASSO 1 — converge p/ 2400 (pós-RENEW o módulo está no baud de fábrica).
+    // PASSO 1 — converge p/ BAUD_MODULO (pós-RENEW o módulo está no baud de fábrica).
     for (uint8_t i = 0; i < N; i++) {
-        if (TODOS[i] == 2400) continue;        // 2400 já é o alvo
+        if (TODOS[i] == BAUD_MODULO) continue; // já é o alvo
         bluetooth.begin(TODOS[i]);
         delay(30);
         at("AT", 120);
-        at("AT+BAUD0", 250);                   // -> 2400 (tabela deste lote)
+        at(AT_BAUD_CMD, 250);                  // -> BAUD_MODULO (tabela deste lote)
         at("AT+RESET", 150);
         delay(600);                            // módulo reinicia
     }
@@ -501,9 +504,9 @@ void bleProvisionar() {
     delay(1500);                               // módulo termina de reiniciar
     while (bluetooth.available()) bluetooth.read();
 
-    // PASSO 2 — config completa a 2400.
+    // PASSO 2 — config completa no baud alvo.
     at("AT+SHIELD1");
-    at("AT+BAUD0");                            // reafirma (só vale após reset)
+    at(AT_BAUD_CMD);                           // reafirma (só vale após reset)
     at("AT+PWRM1");                            // sem auto-sleep do módulo
     at("AT+ROLE0");                            // slave (ROLE1 residual = não anuncia)
     at("AT+IMME0");                            // anuncia sozinho ao ligar

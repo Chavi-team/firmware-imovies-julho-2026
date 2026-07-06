@@ -44,13 +44,13 @@ echo ">> Gerando EEPROM (seeds + serial + placa $PLACA) de $SERIAL..."
 python3 "$HERE/gerar_seed.py" "$SERIAL" "$SEED_BIN" "$PLACA"
 
 # 3. Grava fuses + lock + flash + eeprom.
-#    lfuse=0xE2 → OSCILADOR INTERNO 8MHz (não depende do cristal externo; liga
-#    com tensão mais baixa; casa com sketch.yaml clock=8MHz_internal).
-#    hfuse=0xD7 (EESAVE liga -> EEPROM sobrevive a chip-erase), efuse=0xF7 (BOD),
-#    lock=0xCF.
-echo ">> Gravando via USBasp (fuses + flash + eeprom)..."
+#    lfuse → CRISTAL EXTERNO 16MHz (config de produção; casa com sketch.yaml
+#    clock=16MHz_external). O valor depende do chip (MiniCore): 328PB=0xFF,
+#    328/328P=0xF7. hfuse=0xD7 (EESAVE liga), efuse=0xF7 (BOD), lock=0xCF.
+if [[ "$MCU" == "m328pb" ]]; then LFUSE=0xFF; else LFUSE=0xF7; fi
+echo ">> Gravando via USBasp (cristal 16MHz, lfuse=$LFUSE)..."
 avrdude -P usb -c usbasp -p "$MCU" -b 19200 -B 8 \
-    -U lfuse:w:0xE2:m \
+    -U lfuse:w:$LFUSE:m \
     -U hfuse:w:0xD7:m \
     -U efuse:w:0xF7:m \
     -U lock:w:0xCF:m \
