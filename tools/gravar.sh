@@ -43,15 +43,16 @@ if [[ "$MCU" == "m328pb" ]]; then PLACA="fi15"; else PLACA="fi10"; fi
 echo ">> Gerando EEPROM (seeds + serial + placa $PLACA) de $SERIAL..."
 python3 "$HERE/gerar_seed.py" "$SERIAL" "$SEED_BIN" "$PLACA"
 
-# 3. Grava fuses + lock + flash + eeprom. Valores CANÔNICOS do MiniCore para
-#    cristal 16MHz externo + BOD 2.7V + EEPROM preservada, POR CHIP:
-#      lfuse : 16MHz cristal, CKDIV8 off (16MHz cheios). 328PB=0xFF, 328/P=0xF7
+# 3. Grava fuses + lock + flash + eeprom. Domínio de clock PROVADO em bancada
+#    (v2.1.0/2.7.6 = PONG ok): OSCILADOR RC INTERNO 8MHz, o mesmo p/ os 2 chips.
+#      lfuse : 0xE2 = RC interno 8MHz, CKDIV8 off (8MHz cheios). NÃO usa o cristal.
 #      hfuse : 0xD7 = EESAVE liga (seeds sobrevivem ao chip-erase), sem bootloader
-#      efuse : BOD 2.7V (reset limpo no brownout do motor; protege a EEPROM).
-#              328PB=0xF5, 328/328P=0xFD  (o cfd_bit difere entre os chips)
+#      efuse : 0xF7 (valor da v2.7.6). BOD 2.7V fica p/ reintroduzir à parte.
 #      lock  : 0xCF
-if [[ "$MCU" == "m328pb" ]]; then LFUSE=0xFF; EFUSE=0xF5; else LFUSE=0xF7; EFUSE=0xFD; fi
-echo ">> Gravando via USBasp (cristal 16MHz + BOD 2.7V; lfuse=$LFUSE efuse=$EFUSE)..."
+#    ⚠️ A placa TEM cristal 16MHz (schema), mas o "2400 slow" (AT+BAUD0) casou
+#    com o SoftwareSerial a 8MHz; 16MHz é otimização a validar isoladamente.
+LFUSE=0xE2; EFUSE=0xF7
+echo ">> Gravando via USBasp (RC interno 8MHz; lfuse=$LFUSE efuse=$EFUSE)..."
 avrdude -P usb -c usbasp -p "$MCU" -b 19200 -B 8 \
     -U lfuse:w:$LFUSE:m \
     -U hfuse:w:0xD7:m \
