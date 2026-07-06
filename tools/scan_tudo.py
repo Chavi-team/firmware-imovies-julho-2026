@@ -65,7 +65,6 @@ async def sonda(addr):
         print(">> Não apareceu no ar. Religue a fechadura, espere ~40s e tente de "
               "novo — ou rode o modo DIFERENCIAL primeiro para confirmar o endereço.")
         return
-    print(f">> Conectando em {dev.address}...")
     notif = []
 
     def cb(_c, data):
@@ -74,7 +73,25 @@ async def sonda(addr):
             notif.append(txt)
             print(f"   ⟵ {txt!r}")
 
-    async with BleakClient(dev, timeout=15.0) as cli:
+    # Conexão com retentativas (anúncio intermitente / primeiro connect falha).
+    cli = None
+    for tent in range(1, 4):
+        try:
+            print(f">> Conectando em {dev.address} (tentativa {tent}/3)...")
+            cli = BleakClient(dev, timeout=20.0)
+            await cli.connect()
+            break
+        except Exception as e:
+            print(f"   falhou: {type(e).__name__}")
+            cli = None
+            await asyncio.sleep(2)
+            dev = await BleakScanner.find_device_by_address(addr, timeout=12.0) or dev
+    if cli is None or not cli.is_connected:
+        print(">> NÃO CONECTA mesmo anunciando = anúncio NÃO-CONECTÁVEL (estado "
+              "pós-RENEW/beacon). O conserto pelo ar não alcança — use o "
+              "diagnóstico por BIPES do firmware (regrave e ouça o boot).")
+        return
+    async with cli:
         print(">> Conectado. Serviços/características:")
         ffe1 = False
         for svc in cli.services:

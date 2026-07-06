@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.6.1"
+#define FW_VERSION   "2.6.2"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -235,6 +235,27 @@ void sinalModuloMudo() {
     piscar(CRGB::Red, 2, 200);
 }
 
+// DIAGNÓSTICO POR BIPES (sem cabo, sem BLE): quando o módulo não responde a
+// 2400, varre os bauds perguntando (AT/AT+VERS?) e BIPA AGUDO o índice de onde
+// ele respondeu, logo após os 4 graves:
+//   1 bipe = 2400 | 2 = 9600 | 3 = 19200 | 4 = 38400 | silêncio = mudo em todos
+// É a fechadura dizendo de viva voz em que baud a UART do módulo está.
+void diagBaudBipes() {
+    const long cand[] = {2400, 9600, 19200, 38400};
+    for (uint8_t i = 0; i < 4; i++) {
+        bluetooth.begin(cand[i]);
+        delay(30);
+        bool respondeu = bleResponde();
+        if (!respondeu) respondeu = (bleLerVersao() != 0);
+        if (respondeu) {
+            delay(500);
+            for (uint8_t k = 0; k <= i; k++) { beep(140, 2600); delay(180); }
+            break;
+        }
+    }
+    bluetooth.begin(BAUD_MODULO);
+}
+
 // Reset total pelo botão: melodia DESCENDENTE (o contrário da de pronta).
 void melodiaReset() {
     static const uint16_t f[] = {784, 659, 523, 392};
@@ -349,8 +370,20 @@ void configModuloLeve() {
     at("AT+ROLE0");    // slave
     at("AT+DELI3");    // delimitador '\n' nos 2 sentidos
     at("AT+NOTI1");    // notify ligado
-    at("AT+BEFC020");  // MOSFET(PIO8)=1, wake(PIO6)=0 antes da conexão
-    at("AT+AFTC028");  // MOSFET(PIO8)=1, wake(PIO6)=1 depois -> borda de wake
+    // MOSFET do trilho de energia: na 1.5_400 o gate é o PIO8; na 1.0_400 pode
+    // ser PIO7, 8 OU 9 (a esteira at.js suportava os três). Na placa 1.0
+    // erguemos os TRÊS — imediato (PIOx1, religa o trilho JÁ) e persistente
+    // (BEFC070/AFTC078 = bits 7+8+9 altos + wake no PIO6). ⚠️ Foi a falta disto
+    // que "matou" as 1.0 após o AT+RENEW: o reset de fábrica derrubou o PIO do
+    // MOSFET e o módulo cortou a energia do próprio MCU (viva só via USBasp).
+    if (placa10) {
+        at("AT+PIO71"); at("AT+PIO81"); at("AT+PIO91");
+        at("AT+BEFC070");
+        at("AT+AFTC078");
+    } else {
+        at("AT+BEFC020");  // MOSFET(PIO8)=1, wake(PIO6)=0 antes da conexão
+        at("AT+AFTC028");  // MOSFET(PIO8)=1, wake(PIO6)=1 depois -> borda de wake
+    }
     at("AT+PIO60");    // repouso arma a próxima borda de wake
     // Módulos ver.03: wake por STATUS — o opcode difere por placa no firmware
     // de produção: FI 1.0/1.5 sem mosfet usam STATUS6; a linha _400 usa STATUS8.
@@ -739,6 +772,7 @@ void dormir() {
     at("AT+PIO61", 500);
     EEPROM.update(EE_HIB, 1);
     at("AT+PIO80", 60);
+    if (placa10) { at("AT+PIO70", 60); at("AT+PIO90", 60); }  // mosfet 1.0: pino 7/8/9
     delay(3000);
     EEPROM.update(EE_HIB, 0);
     DBGLN(F("[hib] modulo nao cortou - powerDown normal"));
@@ -842,8 +876,12 @@ void setup() {
     // Feedback final do boot: Rocky = TUDO PRONTO; graves = módulo mudo.
     // (O "mudo" pode ser falso-negativo em clone que não responde AT — a
     // conexão BLE real é a prova final. Mas serve de triagem na bancada.)
-    if (moduloOk) sinalPronto();
-    else          sinalModuloMudo();
+    if (moduloOk) {
+        sinalPronto();
+    } else {
+        sinalModuloMudo();
+        diagBaudBipes();     // bipa o baud onde o módulo respondeu (ver acima)
+    }
     DBGLN(F("[boot] PRONTA - dormindo"));
 }
 
