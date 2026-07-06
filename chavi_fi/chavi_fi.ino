@@ -58,12 +58,13 @@
 #include <EEPROM.h>
 #include <SoftwareSerial.h>
 #include <avr/wdt.h>
+#include <avr/sleep.h>
 #include <Wire.h>
 #include <Adafruit_INA219.h>
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.7.6"
+#define FW_VERSION   "2.9.3"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -94,10 +95,18 @@
 #define PIN_LED10_2  PIN_PB0
 #define PIN_LED10_3  PIN_PB1
 
-// BAUD do módulo BLE = 2400, FIXO (ver cabeçalho). A esteira de produção grava
-// AT+BAUD0 (=2400 nesses clones); 2400 também é o baud mais robusto para o
-// SoftwareSerial no oscilador interno de 8MHz (9600 perde byte).
-#define BAUD_MODULO  2400
+// BAUD do módulo BLE = 9600 (AT+BAUD2) = PADRÃO DE FÁBRICA do módulo (manual
+// pág.8/22). ⭐ PROVA (MS BLE Explorer na CH003FI002734): AT+BAUD? -> "OK+Get2"
+// = 9600. O módulo SAI DE FÁBRICA em 9600; forçá-lo a 2400 exige falar 9600 com
+// ele, e SoftwareSerial a 9600 no RC de 8MHz é marginal -> a conversão falhava e
+// o módulo ficava mudo p/ o MCU. Usar 9600 NATIVO elimina a briga: é a config de
+// referência do fabricante (Arduino a 16MHz + SoftwareSerial 9600, manual pág.12).
+// CLOCK: CRISTAL EXTERNO 16MHz (a placa TEM — schema1/2: X1 16MHz + 22pF). É
+// OBRIGATÓRIO p/ SoftwareSerial a 9600 ser confiável (o RC de 8MHz não dá conta).
+// Sem 2400-slow, o "wake por dado" some — mas com AT+PWRM0 (auto-sleep OFF) o
+// módulo não dorme, então não precisamos dele.
+#define BAUD_MODULO  9600
+#define AT_BAUD_CMD  "AT+BAUD2"    // -> 9600 (padrão de fábrica do módulo)
 
 // Motor REAL (abrir/fechar/calibração): igual ao FI_1_5 de produção — gira até
 // detectar o BATENTE pela corrente (INA219 no I2C 0x45) ou até o teto duro.
@@ -326,6 +335,11 @@ void motorGira(bool sentidoA) {
 // ANTIGO (ver.03/04 das FI 1.0) exige o CR; o lote novo (ver.05) tolera —
 // o FI_1_0_400 sempre mandou com '\r' nos mesmos módulos "Soft AT 5.2".
 void at(const char* c, uint16_t w = 150) {
+    // ⛔ TRAVA CRÍTICA: se o app está CONECTADO (PD3 alto), o módulo está em
+    // MODE2 túnel e NÃO interpreta AT — ele REPASSA o "AT+..." como DADO pro app
+    // (visto na bancada: "⟵ AT", "⟵ AT+NAME003FI002734" + lixo). AT é só p/
+    // config, que só roda DESCONECTADO. Conectado, não manda nada.
+    if (digitalRead(PIN_WAKE) == HIGH) return;
     bluetooth.print(c);
     bluetooth.print('\r');
     delay(w);
@@ -395,29 +409,40 @@ void configModuloLeve() {
     if (!placa10 && digitalRead(PIN_WAKE) == HIGH) {
         DBGLN(F("[cfg] conectado - pula config")); return;
     }
-    at("AT+PWRM1");    // ANTES de tudo: tira o auto-sleep (senão o 1º AT só acorda)
+    // ⭐ AT+PWRM0 = auto-sleep do módulo DESLIGADO (manual pág.39). O firmware
+    // ANTIGO mandava PWRM1 achando que DESLIGAVA o sleep — mas PWRM1 LIGA. Com o
+    // sleep ligado o módulo cochilava e o 1º byte de cada troca só o acordava e
+    // se PERDIA: no boot o AT sumia (4 bipes graves = "mudo") e na operação o
+    // "P" do "PONG" sumia (app recebia "ONG" != "PONG" -> sem PONG p/ sempre).
+    // PWRM0 mantém o módulo sempre acordado e responsivo. O MCU continua dormindo
+    // (powerDown) — a economia real de bateria está nele, não no módulo.
+    at("AT+PWRM0");
     at("AT+TYPE0");    // sem pareamento
-    // NOME reafirmado a CADA boot (como o changeName do FI_1_5) e ANTES do
-    // MODE2 — em MODE2 (túnel) alguns clones ignoram o AT+NAME. Sem isto, o
-    // nome só era tentado no 1º boot e, se falhasse, ficava o de fábrica.
+    // NOME reafirmado a CADA boot (como o changeName do FI_1_5). Fica ANTES do
+    // MODE2 por garantia (nome só era tentado no 1º boot antes; se falhasse,
+    // ficava o de fábrica). AT+NAME só vale no papel slave (ROLE0), manual pág.19.
     if (serialFech[0]) {
         char nm[24];
         snprintf(nm, sizeof(nm), "AT+NAME%s", serialFech);
         at(nm, 200);
     }
-    at("AT+MODE2");    // túnel de dados (repassa os bytes pro MCU)
-    at("AT+ROLE0");    // slave
-    at("AT+DELI3");    // delimitador '\n' nos 2 sentidos
-    at("AT+NOTI1");    // notify ligado
+    // AT+MODE2 = modo controle remoto / túnel de dados (é o PADRÃO DE FÁBRICA,
+    // manual pág.8). ORDEM DA v2.7.6 (provada em bancada com PONG): MODE2 logo
+    // após o NAME. Aqui o módulo está DESCONECTADO (a função dá early-return se
+    // conectado), então ele interpreta AT em qualquer posição — a ordem relativa
+    // ao MODE2 não muda nada. Reafirmá-lo é redundante (já é fábrica) mas inócuo.
+    at("AT+MODE2");
+    at("AT+ROLE0");    // slave (executa advertising)
+    at("AT+DELI3");    // delimitador da resposta AT = 0x0A 0x0D (manual pág.23)
+    at("AT+NOTI1");    // módulo emite OK+CONN/OK+LOST na UART no connect/disconnect
+                       // (manual pág.38). NÃO afeta o notify de dados do app (esse
+                       // é o CCCD 0x2902 que o próprio app habilita no FFE1).
     if (placa10) {
         // GATE DO MOSFET que alimenta o MCU. O pino NÃO é fixo: a esteira at.js
         // suporta PIO 4/5/6/7 (default 4) e o upload antigo usava 7/8/9.
         // Erguemos TODOS os candidatos — imediato (PIOx1 religa o trilho JÁ) e
         // persistente na NVM (BEFCFF7 = todos os PIOs altos ANTES da conexão,
-        // menos o bit3=PIO6 p/ o wake; AFTCFFF = todos altos DEPOIS). Ligar
-        // PIOs não-usados é inócuo (não há nada neles); o que importa é o gate
-        // certo subir seja qual for. Isto substitui o BEFC070 (que zerava
-        // 4/5!) — a causa provável do resgate ter falhado (relatório §2).
+        // menos o bit3=PIO6 p/ o wake; AFTCFFF = todos altos DEPOIS).
         at("AT+PIO41"); at("AT+PIO51"); at("AT+PIO71");
         at("AT+PIO81"); at("AT+PIO91");
         at("AT+BEFCFF7");
@@ -457,54 +482,46 @@ void bleProvisionar() {
     static const long TODOS[] = {2400, 9600, 38400, 19200, 57600, 4800, 115200, 1200};
     const uint8_t N = sizeof(TODOS) / sizeof(long);
 
-    // PASSO 0 — reset de fábrica às cegas (RENEW/DEFAULT). ⚠️ SÓ na placa 1.5.
-    // NA PLACA 1.0 O RENEW É VENENO: ele apaga o AT+BEFC da NVM que segura o
-    // gate do MOSFET de energia -> o módulo corta a alimentação do próprio MCU
-    // no meio do provisionamento (causa-raiz das 0718/0629 mortas — relatório
-    // FI10_ANALISE §1; nenhum firmware/esteira legado jamais usou RENEW). Na
-    // 1.0 a config leve abaixo já reconfigura tudo e PRESERVA o BEFC.
-    if (!placa10) {
+    // PASSO 0 — SEM RENEW. ⚠️ O AT+RENEW/DEFAULT era veneno em DUAS frentes:
+    //  (1.0) apagava o AT+BEFC da NVM que segura o gate do MOSFET de energia ->
+    //        o módulo cortava a alimentação do MCU (0718/0629 mortas, §1);
+    //  (1.5) interferia na tabela de baud do clone -> o módulo NÃO ficava em
+    //        9600 -> 4 bipes graves + sem PONG (visto na CH003FI002734).
+    // O firmware FI_1_5 de PRODUÇÃO (9600, ~centenas em campo) NUNCA usa RENEW:
+    // só reafirma AT+BAUD2 + config. É o que fazemos no PASSO 1/2.
+    if (placa10) {
+        // 1.0: religa o TRILHO de energia (mosfet) em todos os bauds, primeiro.
         for (uint8_t i = 0; i < N; i++) {
             bluetooth.begin(TODOS[i]);
             delay(30);
-            at("AT", 120);                     // acorda (PWRM)
-            at("AT+RENEW", 300);
-            at("AT+DEFAULT", 300);
-            delay(400);                        // módulo re-inicializa nos defaults
-        }
-    } else {
-        // 1.0: primeiro RELIGA O TRILHO em todos os bauds (wake longo + PWRM1 +
-        // ergue os PIOs candidatos do gate), antes de qualquer coisa que
-        // pudesse cortar a energia. Sem RENEW.
-        for (uint8_t i = 0; i < N; i++) {
-            bluetooth.begin(TODOS[i]);
-            delay(30);
-            for (uint8_t k = 0; k < 6; k++) at("AT", 40);   // acorda o PWRM
-            at("AT+PWRM1", 120);
+            for (uint8_t k = 0; k < 6; k++) at("AT", 40);   // acorda o módulo
+            at("AT+PWRM0", 120);   // auto-sleep OFF (sempre acordado)
             at("AT+PIO41", 60); at("AT+PIO51", 60); at("AT+PIO71", 60);
             at("AT+PIO81", 60); at("AT+PIO91", 60);
             at("AT+BEFCFF7", 80); at("AT+AFTCFFF", 80);
         }
     }
 
-    // PASSO 1 — converge p/ 2400 (pós-RENEW o módulo está no baud de fábrica).
+    // PASSO 1 — CONVERGE p/ BAUD_MODULO (9600): em cada baud candidato manda
+    // AT+BAUD2 (=9600) + AT+RESET. Como o módulo já vem de fábrica em 9600, na
+    // prática isto REAFIRMA 9600; se algum módulo veio de outro baud, o comando
+    // pega no baud atual dele e ele passa a 9600 (nos demais é lixo inócuo).
     for (uint8_t i = 0; i < N; i++) {
-        if (TODOS[i] == 2400) continue;        // 2400 já é o alvo
         bluetooth.begin(TODOS[i]);
         delay(30);
-        at("AT", 120);
-        at("AT+BAUD0", 250);                   // -> 2400 (tabela deste lote)
+        for (uint8_t k = 0; k < 3; k++) at("AT", 40);   // acorda o módulo
+        at(AT_BAUD_CMD, 250);                  // -> 9600
         at("AT+RESET", 150);
-        delay(600);                            // módulo reinicia
+        delay(600);                            // módulo reinicia no baud novo
     }
     bluetooth.begin(BAUD_MODULO);
     delay(1500);                               // módulo termina de reiniciar
     while (bluetooth.available()) bluetooth.read();
 
-    // PASSO 2 — config completa a 2400.
+    // PASSO 2 — config completa no baud alvo.
     at("AT+SHIELD1");
-    at("AT+BAUD0");                            // reafirma (só vale após reset)
-    at("AT+PWRM1");                            // sem auto-sleep do módulo
+    at(AT_BAUD_CMD);                           // reafirma (só vale após reset)
+    at("AT+PWRM0");                            // auto-sleep OFF (sempre acordado)
     at("AT+ROLE0");                            // slave (ROLE1 residual = não anuncia)
     at("AT+IMME0");                            // anuncia sozinho ao ligar
     at("AT+ADTY0");                            // anúncio conectável
@@ -732,7 +749,13 @@ void enviaInfo() {
 }
 
 void testeBancada(const String& t) {
-    if (t.startsWith("TST-PING")) { enviaLinha("PONG"); return; }
+    if (t.startsWith("TST-PING")) {
+        // PONG em DOBRO com gap: este lote de módulo às vezes engole o 1º byte
+        // (mesma razão do "11 duplo" da calibragem). Se o 1º PONG for comido, o
+        // 2º chega limpo. O app casa no primeiro que vier íntegro.
+        enviaLinha("PONG"); delay(GAP_NOTIF_MS); enviaLinha("PONG");
+        return;
+    }
     if (t.startsWith("TST-BUZ"))  {
         beep(120, 1500); beep(120, 2000); beep(180, 2500);
         enviaLinha("OK-BUZ"); return;
@@ -887,32 +910,30 @@ void atenderBotao() {
     }
 }
 
-// dormir = LowPower.powerDown. O MCU dorme e acorda pela interrupção do pino de
-// wake (PD3, borda que o módulo gera ao conectar) ou pelo botão (PD2).
+// dormir = SONO LEVE (SLEEP_MODE_IDLE). ⭐ MUDANÇA-CHAVE (v2.9.1):
+// Com CRISTAL de 16MHz, o powerDown PARA o oscilador e ele leva ~65ms p/ voltar
+// ao acordar — a 9600 isso ENGOLE a mensagem inteira (dezenas de bytes). Era a
+// causa do "conecta, motor gira DENTRO da janela, mas o TST-PING FORA da janela
+// não vira PONG": o MCU dormia profundo e o comando se perdia no arranque do
+// cristal. No IDLE o oscilador CONTINUA rodando -> o wake por dado (PCINT do RX
+// do SoftwareSerial no PD4) é INSTANTÂNEO e o byte NÃO se perde. Acorda também
+// por PD3 (conexão) e pelo botão.
+// ⚠️ NÃO manda mais AT+DROP: derrubava a conexão a cada sono. E conectado (MODE2
+// túnel) um "AT+..." vazaria como DADO pro app. Nada de AT aqui.
+// Custo: consumo maior (o clock não desliga). A hibernação por MOSFET + wake por
+// PD3 (bateria) volta DEPOIS que a comunicação estiver 100% confiável.
 // Motor fica OUTPUT LOW (nunca Hi-Z — evita shoot-through na ponte H).
 void dormir() {
     motorPara();
-#if FEATURE_HIBERNA_MOSFET
-    // Hibernação profunda por corte do trilho — receita do goToSleep() do
-    // FI_1_0_400. ⚠️ DESLIGADA na placa 1.0: o pino do gate ainda não está
-    // confirmado (4/5/7/8/9) e um corte que não religue deixa a fechadura
-    // MORTA (é o que estamos combatendo). Na 1.0, sono = powerDown normal, que
-    // NÃO corta a energia (relatório FI10_ANALISE §3 recomenda até validar).
-    if (!placa10) {
-        at("AT+DROP", 500);
-        at("AT+PIO61", 500);
-        EEPROM.update(EE_HIB, 1);
-        at("AT+PIO80", 60);
-        delay(3000);
-        EEPROM.update(EE_HIB, 0);
-        DBGLN(F("[hib] modulo nao cortou - powerDown normal"));
-    }
-#endif
-    at("AT+DROP", 60); at("AT+PIO60", 60);
     acordouBLE = false; acordouBtn = false;
     attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), isrBtn, FALLING);
     attachInterrupt(digitalPinToInterrupt(PIN_WAKE), isrBLE, RISING);
-    LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);
+    set_sleep_mode(SLEEP_MODE_IDLE);
+    cli();
+    sleep_enable();
+    sei();
+    sleep_cpu();                 // acorda em QUALQUER interrupção (PCINT do RX,
+    sleep_disable();             // INT1/PD3 na conexão, INT0/botão) — sem latência
     detachInterrupt(digitalPinToInterrupt(PIN_BUTTON));
     detachInterrupt(digitalPinToInterrupt(PIN_WAKE));
 }

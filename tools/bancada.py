@@ -319,14 +319,30 @@ class Ble:
         await self.client.connect()
         self._buf = ""
 
+        # DIAGNÓSTICO: lista os serviços/características e confirma que o FFE1
+        # existe com a propriedade 'notify' (senão nunca chega resposta nenhuma).
+        try:
+            achou_ffe1 = False
+            for svc in self.client.services:
+                for ch in svc.characteristics:
+                    if "ffe1" in ch.uuid.lower():
+                        achou_ffe1 = True
+                        LOG(f"  GATT: FFE1 props={','.join(ch.properties)}", "hi")
+            if not achou_ffe1:
+                LOG("  ⚠️ GATT: característica FFE1 NÃO encontrada!", "err")
+        except Exception as e:
+            LOG(f"  (dump GATT falhou: {e})")
+
         def cb(_c, data: bytearray):
+            # Mostra o HEX CRU (o decode em '⟵' esconde bytes não-texto). Assim
+            # dá p/ ver se o que volta é "PONG" (50 4F 4E 47) ou lixo/baud errado.
+            hexs = " ".join(f"{b:02X}" for b in data)
             txt = data.decode("utf-8", errors="replace")
+            leg = "".join(c if 32 <= ord(c) < 127 else "." for c in txt)
+            LOG(f"  ⟵ [{hexs}]  \"{leg}\"")
             if self._buf and not self._buf.endswith("\n") and not txt.startswith("\n"):
                 self._buf += "\n"
             self._buf += txt
-            for l in txt.splitlines():
-                if l.strip():
-                    LOG(f"  ⟵ {l.strip()}")
 
         await self.client.start_notify(CHR_FFE1, cb)
         await asyncio.sleep(1.5)      # espera o MCU acordar após a conexão
@@ -500,9 +516,17 @@ def act_gravar(serial, mcu):
                 gerar_seed_bin(serial, _placa_de(m), seed_bin)
             except Exception:
                 break
+        # CRISTAL EXTERNO 16MHz (a placa TEM — schema): OBRIGATÓRIO p/
+        # SoftwareSerial a 9600 (baud de fábrica do módulo) ser confiável. O RC
+        # de 8MHz não fala 9600 bem -> não convertia o módulo (ficava mudo).
+        #   lfuse: 328PB=0xFF, 328/328P=0xF7 (16MHz, CKDIV8 off)
+        #   efuse: 0xF7 (BOD; 2.7V p/ reintroduzir depois de estabilizar)
+        #   hfuse: 0xD7 (EESAVE liga, sem bootloader) | lock: 0xCF
+        lfuse = "0xFF" if m == "m328pb" else "0xF7"
+        efuse = "0xF7"
         rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
-                        "-U", "lfuse:w:0xE2:m", "-U", "hfuse:w:0xD7:m",
-                        "-U", "efuse:w:0xF7:m", "-U", "lock:w:0xCF:m",
+                        "-U", f"lfuse:w:{lfuse}:m", "-U", "hfuse:w:0xD7:m",
+                        "-U", f"efuse:w:{efuse}:m", "-U", "lock:w:0xCF:m",
                         "-U", f"eeprom:w:{seed_bin}:r", "-U", f"flash:w:{HEX}:i"])
         if rc == 0:
             MCU_REAL[serial] = m
