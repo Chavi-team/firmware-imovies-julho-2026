@@ -53,12 +53,18 @@ async def diferencial():
 
 
 async def sonda(addr):
-    # CoreBluetooth só conecta em quem foi visto num scan DESTE processo —
-    # acha o dispositivo primeiro (com retentativas; anúncio pode ser intermitente).
+    # Aceita UUID OU o NOME do anúncio (ex.: 001FI000123). CoreBluetooth só
+    # conecta em quem foi visto num scan DESTE processo — acha primeiro
+    # (com retentativas; anúncio pode ser intermitente).
+    por_nome = "-" not in addr
     dev = None
     for tent in range(1, 4):
-        print(f">> Procurando {addr} (tentativa {tent}/3, 15s)...")
-        dev = await BleakScanner.find_device_by_address(addr, timeout=15.0)
+        print(f">> Procurando {'nome' if por_nome else 'endereço'} '{addr}' "
+              f"(tentativa {tent}/3, 15s)...")
+        if por_nome:
+            dev = await BleakScanner.find_device_by_name(addr, timeout=15.0)
+        else:
+            dev = await BleakScanner.find_device_by_address(addr, timeout=15.0)
         if dev:
             break
     if not dev:
@@ -105,7 +111,11 @@ async def sonda(addr):
             return
         await cli.start_notify(CHR_FFE1, cb)
         await asyncio.sleep(1.0)
-        for cmd in ("AT+VERS?", "AT+BAUD?", "AT+NAME?", "AT+MODE?", "AT+ROLE?"):
+        # BEFC?/AFTC?/PIO? são a joia da coroa: numa FI 1.0 VIVA (firmware
+        # antigo) eles revelam a config EXATA que segura o trilho de energia
+        # (mosfet) desta revisão de placa — que copiamos p/ as placas mortas.
+        for cmd in ("AT+VERS?", "AT+BAUD?", "AT+NAME?", "AT+MODE?", "AT+ROLE?",
+                    "AT+BEFC?", "AT+AFTC?", "AT+PIO?", "AT+STATUS?", "AT+SHIELD?"):
             print(f"   ⟶ {cmd}")
             await cli.write_gatt_char(CHR_FFE1, cmd.encode(), response=False)
             await asyncio.sleep(1.2)
