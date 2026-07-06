@@ -415,8 +415,8 @@ void configModuloLeve() {
     // dele é IGNORADO. Antes o MODE2 vinha cedo e o AT+NOTI1 (crucial) caía no
     // vão: o módulo repassava app->MCU (RX ok, comandos executavam) mas NÃO
     // NOTIFICAVA o MCU->app (TX perdido) -> "buzzer toca / motor gira, mas o app
-    // não recebe PONG/OK". A 2400 colava por timing; a 9600 (CH003FI002734)
-    // expôs. Ordem correta: config toda ANTES, MODE2 por último.
+    // não recebe PONG/OK". Ordem correta: config toda ANTES, MODE2 por último —
+    // assim NOTI1/DELI3 valem antes do túnel fechar o parser de AT.
     at("AT+ROLE0");    // slave
     at("AT+DELI3");    // delimitador '\n' nos 2 sentidos
     at("AT+NOTI1");    // notify ligado -> módulo NOTIFICA o app com o TX do MCU
@@ -486,15 +486,15 @@ void bleProvisionar() {
         }
     }
 
-    // PASSO 1 — CONVERGE p/ BAUD_MODULO (9600): em cada baud candidato manda
-    // AT+BAUD2 (=9600 no clone) + AT+RESET. No baud atual do módulo o comando
-    // pega e ele passa a 9600; nos outros é lixo inócuo. Espelha o
-    // baud9600BLE1010 do FI_1_5.
+    // PASSO 1 — CONVERGE p/ BAUD_MODULO (2400): em cada baud candidato manda
+    // AT+BAUD0 (=2400 no clone) + AT+RESET. No baud atual do módulo o comando
+    // pega e ele passa a 2400; nos outros é lixo inócuo. Espelha o
+    // baudBLE da esteira de produção (at.js).
     for (uint8_t i = 0; i < N; i++) {
         bluetooth.begin(TODOS[i]);
         delay(30);
         for (uint8_t k = 0; k < 3; k++) at("AT", 40);   // acorda (PWRM)
-        at(AT_BAUD_CMD, 250);                  // -> 9600
+        at(AT_BAUD_CMD, 250);                  // -> 2400
         at("AT+RESET", 150);
         delay(600);                            // módulo reinicia no baud novo
     }
