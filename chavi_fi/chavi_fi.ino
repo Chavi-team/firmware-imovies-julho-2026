@@ -64,7 +64,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.9.6"
+#define FW_VERSION   "2.9.7"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -812,7 +812,15 @@ void testeBancada(const String& t) {
 // ---- atende o app: desafio -> saltos -> tokens (ignorados) -> comando ----
 void atenderApp() {
     io = &bluetooth;
-    beep(45, 2600);                     // bipe de wake (acordou por BLE)
+    // Bipe de wake UMA vez por sessão, não a cada micro-wake. Com o sono leve
+    // (IDLE) o MCU acorda a CADA byte que chega -> antes bipava sem parar e o
+    // instalador não distinguia o que era o quê. Agora: 1 bipe curto por conexão
+    // (rate-limit de 4s); os testes têm seus próprios sons distintos.
+    static unsigned long ultimoBipeWake = 0;
+    if (millis() - ultimoBipeWake > 4000) {
+        beep(45, 2600);
+        ultimoBipeWake = millis();
+    }
     DBGLN(F("[app] acordou - ouvindo (20s)"));
     bluetooth.setTimeout(150);
     unsigned long t0 = millis();
