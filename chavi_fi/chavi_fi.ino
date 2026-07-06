@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.6.2"
+#define FW_VERSION   "2.6.3"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -250,6 +250,13 @@ void diagBaudBipes() {
         if (respondeu) {
             delay(500);
             for (uint8_t k = 0; k <= i; k++) { beep(140, 2600); delay(180); }
+            if (i == 0) {
+                // Vivo a 2400 AGORA (estava grogue no teste do boot): reaplica
+                // a config na hora — inclusive os PIOs do trilho da placa 1.0.
+                configModuloLeve();
+                delay(200);
+                beep(90, 3200);   // bipe extra super-agudo = config reaplicada
+            }
             break;
         }
     }
@@ -437,7 +444,8 @@ void bleProvisionar() {
         delay(600);                            // módulo reinicia
     }
     bluetooth.begin(BAUD_MODULO);
-    delay(100);
+    delay(1500);                               // módulo termina de reiniciar
+    while (bluetooth.available()) bluetooth.read();
 
     // PASSO 2 — config completa a 2400.
     at("AT+SHIELD1");
@@ -458,8 +466,14 @@ void bleProvisionar() {
     // o provisionamento não fica re-rodando (pesado) em todo boot.
     EEPROM.update(EE_MOD_CFG, MOD_CFG_MAGIC);
     at("AT+RESET", 150);
-    delay(900);                                // BAUD/NAME valem após o reset
+    delay(1500);                               // BAUD/NAME valem após o reset
     while (bluetooth.available()) bluetooth.read();
+    // REAPLICA a config pós-reset (sem novo reset): o módulo recém-reiniciado
+    // pode ter comido comandos do lote acima — em especial os PIO71/81/91 e
+    // BEFC/AFTC que seguram o TRILHO DE ENERGIA da placa 1.0 (_400). Foi
+    // exatamente isso que deixou a 0629 morta na bateria: config cedo demais,
+    // módulo grogue, PIO do mosfet nunca subiu.
+    configModuloLeve();
 }
 
 void isrBtn() { acordouBtn = true; }
