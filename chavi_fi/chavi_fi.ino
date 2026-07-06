@@ -64,7 +64,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.9.10"
+#define FW_VERSION   "2.9.11"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -245,9 +245,6 @@ void melodiaRocky() {
     noTone(PIN_BUZZER);
 }
 
-// Boot OK: melodia + 3 piscadas verdes (pode conectar/usar).
-void sinalPronto() { melodiaRocky(); piscar(CRGB::Green, 3); }
-
 // ERRO de BLE / módulo mudo: 4 bipes GRAVES + 2 piscadas VERMELHAS.
 void sinalModuloMudo() {
     for (uint8_t i = 0; i < 4; i++) beep(160, 400);
@@ -257,10 +254,13 @@ void sinalModuloMudo() {
 // CONECTOU por BLE: fanfarra do Rocky + 3 piscadas VERDES.
 void sinalConectado() { melodiaRocky(); piscar(CRGB::Green, 3); }
 
-// ABRIR/FECHAR com SUCESSO: 3 notas ascendentes curtas ("conseguiu") + verde.
-void melodiaSucesso() {
-    beep(90, 784); beep(90, 988); beep(160, 1319);
-    piscar(CRGB::Green, 2, 90);
+// ABRIR/FECHAR com SUCESSO: aviso CURTO e rápido (1 pip) + 1 piscada verde.
+// A MELODIA é reservada ao despertar/1ª conexão — aqui é só um "tique" leve pra
+// não pesar em cada acionamento. Pista sonora do sentido do motor:
+//   agudo (si5) = ABRIR (sobe)  |  grave (ré5) = FECHAR (desce).
+void fbComandoOk(bool abrir) {
+    beep(70, abrir ? 988 : 587);
+    piscar(CRGB::Green, 1, 90);
 }
 
 // DIAGNÓSTICO POR BIPES (sem cabo, sem BLE): quando o módulo não responde a
@@ -651,7 +651,7 @@ void acionarVerbo(unsigned long cmd) {
     g_ultimoAcionamentoMs = millis();     // re-marca no FIM (o giro levou tempo)
     delay(120);               // garante o pacote do status transmitido...
     enviaStatus(sentidoA);    // reconfirma no FIM se a conexão sobreviveu ("parou")
-    melodiaSucesso();         // jingle curto ascendente + verde = "abriu/fechou OK"
+    fbComandoOk(cmd == CMD_ABRIR);   // pip curto (agudo=abrir/grave=fecha) + verde
 }
 
 // ---- calibração (espelha FI_1_5, com o timing que o app precisa) ----
