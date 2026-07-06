@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.8.3"
+#define FW_VERSION   "2.8.4"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -94,13 +94,15 @@
 #define PIN_LED10_2  PIN_PB0
 #define PIN_LED10_3  PIN_PB1
 
-// BAUD do módulo BLE = 9600, com CRISTAL EXTERNO 16MHz (config da FROTA DE
-// PRODUÇÃO, provada em ~1000 fechaduras). Com clock preciso do cristal, 9600
-// é confiável no SoftwareSerial (o que falhava era 9600 no RC interno de 8MHz,
-// impreciso — por isso o 2400 anterior). AT+BAUD2 = 9600 nos clones "Soft AT
-// 5.2" (igual ao baud9600BLE1010 do firmware antigo FI_1_5).
-#define BAUD_MODULO  9600
-#define AT_BAUD_CMD  "AT+BAUD2"    // -> 9600 nos clones deste lote
+// BAUD do módulo BLE = 2400, com CRISTAL EXTERNO 16MHz. O MELHOR dos dois
+// mundos: clock PRECISO do cristal (robustez) + baud de TABELA CONHECIDA.
+// ⚠️ O 9600 (AT+BAUD2) falhou na CH003FI002734: a tabela de opcode de baud
+// varia por lote de módulo — AT+BAUD2 nem sempre é 9600. Já AT+BAUD0 = 2400 é
+// o que a esteira de produção (at.js) usa e o que a 2734 respondia. 2400 com
+// clock de cristal é super robusto (baud baixo + timing preciso); a velocidade
+// não importa (comandos do protocolo são pequenos).
+#define BAUD_MODULO  2400
+#define AT_BAUD_CMD  "AT+BAUD0"    // -> 2400 (tabela conhecida da frota)
 
 // Motor REAL (abrir/fechar/calibração): igual ao FI_1_5 de produção — gira até
 // detectar o BATENTE pela corrente (INA219 no I2C 0x45) ou até o teto duro.
