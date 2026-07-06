@@ -58,12 +58,13 @@
 #include <EEPROM.h>
 #include <SoftwareSerial.h>
 #include <avr/wdt.h>
+#include <avr/sleep.h>
 #include <Wire.h>
 #include <Adafruit_INA219.h>
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.9.0"
+#define FW_VERSION   "2.9.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -898,32 +899,30 @@ void atenderBotao() {
     }
 }
 
-// dormir = LowPower.powerDown. O MCU dorme e acorda pela interrupção do pino de
-// wake (PD3, borda que o módulo gera ao conectar) ou pelo botão (PD2).
+// dormir = SONO LEVE (SLEEP_MODE_IDLE). ⭐ MUDANÇA-CHAVE (v2.9.1):
+// Com CRISTAL de 16MHz, o powerDown PARA o oscilador e ele leva ~65ms p/ voltar
+// ao acordar — a 9600 isso ENGOLE a mensagem inteira (dezenas de bytes). Era a
+// causa do "conecta, motor gira DENTRO da janela, mas o TST-PING FORA da janela
+// não vira PONG": o MCU dormia profundo e o comando se perdia no arranque do
+// cristal. No IDLE o oscilador CONTINUA rodando -> o wake por dado (PCINT do RX
+// do SoftwareSerial no PD4) é INSTANTÂNEO e o byte NÃO se perde. Acorda também
+// por PD3 (conexão) e pelo botão.
+// ⚠️ NÃO manda mais AT+DROP: derrubava a conexão a cada sono. E conectado (MODE2
+// túnel) um "AT+..." vazaria como DADO pro app. Nada de AT aqui.
+// Custo: consumo maior (o clock não desliga). A hibernação por MOSFET + wake por
+// PD3 (bateria) volta DEPOIS que a comunicação estiver 100% confiável.
 // Motor fica OUTPUT LOW (nunca Hi-Z — evita shoot-through na ponte H).
 void dormir() {
     motorPara();
-#if FEATURE_HIBERNA_MOSFET
-    // Hibernação profunda por corte do trilho — receita do goToSleep() do
-    // FI_1_0_400. ⚠️ DESLIGADA na placa 1.0: o pino do gate ainda não está
-    // confirmado (4/5/7/8/9) e um corte que não religue deixa a fechadura
-    // MORTA (é o que estamos combatendo). Na 1.0, sono = powerDown normal, que
-    // NÃO corta a energia (relatório FI10_ANALISE §3 recomenda até validar).
-    if (!placa10) {
-        at("AT+DROP", 500);
-        at("AT+PIO61", 500);
-        EEPROM.update(EE_HIB, 1);
-        at("AT+PIO80", 60);
-        delay(3000);
-        EEPROM.update(EE_HIB, 0);
-        DBGLN(F("[hib] modulo nao cortou - powerDown normal"));
-    }
-#endif
-    at("AT+DROP", 60); at("AT+PIO60", 60);
     acordouBLE = false; acordouBtn = false;
     attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), isrBtn, FALLING);
     attachInterrupt(digitalPinToInterrupt(PIN_WAKE), isrBLE, RISING);
-    LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);
+    set_sleep_mode(SLEEP_MODE_IDLE);
+    cli();
+    sleep_enable();
+    sei();
+    sleep_cpu();                 // acorda em QUALQUER interrupção (PCINT do RX,
+    sleep_disable();             // INT1/PD3 na conexão, INT0/botão) — sem latência
     detachInterrupt(digitalPinToInterrupt(PIN_BUTTON));
     detachInterrupt(digitalPinToInterrupt(PIN_WAKE));
 }
