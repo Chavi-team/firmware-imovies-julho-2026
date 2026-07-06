@@ -532,6 +532,8 @@ def act_gravar(serial, mcu):
             MCU_REAL[serial] = m
             LOG(f"✓ {serial} gravada (chip {m}, placa {_placa_de(m)}). 1 bipe = viva; "
                 "aguarde a MELODIA (Rocky) = pronta. 4 bipes graves = módulo mudo.", "ok")
+            global _GRAVA_TS
+            _GRAVA_TS = time.time()   # marca p/ a etapa Conectar esperar o boot
             STATUS("gravar", "ok"); return True
         if "signature" not in out.lower():
             break                          # falha que não é de assinatura: não insiste
@@ -577,8 +579,21 @@ def act_validar(serial, mcu):
     LOG("✗ Validação divergente. Regrave.", "err"); STATUS("validar", "fail"); return False
 
 
+_GRAVA_TS = 0.0   # timestamp do fim da última gravação (p/ esperar o boot)
+BOOT_ESPERA_S = 30   # boot + provisionamento + melodia levam ~24s; margem p/ 30s
+
 def act_conectar(serial, mcu):
     STATUS("conectar", "run")
+    # ⛔ NÃO conectar no meio do boot: o provisionamento (que converge o baud do
+    # módulo e configura MODE2/NOTI) leva ~24s e, se o app conecta no meio, o
+    # módulo fica em modo túnel e a config não completa -> baud/estado errado
+    # (visto: bytes 0xDE 0xFE = 9600 x 2400 descasado, melodia tocando durante o
+    # PONG). Espera o boot terminar contando do fim da gravação.
+    if _GRAVA_TS:
+        falta = BOOT_ESPERA_S - (time.time() - _GRAVA_TS)
+        if falta > 0:
+            LOG(f"Aguardando o boot/provisionamento terminar ({falta:.0f}s)...", "hi")
+            time.sleep(falta)
     alvo = serial[2:] if serial.startswith("CH") else serial
     # Desconecta a sessão anterior ANTES do scan: dispositivo conectado NÃO
     # anuncia — escanear ainda conectado dava "não encontrada" falso (visto na
