@@ -64,7 +64,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.9.11"
+#define FW_VERSION   "2.9.12"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -251,12 +251,15 @@ void sinalModuloMudo() {
     piscar(CRGB::Red, 2, 200);
 }
 
-// CONECTOU por BLE: fanfarra do Rocky + 3 piscadas VERDES.
-void sinalConectado() { melodiaRocky(); piscar(CRGB::Green, 3); }
+// CONECTOU por BLE: aviso CURTO de sucesso (2 notas ascendentes "ta-dá") + verde.
+// ⚠️ NÃO usa a melodia Rocky: o app RECONECTA a cada abrir/fechar, então o
+// OK+CONN dispara a cada comando — a fanfarra tocaria toda vez (pesado). Duas
+// notas subindo (sol5→dó6) remetem a "conectou!" em ~200ms. A Rocky completa
+// fica só sob demanda (TST-ROCKY).
+void sinalConectado() { beep(70, 784); beep(130, 1047); piscar(CRGB::Green, 2, 90); }
 
 // ABRIR/FECHAR com SUCESSO: aviso CURTO e rápido (1 pip) + 1 piscada verde.
-// A MELODIA é reservada ao despertar/1ª conexão — aqui é só um "tique" leve pra
-// não pesar em cada acionamento. Pista sonora do sentido do motor:
+// Distinto da conexão (que são 2 notas): aqui é 1 pip só. Pista de sentido:
 //   agudo (si5) = ABRIR (sobe)  |  grave (ré5) = FECHAR (desce).
 void fbComandoOk(bool abrir) {
     beep(70, abrir ? 988 : 587);
@@ -1112,7 +1115,7 @@ void setup() {
     for (uint8_t t = 0; !moduloOk && t < 5; t++) { delay(250); moduloOk = (bleLerVersao() != 0); }
     DBG(F("[boot] moduloOk=")); DBGLN(moduloOk);
 
-    // Feedback do boot: a MELODIA agora toca na CONEXÃO (OK+CONN), não aqui.
+    // Feedback do boot: o aviso curto de sucesso toca na CONEXÃO (OK+CONN), não aqui.
     //   módulo OK  -> 2 piscadas VERDES (silencioso; "pronta")
     //   módulo MUDO -> 4 bipes GRAVES + vermelho (erro real de BLE) + diag de baud
     if (moduloOk) {
