@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.8.1"
+#define FW_VERSION   "2.8.2"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -460,25 +460,15 @@ void bleProvisionar() {
     static const long TODOS[] = {2400, 9600, 38400, 19200, 57600, 4800, 115200, 1200};
     const uint8_t N = sizeof(TODOS) / sizeof(long);
 
-    // PASSO 0 — reset de fábrica às cegas (RENEW/DEFAULT). ⚠️ SÓ na placa 1.5.
-    // NA PLACA 1.0 O RENEW É VENENO: ele apaga o AT+BEFC da NVM que segura o
-    // gate do MOSFET de energia -> o módulo corta a alimentação do próprio MCU
-    // no meio do provisionamento (causa-raiz das 0718/0629 mortas — relatório
-    // FI10_ANALISE §1; nenhum firmware/esteira legado jamais usou RENEW). Na
-    // 1.0 a config leve abaixo já reconfigura tudo e PRESERVA o BEFC.
-    if (!placa10) {
-        for (uint8_t i = 0; i < N; i++) {
-            bluetooth.begin(TODOS[i]);
-            delay(30);
-            at("AT", 120);                     // acorda (PWRM)
-            at("AT+RENEW", 300);
-            at("AT+DEFAULT", 300);
-            delay(400);                        // módulo re-inicializa nos defaults
-        }
-    } else {
-        // 1.0: primeiro RELIGA O TRILHO em todos os bauds (wake longo + PWRM1 +
-        // ergue os PIOs candidatos do gate), antes de qualquer coisa que
-        // pudesse cortar a energia. Sem RENEW.
+    // PASSO 0 — SEM RENEW. ⚠️ O AT+RENEW/DEFAULT era veneno em DUAS frentes:
+    //  (1.0) apagava o AT+BEFC da NVM que segura o gate do MOSFET de energia ->
+    //        o módulo cortava a alimentação do MCU (0718/0629 mortas, §1);
+    //  (1.5) interferia na tabela de baud do clone -> o módulo NÃO ficava em
+    //        9600 -> 4 bipes graves + sem PONG (visto na CH003FI002734).
+    // O firmware FI_1_5 de PRODUÇÃO (9600, ~centenas em campo) NUNCA usa RENEW:
+    // só reafirma AT+BAUD2 + config. É o que fazemos no PASSO 1/2.
+    if (placa10) {
+        // 1.0: religa o TRILHO de energia (mosfet) em todos os bauds, primeiro.
         for (uint8_t i = 0; i < N; i++) {
             bluetooth.begin(TODOS[i]);
             delay(30);
@@ -490,15 +480,17 @@ void bleProvisionar() {
         }
     }
 
-    // PASSO 1 — converge p/ BAUD_MODULO (pós-RENEW o módulo está no baud de fábrica).
+    // PASSO 1 — CONVERGE p/ BAUD_MODULO (9600): em cada baud candidato manda
+    // AT+BAUD2 (=9600 no clone) + AT+RESET. No baud atual do módulo o comando
+    // pega e ele passa a 9600; nos outros é lixo inócuo. Espelha o
+    // baud9600BLE1010 do FI_1_5.
     for (uint8_t i = 0; i < N; i++) {
-        if (TODOS[i] == BAUD_MODULO) continue; // já é o alvo
         bluetooth.begin(TODOS[i]);
         delay(30);
-        at("AT", 120);
-        at(AT_BAUD_CMD, 250);                  // -> BAUD_MODULO (tabela deste lote)
+        for (uint8_t k = 0; k < 3; k++) at("AT", 40);   // acorda (PWRM)
+        at(AT_BAUD_CMD, 250);                  // -> 9600
         at("AT+RESET", 150);
-        delay(600);                            // módulo reinicia
+        delay(600);                            // módulo reinicia no baud novo
     }
     bluetooth.begin(BAUD_MODULO);
     delay(1500);                               // módulo termina de reiniciar
