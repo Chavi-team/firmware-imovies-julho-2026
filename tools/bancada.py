@@ -1120,7 +1120,17 @@ PAGE = r"""<!DOCTYPE html>
          --ok:#16A34A; --err:#DC2626; --amber:#D97706; --bg:#F4F6F9; }
   *{box-sizing:border-box; font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
   body{margin:0; background:var(--bg); color:var(--ink)}
-  .wrap{max-width:820px; margin:0 auto; padding:26px 20px 40px}
+  .wrap{max-width:1280px; margin:0 auto; padding:26px 20px 40px;
+        display:flex; gap:24px; align-items:flex-start}
+  /* DUAS COLUNAS: comandos/passos à esquerda, logs à direita. */
+  .col-left{flex:1 1 520px; min-width:0}
+  .col-right{flex:1 1 440px; min-width:0; position:sticky; top:26px}
+  body.has-update .col-right{top:88px}
+  /* Tela estreita: empilha (log embaixo), pra não espremer nada. */
+  @media (max-width:900px){
+    .wrap{flex-direction:column}
+    .col-right{position:static; width:100%}
+  }
   h1{font-size:30px; margin:6px 0 2px; letter-spacing:-.5px}
   .sub{color:var(--muted); font-size:15px; margin-bottom:22px}
   .card{background:#fff; border:1px solid var(--line); border-radius:16px;
@@ -1163,7 +1173,9 @@ PAGE = r"""<!DOCTYPE html>
   .logbar{display:flex; justify-content:space-between; align-items:center; margin:18px 0 6px}
   .logbar b{color:var(--muted); font-size:13px; font-weight:700}
   #log{background:#0B1220; color:#E2E8F0; border-radius:12px; padding:12px 14px;
-       font:12px ui-monospace,Menlo,monospace; height:240px; overflow:auto; white-space:pre-wrap; line-height:1.55}
+       font:12px ui-monospace,Menlo,monospace; height:calc(100vh - 150px); min-height:300px;
+       overflow:auto; white-space:pre-wrap; line-height:1.55}
+  @media (max-width:900px){ #log{height:320px} }
   #log .ok{color:#4ADE80} #log .err{color:#F87171} #log .warn{color:#FBBF24} #log .hi{color:#FDBA74}
   /* modal */
   .mask-bg{position:fixed; inset:0; background:rgba(15,23,42,.45); display:none; align-items:center; justify-content:center}
@@ -1223,6 +1235,7 @@ PAGE = r"""<!DOCTYPE html>
 <div id="proc"><span class="spin"></span>Executando…</div>
 <div class="toplink" id="login-state">não conectado</div>
 <div class="wrap">
+  <div class="col-left">
 
   <!-- TELA 1 -->
   <div id="tela-serial">
@@ -1294,8 +1307,12 @@ PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  </div><!-- /col-left -->
+
+  <div class="col-right">
   <div class="logbar"><b>REGISTRO</b><button class="ghost small" onclick="salvarLog()">salvar</button></div>
   <div id="log"></div>
+  </div><!-- /col-right -->
 </div>
 
 <!-- modal login -->
