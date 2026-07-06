@@ -71,6 +71,7 @@ exe = EXE(
     upx=True, console=False,   # janela nativa (webview) — sem terminal preto
     disable_windowed_traceback=False, argv_emulation=False,
     target_arch=None, codesign_identity=None, entitlements_file=None,
+    icon=os.path.join(PKG, "icon.ico"),   # ícone do .exe (Windows); inócuo no Mac
 )
 coll = COLLECT(
     exe, a.binaries, a.zipfiles, a.datas,
@@ -83,7 +84,7 @@ if sys.platform == "darwin":
     app = BUNDLE(
         coll,
         name="Chavi-Fi-Imoveis-Setup.app",
-        icon=None,
+        icon=os.path.join(PKG, "icon.icns"),
         bundle_identifier="com.chavi.fi.setup",
         info_plist={
             "NSHighResolutionCapable": True,

@@ -80,10 +80,10 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.9.9"                 # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.9.11"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.9.9"
+FIRMWARE_VERSION = "2.9.11"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 
 # snapshot compartilhado (preenchido em background; lido pelo endpoint)
@@ -1099,6 +1099,82 @@ def act_desativar_hibernacao(serial, mcu):
     return ok
 
 
+def act_preparar(serial, mcu, mosfet_pin):
+    """AUTO-PREPARO pós-gravação — pro funcionário não precisar lembrar de nada.
+    Roda sozinho depois do 'Gravar' e deixa a fechadura 100% pronta:
+      ① espera o boot + auto-provisionamento do firmware;
+      ② garante o módulo BLE provisionado (o firmware faz sozinho no boot; só
+         reforça pela sequência AT por BLE se o PONG não vier);
+      ③ VALIDA o ciclo da hibernação (corta a energia do MCU pelo MOSFET e
+         confere se RELIGA sozinha) e SÓ ATIVA a hibernação se o ciclo passar —
+         senão deixa em IDLE seguro (a fechadura funciona 100%, só não hiberna).
+    Ativar hibernação é irreversível-por-cabo se o hardware não religar, por isso
+    NUNCA ligamos às cegas: o teste corta→religa é o portão de segurança."""
+    STATUS("preparar", "run")
+    alvo = serial[2:] if serial.startswith("CH") else serial
+
+    # ① espera o boot/auto-provisionamento do firmware terminar (conta do gravar)
+    if _GRAVA_TS:
+        falta = BOOT_ESPERA_S - (time.time() - _GRAVA_TS)
+        if falta > 0:
+            LOG(f"① Aguardando o boot + auto-provisionamento do firmware ({falta:.0f}s)...", "hi")
+            time.sleep(falta)
+
+    def _conecta_pong():
+        try:
+            BLE.disconnect(); time.sleep(1.0)
+            addr = BLE.scan(alvo, timeout=8.0)
+            if not addr:
+                return False
+            BLE.connect(addr)
+        except Exception as e:
+            LOG(f"  BLE: {e}", "warn"); return False
+        for _ in range(4):
+            ok, _r = BLE.cmd("TST-PING", ["PONG"], timeout=3)
+            if ok:
+                return True
+        return False
+
+    # ② módulo: o firmware já se auto-provisiona; confirmamos por PONG e só
+    #    reforçamos por BLE (AT+RESET) se realmente não responder.
+    LOG("② Verificando o módulo BLE (o firmware se auto-provisiona no boot)...", "hi")
+    if _conecta_pong():
+        LOG("  ✓ Módulo provisionado e respondendo (PONG). Nada a reforçar.", "ok")
+    else:
+        LOG("  Sem PONG — reforçando o provisionamento do módulo por BLE...", "warn")
+        if not act_provisionar(serial, mcu, mosfet_pin):
+            LOG("⛔ Não consegui provisionar o módulo. Religue a bateria e rode "
+                "'Preparar' de novo (ou use a recuperação manual na aba avançada).", "err")
+            STATUS("preparar", "fail"); return {"preparada": False, "hibernacao": False}
+        LOG(f"  Provisionado (AT+RESET) — aguardando o reboot ({BOOT_ESPERA_S}s)...", "hi")
+        time.sleep(BOOT_ESPERA_S)
+        if not _conecta_pong():
+            LOG("⛔ Ainda sem PONG após provisionar — verifique o módulo/solda do "
+                "pino de wake. Deixei a hibernação DESLIGADA por segurança.", "err")
+            STATUS("preparar", "fail"); return {"preparada": False, "hibernacao": False}
+        LOG("  ✓ Módulo provisionado e respondendo (PONG).", "ok")
+
+    # ③ valida o ciclo da hibernação; só ativa se corta→religa passar
+    LOG("③ Validando o ciclo da hibernação (corta→religa) antes de ativar...", "hi")
+    if not act_testar_hibernacao(serial, mcu):
+        LOG("⚠️ Hibernação NÃO validada nesta fechadura — mantida em IDLE seguro. "
+            "A fechadura está pronta e funciona 100%; apenas não hiberna. (Se quiser "
+            "insistir: religue a bateria e teste a hibernação manualmente.)", "warn")
+        STATUS("preparar", "ok"); return {"preparada": True, "hibernacao": False}
+
+    # ④ ciclo OK → ativa de vez
+    LOG("④ Ciclo corta→religa validado — ATIVANDO a hibernação...", "hi")
+    on = act_ativar_hibernacao(serial, mcu)
+    if on:
+        LOG("✅ Fechadura 100% PREPARADA: módulo provisionado + hibernação ativada e "
+            "validada. Siga para o auto-teste e o cadastro.", "ok")
+    else:
+        LOG("⚠️ Não confirmei a ativação da hibernação — deixei em IDLE seguro. "
+            "Pode ativar manualmente na aba avançada.", "warn")
+    STATUS("preparar", "ok")
+    return {"preparada": True, "hibernacao": bool(on)}
+
+
 def act_finalizar(serial):
     if BLE.conectado():
         BLE.disconnect()
@@ -1126,7 +1202,18 @@ PAGE = r"""<!DOCTYPE html>
   body.has-update .brandbar{margin-top:56px}
   @media (max-width:560px){ .brand-sub{display:none} }
   *{box-sizing:border-box; font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-  body{margin:0; background:var(--bg); color:var(--ink)}
+  /* FUNDO com a arte "direcional" da Chavi (trilhas terminando no "C" da marca,
+     estilo circuito — combina com bancada de hardware). Tons MUITO claros: um
+     padrão SVG data-uri (poucos bytes) em laranja translúcido + dois washes
+     radiais suaves nos cantos. Leve, não pesa a leitura. */
+  body{margin:0; color:var(--ink);
+    background-color:var(--bg);
+    background-image:
+      radial-gradient(1100px 520px at 88% -8%, rgba(232,102,40,.07), transparent 60%),
+      radial-gradient(900px 520px at -8% 112%, rgba(225,46,29,.05), transparent 55%),
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='260' viewBox='0 0 260 260'%3E%3Cg fill='none' stroke='%23E86628' stroke-opacity='.10' stroke-width='3' stroke-linecap='round'%3E%3Cline x1='16' y1='46' x2='214' y2='46'/%3E%3Ccircle cx='228' cy='46' r='9' stroke-dasharray='46 12'/%3E%3Ccircle cx='2' cy='46' r='9' stroke-dasharray='46 12'/%3E%3Cpath d='M132 96 L132 190 Q132 212 154 212 L214 212'/%3E%3Ccircle cx='228' cy='212' r='9' stroke-dasharray='46 12'/%3E%3Ccircle cx='132' cy='82' r='9' stroke-dasharray='46 12'/%3E%3Cline x1='40' y1='150' x2='96' y2='150'/%3E%3Ccircle cx='110' cy='150' r='9' stroke-dasharray='46 12'/%3E%3C/g%3E%3C/svg%3E");
+    background-repeat:no-repeat,no-repeat,repeat;
+    background-attachment:fixed,fixed,fixed;}
   .wrap{max-width:1280px; margin:0 auto; padding:26px 20px 40px;
         display:flex; gap:24px; align-items:flex-start}
   /* DUAS COLUNAS: comandos/passos à esquerda, logs à direita. */
@@ -1365,8 +1452,9 @@ const PASSOS = [
   ["gravar","1 · Gravar firmware","Grava o programa e as seeds (cabo USBasp)."],
   ["validar","2 · Validar gravação","Relê o chip e confere serial + seeds."],
   ["conectar","3 · Conectar (BLE)","Acha a fechadura por Bluetooth e dá um PING."],
-  ["autoteste","4 · Auto-teste","Testa cada peça e PERGUNTA se funcionou de verdade."],
-  ["cadastrar","5 · Cadastrar no sistema","Registra só o serial no backend."],
+  ["preparar","4 · Preparar (BLE + hibernação)","Roda sozinho após gravar: provisiona o módulo e valida+ativa a hibernação (só liga se o corte→religa passar)."],
+  ["autoteste","5 · Auto-teste","Testa cada peça e PERGUNTA se funcionou de verdade."],
+  ["cadastrar","6 · Cadastrar no sistema","Registra só o serial no backend."],
 ];
 // Testes com a PERGUNTA física (o firmware pode dizer OK e a peça não funcionar).
 // Ordem: os leves primeiro; os MOTORES por ÚLTIMO (puxam corrente e podem dar
@@ -1487,14 +1575,24 @@ function setBusy(on, btn){
 }
 
 async function runStep(step, btn){
-  if(busy)return;
+  if(busy)return {ok:false};
   btn = btn || $("#btn-"+step);
   setBusy(true, btn);
   const mosfet=($("#mosfet")&&$("#mosfet").value)||"8";
   const r=await fetch("/api/step",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({step,serial:SERIAL,mcu:MCU,mosfet})}).then(r=>r.json()).catch(()=>({ok:false}));
   setBusy(false);
-  if(r && r.need_login){ abrirLogin(); }
+  if(r && r.need_login){ abrirLogin(); return r; }
+  // AUTO-FLUXO pós-gravação: assim que 'Gravar' passa, a bancada segue SOZINHA
+  // para validar → preparar (provisiona o módulo + valida/ativa a hibernação),
+  // pro funcionário não esquecer de deixar a fechadura pronta. Para em qualquer
+  // falha (o operador vê o passo que travou e re-executa). Os testes físicos
+  // (auto-teste) e o cadastro seguem manuais — precisam de humano.
+  if(step==="gravar" && r && r.ok){
+    const v = await runStep("validar", $("#btn-validar"));
+    if(v && v.ok) await runStep("preparar", $("#btn-preparar"));
+  }
+  return r;
 }
 // pede o comando ao firmware e, se físico, PERGUNTA se funcionou de verdade.
 async function teste1(t, btn){
@@ -1732,6 +1830,10 @@ class Handler(BaseHTTPRequestHandler):
         if step == "provisionar":
             r = act_provisionar(serial, mcu, b.get("mosfet", "8"))
             return {"ok": bool(r)}
+        if step == "preparar":
+            r = act_preparar(serial, mcu, b.get("mosfet", "8"))
+            return {"ok": bool(r and r.get("preparada")),
+                    "hibernacao": bool(r and r.get("hibernacao"))}
         fn = {"gravar": act_gravar, "validar": act_validar, "conectar": act_conectar,
               "autoteste": act_autoteste, "cadastrar": act_cadastrar,
               "hibernar": act_testar_hibernacao, "hib-on": act_ativar_hibernacao,
