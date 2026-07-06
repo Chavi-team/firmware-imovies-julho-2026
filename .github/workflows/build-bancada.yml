@@ -1,0 +1,75 @@
+name: Build Bancada (Mac + Windows)
+
+# Gera o pacote Chavi-Fi-Imoveis-Setup para macOS e Windows no cloud e publica
+# numa Release. Rode manualmente (Actions -> Build Bancada -> Run workflow) ou
+# empurrando uma tag "bancada-v*" (ex.: git tag bancada-v2.7.3 && git push --tags).
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'bancada-v*'
+
+permissions:
+  contents: write        # criar a Release e anexar os zips
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            plat: mac
+          - os: windows-latest
+            plat: win
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Dependências Python
+        run: pip install pyinstaller bleak pyserial requests pywebview
+
+      - name: Dependências macOS (pyobjc)
+        if: matrix.plat == 'mac'
+        run: pip install pyobjc-framework-WebKit pyobjc-framework-Cocoa
+
+      - name: Baixar avrdude standalone
+        run: python packaging/baixar_avrdude.py
+
+      - name: Empacotar (PyInstaller)
+        run: pyinstaller --clean --distpath packaging/dist --workpath packaging/build packaging/chavi_fi_setup.spec
+
+      - name: Zipar (macOS)
+        if: matrix.plat == 'mac'
+        run: |
+          cd packaging/dist
+          xattr -cr Chavi-Fi-Imoveis-Setup.app || true
+          cp ../LEIA-ME.txt .
+          zip -rqy Chavi-Fi-Imoveis-Setup-mac.zip Chavi-Fi-Imoveis-Setup.app LEIA-ME.txt
+
+      - name: Zipar (Windows)
+        if: matrix.plat == 'win'
+        shell: pwsh
+        run: |
+          cd packaging/dist
+          Copy-Item ../LEIA-ME.txt .
+          Compress-Archive -Force -Path Chavi-Fi-Imoveis-Setup,LEIA-ME.txt -DestinationPath Chavi-Fi-Imoveis-Setup-win.zip
+
+      - name: Anexar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: bancada-${{ matrix.plat }}
+          path: packaging/dist/Chavi-Fi-Imoveis-Setup-*.zip
+
+      - name: Publicar na Release (só em tag)
+        if: startsWith(github.ref, 'refs/tags/bancada-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Bancada ${{ github.ref_name }}
+          files: packaging/dist/Chavi-Fi-Imoveis-Setup-*.zip
+          draft: false
+          prerelease: false
