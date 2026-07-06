@@ -75,6 +75,61 @@ AVR_PROG = os.getenv("AVR_PROG", "usbasp")
 BAUD_CABO = 2400
 API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 
+# ---------------------------------------------------------------------------
+# Auto-aviso de atualização
+# A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
+# "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
+# atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
+BANCADA_VERSION = "1.0.0"                 # versão desta bancada (bump a cada release)
+GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
+
+# snapshot compartilhado (preenchido em background; lido pelo endpoint)
+_UPDATE = {"checado": False, "current": BANCADA_VERSION,
+           "latest": None, "outdated": False, "url": None}
+
+
+def _parse_versao(tag):
+    """'bancada-v2.7.3' / 'v2.7.3' / '2.7.3' -> (2,7,3); tolerante -> None."""
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", tag or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _checar_atualizacao():
+    """Consulta os Releases do GitHub e marca se há versão nova.
+    TOTALMENTE tolerante a falha: sem internet / rate limit / timeout →
+    não mostra nada, não loga erro, não trava (roda em thread daemon)."""
+    try:
+        import requests
+        r = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/releases",
+            headers={"Accept": "application/vnd.github+json"},
+            params={"per_page": 30}, timeout=4)
+        if not r.ok:
+            return
+        cand = None                      # (versao_tupla, release) mais nova bancada-v*
+        for rel in (r.json() or []):
+            if rel.get("draft") or rel.get("prerelease"):
+                continue
+            tag = rel.get("tag_name", "") or ""
+            if not tag.startswith("bancada-v"):
+                continue                 # ignora releases de firmware etc.
+            v = _parse_versao(tag)
+            if v and (cand is None or v > cand[0]):
+                cand = (v, rel)
+        if not cand:
+            return
+        v, rel = cand
+        atual = _parse_versao(BANCADA_VERSION)
+        _UPDATE.update({
+            "latest": ".".join(str(x) for x in v),
+            "outdated": bool(atual and v > atual),
+            "url": rel.get("html_url"),
+        })
+    except Exception:
+        pass                             # silêncio total: rede/timeout/JSON
+    finally:
+        _UPDATE["checado"] = True        # marca que a tentativa terminou
+
 
 # ---------------------------------------------------------------------------
 # Seeds
@@ -1010,8 +1065,53 @@ PAGE = r"""<!DOCTYPE html>
   .modal .row{margin-top:16px; gap:8px}
   .hide{display:none}
   .toplink{position:fixed; top:12px; right:16px; font-size:12px; color:var(--muted)}
+  /* estado "processando" */
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .spin{display:inline-block; width:14px; height:14px; margin-right:8px; vertical-align:-2px;
+        border:2px solid rgba(255,255,255,.45); border-top-color:#fff; border-radius:50%;
+        animation:spin .7s linear infinite}
+  button.running{background:var(--amber)!important; box-shadow:0 0 0 3px rgba(217,119,6,.25)}
+  body.processing button:not(.running):not(.keep){opacity:.4; cursor:not-allowed}
+  #proc{position:fixed; top:10px; left:50%; transform:translateX(-50%); display:none;
+        align-items:center; gap:2px; background:var(--amber); color:#fff; font-weight:800;
+        font-size:13px; padding:8px 16px; border-radius:999px;
+        box-shadow:0 4px 14px rgba(217,119,6,.4); z-index:50}
+  body.processing #proc{display:flex}
+  /* seção de recuperação */
+  .flow-hint{color:var(--muted); font-size:13px; margin:-4px 0 14px}
+  .recovery{margin-top:26px; border:1px dashed var(--amber); background:#FFFBEB;
+        border-radius:14px; padding:16px 18px}
+  .rec-title{font-weight:800; color:var(--amber); font-size:15px; margin-bottom:2px}
+  .rec-sub{color:var(--muted); font-size:12.5px; margin-bottom:14px; line-height:1.45}
+  .rec-item{margin-bottom:12px} .rec-item:last-child{margin-bottom:0}
+  .rec-item button{background:#B45309}
+  .rec-desc{color:var(--muted); font-size:12.5px; margin-top:5px; line-height:1.4}
+  /* aviso de atualização disponível — banner fixo no topo, difícil de ignorar */
+  #update-banner{position:fixed; top:0; left:0; right:0; z-index:100; display:none;
+        align-items:center; justify-content:center; gap:18px; flex-wrap:wrap;
+        background:linear-gradient(90deg,#DC2626,#E86628); color:#fff;
+        padding:14px 20px; box-shadow:0 5px 20px rgba(220,38,38,.55)}
+  #update-banner .ub-txt{font-size:15px; font-weight:800; letter-spacing:.2px}
+  #update-banner .ub-txt b{font-size:17px}
+  #update-banner button{background:#fff; color:#B91C1C; border:none; border-radius:10px;
+        padding:12px 24px; font-weight:900; font-size:15px; cursor:pointer;
+        box-shadow:0 2px 10px rgba(0,0,0,.25); text-transform:uppercase; letter-spacing:.4px}
+  #update-banner button:hover{background:#FEF2F2}
+  @keyframes ubpulse{0%,100%{box-shadow:0 5px 20px rgba(220,38,38,.5)}
+        50%{box-shadow:0 5px 30px rgba(220,38,38,.9)}}
+  #update-banner.on{display:flex; animation:ubpulse 1.5s ease-in-out infinite}
+  body.has-update .wrap{padding-top:70px}
+  #update-ok{position:fixed; top:12px; left:16px; font-size:12px; color:var(--ok);
+        font-weight:700; opacity:.85}
 </style></head>
 <body>
+<div id="update-banner">
+  <span class="ub-txt">⚠️ Atualização disponível: <b id="ub-new">—</b>
+    — você está na v<span id="ub-cur">—</span></span>
+  <button id="ub-btn" class="keep">⬇ Baixar atualização</button>
+</div>
+<div id="update-ok"></div>
+<div id="proc"><span class="spin"></span>Executando…</div>
 <div class="toplink" id="login-state">não conectado</div>
 <div class="wrap">
 
@@ -1051,9 +1151,28 @@ PAGE = r"""<!DOCTYPE html>
       <div class="serial" id="serial-lbl"></div>
       <button class="ghost small" onclick="voltar()">‹ Trocar</button>
     </div>
+    <div class="flow-hint">Siga os passos na ordem, de cima para baixo ▼</div>
     <div id="steps"></div>
     <div class="comp" id="comp"></div>
     <button class="big green" style="margin-top:12px" onclick="finalizar()">✔ FINALIZAR e iniciar a próxima</button>
+
+    <!-- RECUPERAÇÃO: só quando algo dá errado. No fluxo normal, ignore. -->
+    <div class="recovery">
+      <div class="rec-title">⚠️ Recuperação — só se algo der errado</div>
+      <div class="rec-sub">No fluxo NORMAL você <b>não precisa</b> destes botões — basta seguir os passos numerados acima. Use um destes só quando o problema abaixo acontecer:</div>
+      <div class="rec-item">
+        <button id="btn-provisionar">⚙️ Provisionar módulo (BLE)</button>
+        <div class="rec-desc">Use se a fechadura <b>NÃO conectar</b> ou der <b>4 bipes graves</b>. Reconfigura o rádio por Bluetooth.</div>
+      </div>
+      <div class="rec-item">
+        <button id="btn-consertar">🩺 Consertar módulo</button>
+        <div class="rec-desc">Use se a comunicação estiver <b>saindo com lixo/travando</b>.</div>
+      </div>
+      <div class="rec-item">
+        <button id="btn-renomear">🔧 Renomear módulo</button>
+        <div class="rec-desc">Use se no scan aparecer um <b>nome errado/antigo</b> em vez do serial.</div>
+      </div>
+    </div>
   </div>
 
   <div class="logbar"><b>REGISTRO</b><button class="ghost small" onclick="salvarLog()">salvar</button></div>
@@ -1067,15 +1186,15 @@ PAGE = r"""<!DOCTYPE html>
       <h3>Entrar (admin)</h3>
       <p>Telefone do admin, só dígitos com DDD</p>
       <input id="in-phone" inputmode="numeric" placeholder="41999999999">
-      <div class="row center"><button onclick="otpGerar()">Enviar código</button>
-        <button class="grey" onclick="fecharModal()">Cancelar</button></div>
+      <div class="row center"><button class="keep" onclick="otpGerar()">Enviar código</button>
+        <button class="grey keep" onclick="fecharModal()">Cancelar</button></div>
     </div>
     <div id="m-code" class="hide">
       <h3>Código do WhatsApp</h3>
       <p>Digite o código de 6 dígitos</p>
       <input id="in-otp" inputmode="numeric" maxlength="6" placeholder="000000">
-      <div class="row center"><button class="green" onclick="otpVerificar()">Entrar</button>
-        <button class="grey" onclick="fecharModal()">Cancelar</button></div>
+      <div class="row center"><button class="green keep" onclick="otpVerificar()">Entrar</button>
+        <button class="grey keep" onclick="fecharModal()">Cancelar</button></div>
     </div>
   </div>
 </div>
@@ -1086,8 +1205,8 @@ PAGE = r"""<!DOCTYPE html>
     <h3 id="cf-title">Confirmar</h3>
     <p id="cf-q" style="font-size:16px;color:var(--ink);font-weight:600"></p>
     <div class="row center" style="flex-direction:column;gap:10px">
-      <button class="green big" id="cf-sim">✓ SIM, funcionou</button>
-      <button class="big" id="cf-nao" style="background:var(--err)">✗ NÃO funcionou</button>
+      <button class="green big keep" id="cf-sim">✓ SIM, funcionou</button>
+      <button class="big keep" id="cf-nao" style="background:var(--err)">✗ NÃO funcionou</button>
     </div>
   </div>
 </div>
@@ -1157,31 +1276,14 @@ function renderSteps(){
   }
   const comp=$("#comp"); comp.innerHTML="";
   for(const t of TESTES){ const b=document.createElement("button");
-    b.textContent=t.label; b.onclick=()=>teste1(t); comp.appendChild(b); }
-  // renomeia o módulo pelo ar (nome residual/corrompido de gravação antiga)
-  const ren=document.createElement("button");
-  ren.textContent="🔧 Renomear módulo";
-  ren.onclick=async()=>{
-    const errado=prompt("Nome ERRADO que aparece no scan (ex.: 803FI002485):");
-    if(!errado)return;
-    await fetch("/api/renomear",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({serial:SERIAL,nomeErrado:errado.trim()})}).catch(()=>{});
-  };
-  comp.appendChild(ren);
+    b.textContent=t.label; b.onclick=(e)=>teste1(t, e.currentTarget); comp.appendChild(b); }
+  // RECUPERAÇÃO (botões estáticos na TELA 2) — só fiação, texto/ajuda vêm do HTML.
+  // BACKUP: provisiona o módulo POR BLE. Só se o firmware não auto-provisionou.
+  $("#btn-provisionar").onclick=(e)=>runStep("provisionar", e.currentTarget);
   // diagnostica e conserta a UART do módulo pelo ar (baud errado etc.)
-  const con=document.createElement("button");
-  con.textContent="🩺 Consertar módulo";
-  con.onclick=async()=>{
-    await fetch("/api/consertar",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({serial:SERIAL})}).catch(()=>{});
-  };
-  comp.appendChild(con);
-  // BACKUP: provisiona o módulo POR BLE (sequência AT do parque em 9600). Só se
-  // o firmware não auto-provisionou (4 beeps / sem PONG) — normalmente NÃO precisa.
-  const prov=document.createElement("button");
-  prov.textContent="⚙️ Provisionar módulo (BLE)";
-  prov.onclick=()=>runStep("provisionar");
-  comp.appendChild(prov);
+  $("#btn-consertar").onclick=doConsertar;
+  // renomeia o módulo pelo ar (nome residual/corrompido de gravação antiga)
+  $("#btn-renomear").onclick=doRenomear;
 }
 
 function setChip(step,state){
@@ -1190,20 +1292,66 @@ function setChip(step,state){
   el.textContent={pending:"○",run:"⏳",ok:"✓",fail:"✗"}[state]||"○";
 }
 
-async function runStep(step){
-  if(busy)return; busy=true;
+// Trava/destrava TODA a interface enquanto uma ação roda: desabilita os botões
+// de fluxo (passos, testes, recuperação, finalizar/trocar), reduz a opacidade,
+// e mostra "Executando…" no botão ativo + a barra flutuante #proc. Os botões
+// dos modais (classe .keep) continuam clicáveis (ex.: "funcionou?" no auto-teste).
+let ACTIVE_BTN=null;
+function setBusy(on, btn){
+  busy = on;
+  ACTIVE_BTN = on ? (btn||null) : ACTIVE_BTN;
+  document.body.classList.toggle("processing", on);
+  document.querySelectorAll("#tela-passos button, #btn-next").forEach(b=>{
+    if(b.classList.contains("keep")) return;
+    b.disabled = on && (b!==btn);
+  });
+  if(on){
+    if(btn){ btn.classList.add("running");
+      if(btn.dataset.orig===undefined) btn.dataset.orig=btn.textContent;
+      btn.innerHTML='<span class="spin"></span>Executando…'; }
+  } else if(ACTIVE_BTN){
+    ACTIVE_BTN.classList.remove("running");
+    if(ACTIVE_BTN.dataset.orig!==undefined){ ACTIVE_BTN.textContent=ACTIVE_BTN.dataset.orig;
+      delete ACTIVE_BTN.dataset.orig; }
+    ACTIVE_BTN=null;
+  }
+}
+
+async function runStep(step, btn){
+  if(busy)return;
+  btn = btn || $("#btn-"+step);
+  setBusy(true, btn);
   const mosfet=($("#mosfet")&&$("#mosfet").value)||"8";
   const r=await fetch("/api/step",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({step,serial:SERIAL,mcu:MCU,mosfet})}).then(r=>r.json()).catch(()=>({ok:false}));
-  busy=false;
+  setBusy(false);
   if(r && r.need_login){ abrirLogin(); }
 }
 // pede o comando ao firmware e, se físico, PERGUNTA se funcionou de verdade.
-async function teste1(t){ if(busy)return; busy=true;
+async function teste1(t, btn){
+  if(busy)return;
+  setBusy(true, btn);
   const r=await fetch("/api/test",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({serial:SERIAL,cmd:t.cmd})}).then(r=>r.json()).catch(()=>({ok:false}));
   if(r.ok && t.fisico){ await confirmarFisico(t); }
-  busy=false;
+  setBusy(false);
+}
+// recuperação: renomear e consertar (envolvidos por setBusy p/ travar a UI)
+async function doRenomear(e){
+  if(busy)return;
+  const errado=prompt("Nome ERRADO que aparece no scan (ex.: 803FI002485):");
+  if(!errado)return;
+  setBusy(true, e.currentTarget);
+  await fetch("/api/renomear",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({serial:SERIAL,nomeErrado:errado.trim()})}).catch(()=>{});
+  setBusy(false);
+}
+async function doConsertar(e){
+  if(busy)return;
+  setBusy(true, e.currentTarget);
+  await fetch("/api/consertar",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({serial:SERIAL})}).catch(()=>{});
+  setBusy(false);
 }
 
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -1220,7 +1368,9 @@ async function reconectar(){
 // AUTO-TESTE: roda cada peça e CRUZA o OK do firmware com o que o operador vê.
 // Motores por último, com pausa antes (bateria recupera). Se um teste não
 // responder (brownout derrubou o BLE), tenta RECONECTAR 1x e refaz.
-async function autoteste(){ if(busy)return; busy=true;
+async function autoteste(){
+  if(busy)return;
+  setBusy(true, $("#btn-autoteste"));
   setChip("autoteste","run");
   let allok=true;
   for(const t of TESTES){
@@ -1234,7 +1384,7 @@ async function autoteste(){ if(busy)return; busy=true;
     if(t.fisico){ const sim=await confirmarFisico(t); if(!sim) allok=false; }
   }
   setChip("autoteste", allok?"ok":"fail");
-  busy=false;
+  setBusy(false);
 }
 
 // modal "funcionou?" -> registra no backend e resolve true/false
@@ -1294,6 +1444,31 @@ ev.onmessage=e=>{ const o=JSON.parse(e.data);
   else if(o.kind==="login") atualizaLoginState(o.on); };
 
 fetch("/api/state").then(r=>r.json()).then(s=>atualizaLoginState(s.logged));
+
+/* aviso de atualização (não-bloqueante; falha de rede = silêncio) */
+async function updateCheck(tent){
+  let d;
+  try{ d=await fetch("/api/update-check").then(r=>r.json()); }
+  catch(e){ return; }                       // sem servidor/rede: ignora
+  if(!d) return;
+  if(!d.checado){                            // checagem ainda rodando: re-tenta
+    if((tent||0)<5) setTimeout(()=>updateCheck((tent||0)+1), 2500);
+    return;
+  }
+  if(d.outdated && d.latest){
+    $("#ub-new").textContent = "v"+d.latest;
+    $("#ub-cur").textContent = d.current;
+    $("#update-banner").classList.add("on");
+    document.body.classList.add("has-update");
+  } else if(d.latest){
+    $("#update-ok").textContent = "✓ atualizado (v"+d.current+")";
+  }
+}
+$("#ub-btn").onclick=()=>{
+  fetch("/api/open-update",{method:"POST"}).catch(()=>{});
+};
+updateCheck(0);
+
 prev();
 </script>
 </body></html>"""
@@ -1331,6 +1506,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"serial": s, "seeds": seeds_de(s) if len(s) >= 5 else []}); return
         if self.path == "/api/state":
             self._send(200, {"logged": BACKEND.tem_token()}); return
+        if self.path == "/api/update-check":
+            self._send(200, dict(_UPDATE)); return
         if self.path == "/events":
             self._sse(); return
         self._send(404, {"erro": "nao encontrado"})
@@ -1361,6 +1538,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/consertar":
             ok = act_consertar_modulo(b.get("serial", ""))
             self._send(200, {"ok": bool(ok)}); return
+        if self.path == "/api/open-update":
+            # abre a página da release no navegador padrão do SISTEMA (mais
+            # confiável que window.open dentro da janela nativa/webview).
+            url = _UPDATE.get("url")
+            if url:
+                try:
+                    webbrowser.open(url)
+                except Exception:
+                    pass
+            self._send(200, {"ok": bool(url)}); return
         if self.path == "/api/login/generate":
             ok = BACKEND.solicitar_otp(b.get("phone", ""), CFG.get("country", "55"))
             self._send(200, {"ok": ok}); return
@@ -1442,6 +1629,8 @@ def main():
     # Servidor numa thread daemon; a GUI (webview) precisa da MAIN thread no macOS.
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     threading.Timer(1.0, _checar_ferramentas).start()
+    # checagem de atualização em background (não bloqueia a abertura da janela)
+    threading.Thread(target=_checar_atualizacao, daemon=True).start()
 
     if os.environ.get("BANCADA_NO_BROWSER"):        # modo teste/headless
         try:
