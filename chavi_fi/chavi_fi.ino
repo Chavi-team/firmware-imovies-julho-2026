@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.8.0"
+#define FW_VERSION   "2.8.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo

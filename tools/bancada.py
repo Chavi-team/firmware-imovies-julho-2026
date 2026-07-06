@@ -500,11 +500,16 @@ def act_gravar(serial, mcu):
                 gerar_seed_bin(serial, _placa_de(m), seed_bin)
             except Exception:
                 break
-        # lfuse = CRISTAL EXTERNO 16MHz (MiniCore): 328PB=0xFF, 328/328P=0xF7.
+        # Fuses do MiniCore por chip: cristal 16MHz + BOD 2.7V + EEPROM preservada.
+        #   lfuse: 328PB=0xFF, 328/328P=0xF7 (16MHz, CKDIV8 off)
+        #   efuse: 328PB=0xF5, 328/328P=0xFD (BOD 2.7V — protege a EEPROM no
+        #          brownout do motor; era 0xF7=BOD OFF, uma falha corrigida)
+        #   hfuse: 0xD7 (EESAVE liga, sem bootloader) | lock: 0xCF
         lfuse = "0xFF" if m == "m328pb" else "0xF7"
+        efuse = "0xF5" if m == "m328pb" else "0xFD"
         rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
                         "-U", f"lfuse:w:{lfuse}:m", "-U", "hfuse:w:0xD7:m",
-                        "-U", "efuse:w:0xF7:m", "-U", "lock:w:0xCF:m",
+                        "-U", f"efuse:w:{efuse}:m", "-U", "lock:w:0xCF:m",
                         "-U", f"eeprom:w:{seed_bin}:r", "-U", f"flash:w:{HEX}:i"])
         if rc == 0:
             MCU_REAL[serial] = m
