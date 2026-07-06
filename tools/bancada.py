@@ -685,7 +685,17 @@ def act_gravar(serial, mcu):
             STATUS("gravar", "ok"); return True
         if "signature" not in out.lower():
             break                          # falha que não é de assinatura: não insiste
-    LOG("✗ Gravação falhou. Verifique bateria DENTRO e contato firme do USBasp.", "err")
+    # Mensagem conforme a CAUSA (não adianta insistir clicando):
+    low = out.lower()
+    if "cannot find usb device" in low or "unable to open port" in low or "no usb" in low:
+        LOG("✗ O GRAVADOR sumiu da USB (não é a fechadura). ⇒ TIRE o USBasp do Mac, "
+            "espere 5s e RECONECTE (direto, sem hub). Clicar de novo NÃO resolve — "
+            "o USBasp travou e precisa ser religado.", "err")
+    elif "does not answer" in low or "initialization failed" in low:
+        LOG("✗ O chip não respondeu ao gravador. ⇒ Firme o cabo no conector ISP da "
+            "placa e confirme a BATERIA dentro. Depois clique Gravar de novo.", "err")
+    else:
+        LOG("✗ Gravação falhou. Verifique bateria DENTRO e contato firme do USBasp.", "err")
     STATUS("gravar", "fail"); return False
 
 
