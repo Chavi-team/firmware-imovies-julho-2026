@@ -64,7 +64,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.9.5"
+#define FW_VERSION   "2.9.6"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -479,7 +479,10 @@ void bleProvisionar() {
     DBGLN(F("[prov] provisionamento completo do modulo (1o boot)"));
     beep(50, 1200); beep(50, 1200);            // "configurando o rádio, aguarde"
 
-    static const long TODOS[] = {2400, 9600, 38400, 19200, 57600, 4800, 115200, 1200};
+    // Só os bauds ALCANÇÁVEIS pelo SoftwareSerial a 16MHz (9600 primeiro = o mais
+    // comum). Tirei 57600/115200/1200: SoftwareSerial não os faz confiável, e
+    // varrê-los só alongava o boot (colidia com a conexão da bancada).
+    static const long TODOS[] = {9600, 2400, 4800, 19200, 38400};
     const uint8_t N = sizeof(TODOS) / sizeof(long);
 
     // PASSO 0 — SEM RENEW. ⚠️ O AT+RENEW/DEFAULT era veneno em DUAS frentes:
@@ -1010,36 +1013,28 @@ void setup() {
         DBGLN(F("[boot] wake da hibernacao - atendendo direto"));
         return;                              // loop() atende já no 1º giro
     }
-    if (EEPROM.read(EE_MOD_CFG) != MOD_CFG_MAGIC) {
-        if (digitalRead(PIN_WAKE) == HIGH) {
-            // Cliente conectado no 1º boot: provisionar agora vazaria AT pro
-            // app (túnel). Fica p/ o próximo boot limpo (flag continua 0).
-            DBGLN(F("[boot] conectado - provisionamento adiado"));
-        } else {
-            // PROVISIONAMENTO AUTO-CURÁVEL: garante que QUALQUER módulo (virgem
-            // 9600, frota antiga 2400, ou estado de experimento) converge no 1º
-            // boot. Provisiona -> VERIFICA (bleVivo a 9600) -> re-tenta até 3x.
-            // Sem isto era cego: se a conversão de baud não pegasse, ficava mudo
-            // sem retry (só regravando). Cada tentativa varre todos os bauds de
-            // novo, então recupera módulo em qualquer estado alcançável.
-            for (uint8_t tent = 1; tent <= 3; tent++) {
-                DBG(F("[boot] provisionamento tentativa ")); DBGLN(tent);
-                bleProvisionar();
-                // VERIFICA com bleLerVersao (exige a string "ver." na resposta),
-                // NÃO bleVivo/bleResponde (que passam em qualquer byte = lixo de
-                // baud errado). Só passa se o módulo responder de fato a 9600.
-                if (bleLerVersao() != 0) { DBGLN(F("[boot] modulo verificou - ok")); break; }
-                DBGLN(F("[boot] nao verificou - re-tentando"));
-            }
-        }
+    // ⭐ PROVISIONAMENTO ADAPTATIVO (rápido no caso comum, sem storm):
+    // Se o app conectar no meio, os AT vazam pro túnel e a verificação falha
+    // (o módulo tunela o AT+VERS? em vez de responder). Antes o loop 3x + sweep
+    // levava 60-80s e COLIDIA com a conexão da bancada. Agora:
+    //  1) CAMINHO RÁPIDO (virgem/resetado JÁ está em 9600): config leve +
+    //     verifica. ~3s. É o caso do campo (reset -> módulo volta a 9600).
+    //  2) SÓ se falhar -> conversão pesada (sweep), no MÁXIMO 2 passadas.
+    // Se PD3 estiver alto (app já conectado), nem tenta (vazaria) — adia.
+    if (digitalRead(PIN_WAKE) == HIGH) {
+        DBGLN(F("[boot] conectado - provisionamento adiado"));
     } else {
-        DBGLN(F("[boot] modulo ja provisionado - config leve"));
-        configModuloLeve();
+        configModuloLeve();                        // caminho rápido: 9600 direto
+        moduloOk = (bleLerVersao() != 0);
+        for (uint8_t t = 0; !moduloOk && t < 2 && digitalRead(PIN_WAKE) == LOW; t++) {
+            DBG(F("[boot] 9600 falhou - sweep passada ")); DBGLN(t + 1);
+            bleProvisionar();                      // converte de qualquer baud -> 9600
+            moduloOk = (bleLerVersao() != 0);
+        }
     }
-    // Sinal final estrito: Rocky só toca se o módulo responder "ver." de fato
-    // (bleLerVersao), não em lixo de baud errado (bleVivo passava em qualquer
-    // byte). Assim a melodia é prova real de que a UART casou a 9600.
-    moduloOk = (bleLerVersao() != 0);
+    EEPROM.update(EE_MOD_CFG, MOD_CFG_MAGIC);       // marca provisionado
+    // Sinal final estrito: Rocky só toca se o módulo responder "ver." de fato.
+    if (!moduloOk) moduloOk = (bleLerVersao() != 0);
     DBG(F("[boot] moduloOk=")); DBGLN(moduloOk);
 
     // Feedback final do boot: Rocky = TUDO PRONTO; graves = módulo mudo.
