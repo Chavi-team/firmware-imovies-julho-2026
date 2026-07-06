@@ -706,7 +706,9 @@ def act_renomear(serial, nome_errado):
 # de solda quebrada até se perguntar AT+BAUD? pelo ar.
 def act_consertar_modulo(serial):
     alvo = serial[2:] if serial.startswith("CH") else serial
-    LOG(f"🩺 Diagnóstico do módulo '{alvo}' pelo ar...", "hi")
+    # canal CH001 = geração FI 1.0 (tem o MOSFET de energia no PIO do módulo)
+    is10 = serial[2:5] == "001"
+    LOG(f"🩺 Diagnóstico do módulo '{alvo}' pelo ar (placa {'1.0' if is10 else '1.5'})...", "hi")
     try:
         addr = BLE.scan(alvo, timeout=8.0)
         if not addr:
@@ -714,9 +716,27 @@ def act_consertar_modulo(serial):
         BLE.connect(addr)
     except Exception as e:
         LOG(f"✗ Erro ao conectar: {e}", "err"); return False
-    for q in ("AT+VERS?", "AT+BAUD?", "AT+MODE?", "AT+ROLE?"):
+    for q in ("AT+VERS?", "AT+BAUD?", "AT+MODE?", "AT+ROLE?", "AT+BEFC?", "AT+AFTC?"):
         BLE.cmd(q, ["ver", "OK", "+", "Get"], timeout=2)   # respostas vão pro log
         time.sleep(0.3)
+    if is10:
+        # RESGATE DA FI 1.0 PELO AR: religa o trilho de energia (gate do MOSFET
+        # num PIO do módulo — pino 4/5/7/8/9). Grava na NVM: BEFCFF7/AFTCFFF =
+        # todos os PIOs altos (menos PIO6, p/ o wake). Assim, ao religar a
+        # bateria, o módulo já sobe o gate e o MCU liga sozinho. NÃO mexe no
+        # baud (o lote 1.0 pode não ser 2400 — deixa como está).
+        LOG("Religando o trilho de energia da 1.0 (PIOs do MOSFET) na NVM do módulo...", "hi")
+        for c in ("AT+PIO41", "AT+PIO51", "AT+PIO71", "AT+PIO81", "AT+PIO91",
+                  "AT+BEFCFF7", "AT+AFTCFFF"):
+            BLE.cmd(c, ["OK", "+", "Set"], timeout=2)
+            time.sleep(0.3)
+        BLE.cmd("AT+RESET", ["OK", "+"], timeout=2)
+        BLE.disconnect()
+        LOG("✓ Config de energia gravada. AGORA: tire o USBasp, RELIGUE A BATERIA "
+            "e veja se ela dá o bipe/melodia sozinha (= trilho religado). Depois "
+            "reconecte no passo 3.", "ok")
+        time.sleep(4)
+        return True
     LOG("Forçando a UART do módulo para 2400 (AT+BAUD0) + reset...", "hi")
     BLE.cmd("AT+BAUD0", ["OK", "+"], timeout=2)
     time.sleep(0.4)
