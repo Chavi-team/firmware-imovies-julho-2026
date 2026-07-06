@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.8.2"
+#define FW_VERSION   "2.8.3"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -408,19 +408,22 @@ void configModuloLeve() {
         snprintf(nm, sizeof(nm), "AT+NAME%s", serialFech);
         at(nm, 200);
     }
-    at("AT+MODE2");    // túnel de dados (repassa os bytes pro MCU)
+    // ⚠️ AT+MODE2 é o ÚLTIMO comando. Em MODE2 (túnel de dados) o módulo PARA de
+    // interpretar AT e passa a repassar tudo como dado — então QUALQUER AT depois
+    // dele é IGNORADO. Antes o MODE2 vinha cedo e o AT+NOTI1 (crucial) caía no
+    // vão: o módulo repassava app->MCU (RX ok, comandos executavam) mas NÃO
+    // NOTIFICAVA o MCU->app (TX perdido) -> "buzzer toca / motor gira, mas o app
+    // não recebe PONG/OK". A 2400 colava por timing; a 9600 (CH003FI002734)
+    // expôs. Ordem correta: config toda ANTES, MODE2 por último.
     at("AT+ROLE0");    // slave
     at("AT+DELI3");    // delimitador '\n' nos 2 sentidos
-    at("AT+NOTI1");    // notify ligado
+    at("AT+NOTI1");    // notify ligado -> módulo NOTIFICA o app com o TX do MCU
     if (placa10) {
         // GATE DO MOSFET que alimenta o MCU. O pino NÃO é fixo: a esteira at.js
         // suporta PIO 4/5/6/7 (default 4) e o upload antigo usava 7/8/9.
         // Erguemos TODOS os candidatos — imediato (PIOx1 religa o trilho JÁ) e
         // persistente na NVM (BEFCFF7 = todos os PIOs altos ANTES da conexão,
-        // menos o bit3=PIO6 p/ o wake; AFTCFFF = todos altos DEPOIS). Ligar
-        // PIOs não-usados é inócuo (não há nada neles); o que importa é o gate
-        // certo subir seja qual for. Isto substitui o BEFC070 (que zerava
-        // 4/5!) — a causa provável do resgate ter falhado (relatório §2).
+        // menos o bit3=PIO6 p/ o wake; AFTCFFF = todos altos DEPOIS).
         at("AT+PIO41"); at("AT+PIO51"); at("AT+PIO71");
         at("AT+PIO81"); at("AT+PIO91");
         at("AT+BEFCFF7");
@@ -433,6 +436,7 @@ void configModuloLeve() {
     // Módulos ver.03: wake por STATUS — o opcode difere por placa no firmware
     // de produção: FI 1.0/1.5 sem mosfet usam STATUS6; a linha _400 usa STATUS8.
     if (g_moduloVers == 3) at(placa10 ? "AT+STATUS6" : "AT+STATUS8");
+    at("AT+MODE2");    // POR ÚLTIMO: túnel de dados (a partir daqui ignora AT)
 }
 
 // Provisionamento COMPLETO com DESCONTAMINAÇÃO — só na 1ª vez após gravar
