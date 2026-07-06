@@ -64,7 +64,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.9.8"
+#define FW_VERSION   "2.9.9"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -630,10 +630,17 @@ void acionarVerbo(unsigned long cmd) {
         return;
     }
     g_ultimoAcionamentoMs = millis();
+    // ⭐ CONFIRMA ANTES DO MOTOR (fix do "abriu 3x + loading infinito"): o motor
+    // puxa corrente e pode DERRUBAR o BLE; se a confirmação saísse só DEPOIS do
+    // giro, ela se perdia -> o app dava timeout e reenviava (abrindo de novo a
+    // cada rodada). Mandando o status JÁ (conexão ainda saudável), o app recebe
+    // na hora e para de tentar. Mesmo padrão do "11" da calibração.
+    enviaStatus(sentidoA);
+    delay(60);
     motorGira(sentidoA);      // gira até o fim de curso + recuo (motor PARA aqui)
     g_ultimoAcionamentoMs = millis();     // re-marca no FIM (o giro levou tempo)
     delay(120);               // garante o pacote do status transmitido...
-    enviaStatus(sentidoA);    // ...antes do AT+DROP do dormir(). "terminei de girar"
+    enviaStatus(sentidoA);    // reconfirma no FIM se a conexão sobreviveu ("parou")
 }
 
 // ---- calibração (espelha FI_1_5, com o timing que o app precisa) ----
