@@ -35,7 +35,8 @@ def main():
         binm, confm = membros.get("avrdude"), membros.get("avrdude.conf")
     elif sys.platform.startswith("win"):
         plat, exe = "win", "avrdude.exe"
-        data = baixar(f"{BASE}/avrdude_v{VER}_Windows_64bit.zip")
+        # ⚠️ o asset Windows usa HÍFENS (o macOS usa underscores) na release v8.0
+        data = baixar(f"{BASE}/avrdude-v{VER}-windows-x64.zip")
         zf = zipfile.ZipFile(io.BytesIO(data))
         membros = {os.path.basename(n): n for n in zf.namelist()}
         binm, confm = membros.get("avrdude.exe"), membros.get("avrdude.conf")

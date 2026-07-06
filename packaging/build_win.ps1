@@ -28,7 +28,7 @@ $avr = "$HERE\avrdude\win"
 if (-not (Test-Path "$avr\avrdude.exe")) {
   New-Item -ItemType Directory -Force -Path $avr | Out-Null
   $zip = "$env:TEMP\avrdude_win.zip"
-  Invoke-WebRequest "https://github.com/avrdudes/avrdude/releases/download/v8.0/avrdude_v8.0_Windows_64bit.zip" -OutFile $zip
+  Invoke-WebRequest "https://github.com/avrdudes/avrdude/releases/download/v8.0/avrdude-v8.0-windows-x64.zip" -OutFile $zip
   Expand-Archive -Force $zip "$env:TEMP\avrdude_win"
   Copy-Item (Get-ChildItem "$env:TEMP\avrdude_win" -Recurse -Filter avrdude.exe | Select -First 1).FullName "$avr\avrdude.exe"
   Copy-Item (Get-ChildItem "$env:TEMP\avrdude_win" -Recurse -Filter avrdude.conf | Select -First 1).FullName "$avr\avrdude.conf"
