@@ -53,7 +53,19 @@ async def diferencial():
 
 
 async def sonda(addr):
-    print(f">> Conectando em {addr}...")
+    # CoreBluetooth só conecta em quem foi visto num scan DESTE processo —
+    # acha o dispositivo primeiro (com retentativas; anúncio pode ser intermitente).
+    dev = None
+    for tent in range(1, 4):
+        print(f">> Procurando {addr} (tentativa {tent}/3, 15s)...")
+        dev = await BleakScanner.find_device_by_address(addr, timeout=15.0)
+        if dev:
+            break
+    if not dev:
+        print(">> Não apareceu no ar. Religue a fechadura, espere ~40s e tente de "
+              "novo — ou rode o modo DIFERENCIAL primeiro para confirmar o endereço.")
+        return
+    print(f">> Conectando em {dev.address}...")
     notif = []
 
     def cb(_c, data):
@@ -62,7 +74,7 @@ async def sonda(addr):
             notif.append(txt)
             print(f"   ⟵ {txt!r}")
 
-    async with BleakClient(addr, timeout=15.0) as cli:
+    async with BleakClient(dev, timeout=15.0) as cli:
         print(">> Conectado. Serviços/características:")
         ffe1 = False
         for svc in cli.services:
