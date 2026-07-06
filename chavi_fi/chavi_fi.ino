@@ -64,7 +64,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.9.1"
+#define FW_VERSION   "2.9.2"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -335,6 +335,11 @@ void motorGira(bool sentidoA) {
 // ANTIGO (ver.03/04 das FI 1.0) exige o CR; o lote novo (ver.05) tolera —
 // o FI_1_0_400 sempre mandou com '\r' nos mesmos módulos "Soft AT 5.2".
 void at(const char* c, uint16_t w = 150) {
+    // ⛔ TRAVA CRÍTICA: se o app está CONECTADO (PD3 alto), o módulo está em
+    // MODE2 túnel e NÃO interpreta AT — ele REPASSA o "AT+..." como DADO pro app
+    // (visto na bancada: "⟵ AT", "⟵ AT+NAME003FI002734" + lixo). AT é só p/
+    // config, que só roda DESCONECTADO. Conectado, não manda nada.
+    if (digitalRead(PIN_WAKE) == HIGH) return;
     bluetooth.print(c);
     bluetooth.print('\r');
     delay(w);
