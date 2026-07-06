@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.7.0"
+#define FW_VERSION   "2.7.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -107,6 +107,11 @@
 #define MOTOR_TIMEOUT_MS  10000    // teto duro de giro (= timeoutMotor do FI_1_5)
 #define MOTOR_ARRANQUE_MS 300      // ignora o pico de arranque (inrush > 300mA)
 #define MOTOR_MS     1000      // fallback por tempo (sem INA219)
+// RECUO ("line up" do FI_1_5): após bater no fim de curso, gira um pouco no
+// sentido CONTRÁRIO para ALIVIAR a pressão do batente (senão o came fica
+// forçando o fim de curso e a próxima abertura pode travar). O legado usa
+// timeToLineUP=1000ms; aqui é ajustável. 0 = sem recuo.
+#define MOTOR_RECUO_MS   450
 #define MOTOR_TST_MS 450       // pulso curto do motor no TESTE de bancada
                                // (menos energia de stall -> menos brownout)
 #define JANELA_MS    20000     // ocioso E desconectado: dorme após isso
@@ -281,23 +286,36 @@ void motorGiraMs(bool sentidoA, uint16_t ms) {
     delay(ms);
     motorPara();
 }
-// Giro REAL (abrir/fechar/calibração), padrão do FI_1_5 de produção: gira até
-// o BATENTE (corrente média > MOTOR_STALL_MA no INA219) ou o teto de 10s.
-// O pico de arranque é ignorado (MOTOR_ARRANQUE_MS) p/ não virar falso batente.
-// O motor NUNCA fica ligado: para no batente, no teto, ou no fallback por tempo.
+// Giro REAL (abrir/fechar/calibração), padrão do FI_1_5 de produção:
+//  1. gira no sentido do comando até o BATENTE (corrente média > MOTOR_STALL_MA
+//     no INA219) ou o teto de 10s. O pico de arranque é ignorado
+//     (MOTOR_ARRANQUE_MS) p/ não virar falso batente. Sem INA219 -> pulso fixo.
+//  2. RECUO ("line up"): gira um pouco no sentido CONTRÁRIO (MOTOR_RECUO_MS) p/
+//     aliviar a pressão do fim de curso — igual ao FI_1_5. O recuo é curto e
+//     NÃO desfaz a abertura (o came já passou o ponto); só solta o batente.
+// O motor NUNCA fica ligado: para no batente, no teto ou no fim de cada etapa.
 void motorGira(bool sentidoA) {
-    if (!inaOk) { motorGiraMs(sentidoA, MOTOR_MS); return; }
-    ina219.powerSave(false);
-    motorLiga(sentidoA);
-    unsigned long t0 = millis();
-    while (millis() - t0 < MOTOR_TIMEOUT_MS) {
-        float mA = 0;
-        for (uint8_t i = 0; i < 25; i++) mA += ina219.getCurrent_mA();
-        mA /= 25.0f;
-        if (millis() - t0 > MOTOR_ARRANQUE_MS && fabs(mA) > MOTOR_STALL_MA) break;
+    if (!inaOk) {
+        motorGiraMs(sentidoA, MOTOR_MS);       // 1. giro (fallback por tempo)
+    } else {
+        ina219.powerSave(false);
+        motorLiga(sentidoA);
+        unsigned long t0 = millis();
+        while (millis() - t0 < MOTOR_TIMEOUT_MS) {   // 1. giro até o batente
+            float mA = 0;
+            for (uint8_t i = 0; i < 25; i++) mA += ina219.getCurrent_mA();
+            mA /= 25.0f;
+            if (millis() - t0 > MOTOR_ARRANQUE_MS && fabs(mA) > MOTOR_STALL_MA) break;
+        }
+        motorPara();
+        ina219.powerSave(true);
     }
-    motorPara();
-    ina219.powerSave(true);
+    // 2. recuo/line-up (alivia o batente). Pausa curta antes p/ o motor parar
+    //    de fato (inércia) e não dar shoot-through na inversão de sentido.
+    if (MOTOR_RECUO_MS > 0) {
+        delay(80);
+        motorGiraMs(!sentidoA, MOTOR_RECUO_MS);
+    }
 }
 
 // ---- módulo BLE (sempre a 2400) ----------------------------------------------
