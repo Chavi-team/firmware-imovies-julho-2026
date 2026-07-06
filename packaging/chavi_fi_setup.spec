@@ -13,10 +13,16 @@ BIN = os.path.join(ROOT, "bin")
 PKG = os.path.join(ROOT, "packaging")
 
 datas = []
-# firmware pré-compilado (o pacote NÃO compila — grava o .hex embutido)
+# firmware pré-compilado (o pacote NÃO compila — grava o .hex embutido).
+# Procura no bin/ (build local) e, senão, no packaging/firmware/ VERSIONADO no
+# git — assim o build Windows funciona sem arduino-cli (o .hex viaja no repo).
 hexf = os.path.join(BIN, "chavi_fi.ino.hex")
+if not os.path.exists(hexf):
+    hexf = os.path.join(PKG, "firmware", "chavi_fi.ino.hex")
 if os.path.exists(hexf):
     datas.append((hexf, "."))
+else:
+    raise SystemExit("chavi_fi.ino.hex não encontrado (bin/ nem packaging/firmware/)")
 
 # avrdude standalone + avrdude.conf, se preparado em packaging/avrdude/<plat>/
 plat = "win" if sys.platform.startswith("win") else ("mac" if sys.platform == "darwin" else "linux")

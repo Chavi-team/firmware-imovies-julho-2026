@@ -1,0 +1,42 @@
+COMO GERAR O PACOTE DA BANCADA PARA WINDOWS
+=============================================
+
+O pacote Windows PRECISA ser gerado NUM PC WINDOWS (o PyInstaller não faz
+cross-compile do Mac). Só precisa fazer isto UMA VEZ por versão de firmware;
+o .exe resultante roda em qualquer Windows sem instalar nada.
+
+PRÉ-REQUISITOS no PC de build (só na máquina que GERA o pacote):
+  1. Python 3 — https://www.python.org/downloads/  (na instalação, MARQUE
+     "Add python.exe to PATH").
+  2. O repositório do firmware (esta pasta). Pode copiar por pendrive ou
+     git clone. O firmware .hex JÁ VEM no repo (packaging\firmware\), então
+     NÃO precisa de arduino-cli no Windows.
+  3. Internet (o script baixa o avrdude automaticamente).
+
+PASSOS:
+  1. Abra o PowerShell na pasta do firmware (a que tem as subpastas
+     chavi_fi\, tools\ e packaging\).
+     - No Explorer, entre na pasta, clique na barra de endereço, digite
+       "powershell" e Enter.
+
+  2. Na 1ª vez, libere a execução de scripts (cole e Enter):
+       Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+  3. Rode o build (cole e Enter):
+       .\packaging\build_win.ps1
+
+  4. Aguarde (~2-3 min). No fim ele gera:
+       packaging\dist\Chavi-Fi-Imoveis-Setup-win.zip
+
+DISTRIBUIR:
+  Copie o .zip para cada PC. No PC de destino: descompactar e rodar
+  "Chavi-Fi-Imoveis-Setup.exe". Sem instalar Python/avrdude.
+  - 1ª vez: o Windows SmartScreen pode avisar -> "Mais informações" ->
+    "Executar assim mesmo".
+  - Driver do USBasp: instale com o Zadig (zadig.akeo.ie) -> selecione o
+    USBasp -> Install Driver (libusbK). Só na 1ª vez por PC.
+
+ATUALIZAR O FIRMWARE NO PACOTE:
+  O .hex embutido vem de packaging\firmware\chavi_fi.ino.hex (versionado no
+  repo). Quando o firmware mudar, o Mac atualiza esse arquivo e faz commit;
+  no Windows basta puxar o repo atualizado e rodar o build_win.ps1 de novo.

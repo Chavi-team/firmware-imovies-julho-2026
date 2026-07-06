@@ -8,11 +8,17 @@ $FW   = Split-Path -Parent $HERE
 Set-Location $FW
 
 Write-Host "== 1/4 firmware .hex ==" -ForegroundColor Cyan
+# O .hex vem VERSIONADO no repo (packaging\firmware\chavi_fi.ino.hex) — não
+# precisa de arduino-cli no Windows. Copia para bin\ se ainda não existir.
 if (-not (Test-Path "bin\chavi_fi.ino.hex")) {
-  if (Get-Command arduino-cli -ErrorAction SilentlyContinue) {
+  if (Test-Path "packaging\firmware\chavi_fi.ino.hex") {
+    New-Item -ItemType Directory -Force -Path "bin" | Out-Null
+    Copy-Item "packaging\firmware\chavi_fi.ino.hex" "bin\chavi_fi.ino.hex"
+    Write-Host "   usando o .hex versionado (packaging\firmware\)" -ForegroundColor Green
+  } elseif (Get-Command arduino-cli -ErrorAction SilentlyContinue) {
     arduino-cli compile --profile chavi_fi --build-path bin chavi_fi
   } else {
-    Write-Warning "Sem arduino-cli e sem bin\chavi_fi.ino.hex. Copie o .hex de um build Mac para bin\ e rode de novo."
+    Write-Warning "Sem .hex versionado e sem arduino-cli. Repositório incompleto."
     exit 1
   }
 }
