@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.6.0"
+#define FW_VERSION   "2.6.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -276,8 +276,12 @@ void motorGira(bool sentidoA) {
 
 // Manda um comando AT e descarta a resposta (não dependemos dela — os clones
 // nem sempre respondem). O delay dá tempo do módulo processar.
+// Terminado em '\r' como o FI_1_0/FI_1_0_400 de produção: o lote de módulos
+// ANTIGO (ver.03/04 das FI 1.0) exige o CR; o lote novo (ver.05) tolera —
+// o FI_1_0_400 sempre mandou com '\r' nos mesmos módulos "Soft AT 5.2".
 void at(const char* c, uint16_t w = 150) {
     bluetooth.print(c);
+    bluetooth.print('\r');
     delay(w);
     while (bluetooth.available()) bluetooth.read();
 }
@@ -289,7 +293,7 @@ void at(const char* c, uint16_t w = 150) {
 bool bleResponde() {
     for (uint8_t t = 0; t < 4; t++) {
         while (bluetooth.available()) bluetooth.read();
-        bluetooth.print("AT");
+        bluetooth.print("AT\r");
         unsigned long t0 = millis();
         while (millis() - t0 < 250) {
             if (bluetooth.available()) return true;
@@ -304,7 +308,7 @@ bool bleVivo() {
     if (digitalRead(PIN_WAKE) == HIGH) return true;  // conectado = vivo (e AT seria tunelado)
     if (bleResponde()) return true;
     while (bluetooth.available()) bluetooth.read();
-    bluetooth.print("AT+VERS?");
+    bluetooth.print("AT+VERS?\r");
     unsigned long t0 = millis();
     while (millis() - t0 < 450) {
         if (bluetooth.available()) return true;
@@ -317,7 +321,7 @@ bool bleVivo() {
 uint8_t bleLerVersao() {
     for (uint8_t t = 0; t < 3; t++) {
         while (bluetooth.available()) bluetooth.read();
-        bluetooth.print("AT+VERS?");
+        bluetooth.print("AT+VERS?\r");
         char resp[48] = {0};
         uint8_t n = 0;
         unsigned long tt = millis();
@@ -348,7 +352,9 @@ void configModuloLeve() {
     at("AT+BEFC020");  // MOSFET(PIO8)=1, wake(PIO6)=0 antes da conexão
     at("AT+AFTC028");  // MOSFET(PIO8)=1, wake(PIO6)=1 depois -> borda de wake
     at("AT+PIO60");    // repouso arma a próxima borda de wake
-    if (g_moduloVers == 3) at("AT+STATUS8");  // módulos ver.03: wake por STATUS
+    // Módulos ver.03: wake por STATUS — o opcode difere por placa no firmware
+    // de produção: FI 1.0/1.5 sem mosfet usam STATUS6; a linha _400 usa STATUS8.
+    if (g_moduloVers == 3) at(placa10 ? "AT+STATUS6" : "AT+STATUS8");
 }
 
 // Provisionamento COMPLETO com DESCONTAMINAÇÃO — só na 1ª vez após gravar
