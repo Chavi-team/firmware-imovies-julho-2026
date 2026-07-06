@@ -990,6 +990,93 @@ def act_consertar_modulo(serial):
     return False
 
 
+# ---------------------------------------------------------------------------
+# HIBERNAÇÃO (economia de bateria) — teste do ciclo corta→religa PELO MOSFET.
+# A hibernação corta a energia do MCU p/ poupar bateria; se o hardware não
+# religar, a fechadura "morre" (só volta regravando pelo cabo USBasp). Por isso
+# testamos o ciclo ANTES de ativar de vez: TST-HIB derruba o BLE e corta o
+# MOSFET; se cortou, o MCU some do ar e depois RELIGA sozinho (Rocky). Re-scan +
+# PONG = ciclo provado seguro nesta fechadura.
+# ---------------------------------------------------------------------------
+def act_testar_hibernacao(serial, mcu):
+    STATUS("hibernar", "run")
+    alvo = serial[2:] if serial.startswith("CH") else serial
+    # 1) garante conexão (o teste precisa mandar TST-HIB por BLE)
+    if not BLE.conectado():
+        try:
+            addr = BLE.scan(alvo, timeout=8.0)
+            if not addr:
+                LOG("✗ Fechadura não encontrada por BLE — religue a bateria e tente de novo.", "err")
+                STATUS("hibernar", "fail"); return False
+            BLE.connect(addr)
+        except Exception as e:
+            LOG(f"✗ Erro ao conectar por BLE: {e}", "err")
+            STATUS("hibernar", "fail"); return False
+    # 2) explica e pede p/ o operador OUVIR o corte + o religamento
+    LOG("🔋 Testando o ciclo da hibernação: vou CORTAR a energia do MCU pelo MOSFET "
+        "e depois verificar se ela RELIGA sozinha.", "hi")
+    LOG("👂 OUÇA a fechadura agora: ao cortar deve ficar em SILÊNCIO (cortou) e, ao "
+        "religar, deve tocar a MELODIA (Rocky). Se ficar muda pra sempre, o corte "
+        "funcionou mas o religamento não — aí é regravar pelo cabo.", "hi")
+    # 3) manda TST-HIB. OK-HIB = vai cortar (e derrubar o BLE); HIB-FALHOU-DROP =
+    #    não conseguiu nem derrubar a conexão (config/hardware).
+    ok, buf = BLE.cmd("TST-HIB", ["OK-HIB", "HIB-FALHOU-DROP"], timeout=6)
+    if "HIB-FALHOU-DROP" in buf:
+        LOG("⚠️ Não derrubou a conexão — não dá pra cortar (config/hardware).", "err")
+        STATUS("hibernar", "fail"); return False
+    if not ok:
+        LOG("Não veio OK-HIB — sigo assim mesmo (a conexão pode ter caído junto com o corte).", "warn")
+    # 4) a conexão VAI CAIR (o firmware corta). Espera, limpa a sessão.
+    time.sleep(6)
+    BLE.disconnect()
+    time.sleep(2)
+    # 5) re-scan: se cortou e religou, ela reaparece anunciando
+    try:
+        addr = BLE.scan(alvo, timeout=10)
+    except Exception as e:
+        LOG(f"✗ Erro no re-scan BLE: {e}", "err")
+        STATUS("hibernar", "fail"); return False
+    if not addr:
+        LOG("⚠️ Não reapareceu no scan — se cortou e não religou, regrave pelo cabo.", "err")
+        STATUS("hibernar", "fail"); return False
+    # 6) reconecta e confirma que o MCU está vivo (PONG)
+    try:
+        BLE.connect(addr)
+    except Exception as e:
+        LOG(f"✗ Erro ao reconectar: {e}", "err")
+        STATUS("hibernar", "fail"); return False
+    ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=6)
+    if ok:
+        LOG("✅ RELIGOU e respondeu PONG! O ciclo corta→religa funciona nesta fechadura. "
+            "Se você ouviu silêncio no corte + Rocky ao religar, a hibernação é segura aqui. "
+            "Clique 'Ativar hibernação' para ligar de vez.", "ok")
+        STATUS("hibernar", "ok"); return True
+    LOG("⚠️ Reconectou mas SEM PONG — o MCU pode não ter religado. Regrave pelo cabo por segurança.", "err")
+    STATUS("hibernar", "fail"); return False
+
+
+def act_ativar_hibernacao(serial, mcu):
+    if not BLE.conectado():
+        LOG("Conecte por BLE (passo 3) antes de ativar a hibernação.", "warn"); return False
+    ok, _ = BLE.cmd("TST-HIB-ON", ["OK-HIB-ON"], timeout=5)
+    if ok:
+        LOG("✅ Hibernação ATIVADA — vale no próximo boot. Religue a bateria.", "ok")
+    else:
+        LOG("✗ Não confirmou a ativação (sem OK-HIB-ON). Tente de novo.", "err")
+    return ok
+
+
+def act_desativar_hibernacao(serial, mcu):
+    if not BLE.conectado():
+        LOG("Conecte por BLE (passo 3) antes de desativar a hibernação.", "warn"); return False
+    ok, _ = BLE.cmd("TST-HIB-OFF", ["OK-HIB-OFF"], timeout=5)
+    if ok:
+        LOG("🔌 Hibernação desativada (modo seguro IDLE).", "ok")
+    else:
+        LOG("✗ Não confirmou a desativação (sem OK-HIB-OFF). Tente de novo.", "err")
+    return ok
+
+
 def act_finalizar(serial):
     if BLE.conectado():
         BLE.disconnect()
@@ -1172,6 +1259,16 @@ PAGE = r"""<!DOCTYPE html>
         <button id="btn-renomear">🔧 Renomear módulo</button>
         <div class="rec-desc">Use se no scan aparecer um <b>nome errado/antigo</b> em vez do serial.</div>
       </div>
+
+      <div class="rec-item" style="margin-top:16px;border-top:1px dashed var(--amber);padding-top:14px">
+        <div class="rec-title" style="font-size:14px">🔋 Hibernação (economia de bateria — avançado)</div>
+        <div class="rec-desc" style="margin-bottom:10px">⚠️ Só ative depois de <b>TESTAR</b>. Se o hardware não religar, a fechadura <b>para de responder</b> até ser regravada pelo cabo.</div>
+        <div class="row" style="flex-wrap:wrap;gap:8px">
+          <button id="btn-hibernar">🔋 Testar hibernação</button>
+          <button id="btn-hib-on">⚡ Ativar hibernação</button>
+          <button id="btn-hib-off">🔌 Desativar (modo seguro)</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1231,8 +1328,8 @@ const TESTES = [
   {cmd:"TST-MOT2", label:"Motor ←", pergunta:"O motor GIROU para o OUTRO lado?", fisico:true, motor:true},
   // manuais: só no botão avulso, NUNCA no auto-teste
   {cmd:"TST-ROCKY", label:"♪ Rocky", pergunta:"", fisico:false, manual:true},
-  {cmd:"TST-HIB",  label:"⚡ Hibernar", fisico:true, manual:true,
-   pergunta:"Após o OK-HIB a conexão SEMPRE cai (é o DROP, esperado). O teste é o SOM: ficou em SILÊNCIO (= cortou; responda SIM) ou deu 3 bipes GRAVES (= não cortou; responda NÃO)? Se SIM, reconecte no passo 3: bipe de boot + PONG = ciclo cortar/religar PROVADO."},
+  // Hibernação (⚡): agora é fluxo AUTOMATIZADO na seção de RECUPERAÇÃO
+  // (Testar/Ativar/Desativar), que valida o ciclo corta→religa sozinho.
 ];
 let SERIAL="", MCU="m328pb", busy=false;
 
@@ -1284,6 +1381,11 @@ function renderSteps(){
   $("#btn-consertar").onclick=doConsertar;
   // renomeia o módulo pelo ar (nome residual/corrompido de gravação antiga)
   $("#btn-renomear").onclick=doRenomear;
+  // HIBERNAÇÃO (avançado): testar o ciclo corta→religa, ativar e desativar.
+  // Passam pelo runStep -> setBusy cuida do loading/disable como os demais.
+  $("#btn-hibernar").onclick=(e)=>runStep("hibernar", e.currentTarget);
+  $("#btn-hib-on").onclick=(e)=>runStep("hib-on", e.currentTarget);
+  $("#btn-hib-off").onclick=(e)=>runStep("hib-off", e.currentTarget);
 }
 
 function setChip(step,state){
@@ -1564,7 +1666,9 @@ class Handler(BaseHTTPRequestHandler):
             r = act_provisionar(serial, mcu, b.get("mosfet", "8"))
             return {"ok": bool(r)}
         fn = {"gravar": act_gravar, "validar": act_validar, "conectar": act_conectar,
-              "autoteste": act_autoteste, "cadastrar": act_cadastrar}.get(step)
+              "autoteste": act_autoteste, "cadastrar": act_cadastrar,
+              "hibernar": act_testar_hibernacao, "hib-on": act_ativar_hibernacao,
+              "hib-off": act_desativar_hibernacao}.get(step)
         if not fn:
             return {"ok": False, "erro": "passo desconhecido"}
         r = fn(serial, mcu) if step != "cadastrar" else act_cadastrar(serial, mcu)
