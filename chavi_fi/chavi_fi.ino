@@ -64,7 +64,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.9.9"
+#define FW_VERSION   "2.9.10"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -192,6 +192,7 @@ volatile bool acordouBLE = false, acordouBtn = false;
 bool moduloOk = false;
 bool g_wakeHib = false;        // este boot foi um "acordar da hibernação"
 bool g_hiberna = false;        // HIBERNAÇÃO por corte de MOSFET ligada (EE_HIBERNA)
+bool g_sessaoConectada = false; // já tocou a melodia de "conectou" nesta sessão BLE
 void atenderBotao();           // usada pelo atenderApp (definida mais abaixo)
 
 // Canal de RESPOSTA (sempre BLE neste build; Stream* mantido p/ um futuro
@@ -247,10 +248,19 @@ void melodiaRocky() {
 // Boot OK: melodia + 3 piscadas verdes (pode conectar/usar).
 void sinalPronto() { melodiaRocky(); piscar(CRGB::Green, 3); }
 
-// Boot com módulo BLE mudo: 4 bipes graves + 2 piscadas vermelhas (triagem).
+// ERRO de BLE / módulo mudo: 4 bipes GRAVES + 2 piscadas VERMELHAS.
 void sinalModuloMudo() {
     for (uint8_t i = 0; i < 4; i++) beep(160, 400);
     piscar(CRGB::Red, 2, 200);
+}
+
+// CONECTOU por BLE: fanfarra do Rocky + 3 piscadas VERDES.
+void sinalConectado() { melodiaRocky(); piscar(CRGB::Green, 3); }
+
+// ABRIR/FECHAR com SUCESSO: 3 notas ascendentes curtas ("conseguiu") + verde.
+void melodiaSucesso() {
+    beep(90, 784); beep(90, 988); beep(160, 1319);
+    piscar(CRGB::Green, 2, 90);
 }
 
 // DIAGNÓSTICO POR BIPES (sem cabo, sem BLE): quando o módulo não responde a
@@ -641,6 +651,7 @@ void acionarVerbo(unsigned long cmd) {
     g_ultimoAcionamentoMs = millis();     // re-marca no FIM (o giro levou tempo)
     delay(120);               // garante o pacote do status transmitido...
     enviaStatus(sentidoA);    // reconfirma no FIM se a conexão sobreviveu ("parou")
+    melodiaSucesso();         // jingle curto ascendente + verde = "abriu/fechou OK"
 }
 
 // ---- calibração (espelha FI_1_5, com o timing que o app precisa) ----
@@ -847,15 +858,11 @@ void testeBancada(const String& t) {
 // ---- atende o app: desafio -> saltos -> tokens (ignorados) -> comando ----
 void atenderApp() {
     io = &bluetooth;
-    // Bipe de wake UMA vez por sessão, não a cada micro-wake. Com o sono leve
-    // (IDLE) o MCU acorda a CADA byte que chega -> antes bipava sem parar e o
-    // instalador não distinguia o que era o quê. Agora: 1 bipe curto por conexão
-    // (rate-limit de 4s); os testes têm seus próprios sons distintos.
-    static unsigned long ultimoBipeWake = 0;
-    if (millis() - ultimoBipeWake > 4000) {
-        beep(45, 2600);
-        ultimoBipeWake = millis();
-    }
+    // ⚠️ SEM bipe de wake aqui. Com o sono leve (IDLE) o MCU acorda a CADA byte —
+    // bipar na acordada dava o "beep agudo de tempos em tempos" (mesmo com o app
+    // fechado, o módulo acorda o MCU com OK+LOST/ruído). O feedback sonoro agora é
+    // por EVENTO: a MELODIA toca quando chega "OK+CONN" (conectou de verdade); nada
+    // em wakes espúrios.
     DBGLN(F("[app] acordou - ouvindo (20s)"));
     bluetooth.setTimeout(150);
     unsigned long t0 = millis();
@@ -881,6 +888,13 @@ void atenderApp() {
         if ((pk >= 'A' && pk <= 'Z') || (pk >= 'a' && pk <= 'z')) {
             String txt = bluetooth.readString(); txt.trim(); txt.toUpperCase();
             DBG(F("[app] txt: ")); DBGLN(txt);
+            // Notificações do módulo (AT+NOTI1): conectou / desconectou. É AQUI que
+            // toca a MELODIA de conexão — evento real, não wake espúrio.
+            if (txt.startsWith("OK+CONN")) {
+                if (!g_sessaoConectada) { g_sessaoConectada = true; sinalConectado(); }
+                continue;
+            }
+            if (txt.startsWith("OK+LOST")) { g_sessaoConectada = false; continue; }
             if (txt.startsWith("TST-"))        { t0 = millis(); janela = JANELA_TST; testeBancada(txt); continue; }
             // PROTOCOLO DIRETO (app novo, sem handshake): o app sonda com
             // TST-PING ao conectar (o firmware LEGADO ignora texto — parseInt
@@ -984,6 +998,7 @@ void dormir() {
         delay(150);
     }
     acordouBLE = false; acordouBtn = false;
+    g_sessaoConectada = false;   // sessão encerrou -> melodia toca de novo no próximo OK+CONN
     attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), isrBtn, FALLING);
     attachInterrupt(digitalPinToInterrupt(PIN_WAKE), isrBLE, RISING);
     set_sleep_mode(SLEEP_MODE_IDLE);
@@ -1009,8 +1024,9 @@ void setup() {
     pinMode(PIN_WAKE, INPUT);
     motorPara();
 
-    // ESTOU VIVO — a PRIMEIRA coisa, antes de tudo. Se não tocar = hardware/energia.
-    beep(120, 1800);
+    // ESTOU VIVO — a PRIMEIRA coisa, antes de tudo. Beep curto e AGUDO ao energizar.
+    // Se não tocar = hardware/energia.
+    beep(70, 2600);
 
 #if FEATURE_SERIAL_DEBUG
     Serial.begin(DBG_BAUD);
@@ -1090,18 +1106,20 @@ void setup() {
         }
     }
     EEPROM.update(EE_MOD_CFG, MOD_CFG_MAGIC);       // marca provisionado
-    // Sinal final estrito: Rocky só toca se o módulo responder "ver." de fato.
-    if (!moduloOk) moduloOk = (bleLerVersao() != 0);
+    // Verifica o módulo com RETRY p/ NÃO dar 4 beeps à toa: logo após o
+    // provisionamento (AT+RESET) o módulo fica grogue e não responde AT+VERS? na
+    // 1ª — era o falso "mudo" que tocava 4 graves mesmo com o BLE OK depois.
+    for (uint8_t t = 0; !moduloOk && t < 5; t++) { delay(250); moduloOk = (bleLerVersao() != 0); }
     DBG(F("[boot] moduloOk=")); DBGLN(moduloOk);
 
-    // Feedback final do boot: Rocky = TUDO PRONTO; graves = módulo mudo.
-    // (O "mudo" pode ser falso-negativo em clone que não responde AT — a
-    // conexão BLE real é a prova final. Mas serve de triagem na bancada.)
+    // Feedback do boot: a MELODIA agora toca na CONEXÃO (OK+CONN), não aqui.
+    //   módulo OK  -> 2 piscadas VERDES (silencioso; "pronta")
+    //   módulo MUDO -> 4 bipes GRAVES + vermelho (erro real de BLE) + diag de baud
     if (moduloOk) {
-        sinalPronto();
+        piscar(CRGB::Green, 2);
     } else {
         sinalModuloMudo();
-        diagBaudBipes();     // bipa o baud onde o módulo respondeu (ver acima)
+        diagBaudBipes();
     }
     DBGLN(F("[boot] PRONTA - dormindo"));
 }
