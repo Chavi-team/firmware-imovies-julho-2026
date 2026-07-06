@@ -64,7 +64,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.9.7"
+#define FW_VERSION   "2.9.8"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -150,6 +150,9 @@
 #define MOD_CFG_MAGIC   0xC9
 #define EE_HIB          911    // 1 = desligou hibernando (boot seguinte = wake)
 #define EE_BOARD        912    // 1 = placa FI 1.0; qualquer outro valor = FI 1.5
+#define EE_HIBERNA      913    // 1 = HIBERNAÇÃO por corte de MOSFET ligada (default
+                               // 0 = sono leve IDLE, seguro). Ativa via HIB-ON após
+                               // validar o ciclo corta->religa na bancada (TST-HIB).
                                // (gravado pelo seed.bin/gerar_seed.py conforme a placa)
 
 // ---- protocolo ----
@@ -188,6 +191,7 @@ char serialFech[12] = {0};
 volatile bool acordouBLE = false, acordouBtn = false;
 bool moduloOk = false;
 bool g_wakeHib = false;        // este boot foi um "acordar da hibernação"
+bool g_hiberna = false;        // HIBERNAÇÃO por corte de MOSFET ligada (EE_HIBERNA)
 void atenderBotao();           // usada pelo atenderApp (definida mais abaixo)
 
 // Canal de RESPOSTA (sempre BLE neste build; Stream* mantido p/ um futuro
@@ -447,7 +451,16 @@ void configModuloLeve() {
         at("AT+PIO81"); at("AT+PIO91");
         at("AT+BEFCFF7");
         at("AT+AFTCFFF");
+    } else if (g_hiberna) {
+        // HIBERNAÇÃO (receita do FI_1_5_400 de produção): PIO8 (MOSFET) NÃO é
+        // forçado alto -> o AT+PIO80 do dormir() consegue CORTAR o trilho.
+        //   BEFC000 = tudo baixo antes da conexão (MCU desligado no repouso)
+        //   AFTC008 = PIO6 alto depois -> borda de wake que religa o MCU
+        at("AT+BEFC000");
+        at("AT+AFTC008");
     } else {
+        // MODO NORMAL (IDLE): MOSFET SEMPRE ligado (PIO8=1 antes e depois), MCU
+        // nunca desliga — comunicação robusta, mais bateria. É a config do AT.py.
         at("AT+BEFC020");  // MOSFET(PIO8)=1, wake(PIO6)=0 antes da conexão
         at("AT+AFTC028");  // MOSFET(PIO8)=1, wake(PIO6)=1 depois -> borda de wake
     }
@@ -777,23 +790,38 @@ void testeBancada(const String& t) {
     //   silêncio após a queda      = CORTOU (reconecte: bipe de boot + PONG)
     //   3 bipes graves após ~4s    = módulo não obedeceu o PIO80
     //   "HIB-FALHOU-DROP" na tela  = nem o DROP derrubou (segue conectado)
+    // Liga/desliga a HIBERNAÇÃO permanente (toggle EE_HIBERNA). Só depois de
+    // validar o ciclo com TST-HIB! (checados ANTES de "TST-HIB" — prefixo maior)
+    if (t.startsWith("TST-HIB-ON")) {
+        EEPROM.update(EE_HIBERNA, 1); g_hiberna = true;
+        enviaLinha("OK-HIB-ON");             // vale no próximo boot (config BEFC000)
+        return;
+    }
+    if (t.startsWith("TST-HIB-OFF")) {
+        EEPROM.update(EE_HIBERNA, 0); g_hiberna = false;
+        enviaLinha("OK-HIB-OFF");
+        return;
+    }
+    // VALIDAÇÃO do ciclo corta->religa (não muda o toggle; testa o hardware).
+    //   silêncio + boot(Rocky) na reconexão = CORTOU e RELIGOU -> hibernação OK
+    //   3 bipes graves após ~3s              = MCU vivo = módulo NÃO cortou
+    //   "HIB-FALHOU-DROP" na tela            = nem o DROP derrubou (segue conectado)
     if (t.startsWith("TST-HIB")) {
         enviaLinha("OK-HIB");
-        DBGLN(F("[hib] DROP -> PIO61 -> PIO80 (receita FI_1_0_400)"));
         delay(400);                          // a resposta sai antes do DROP
-        at("AT+DROP", 500);
+        at("AT+DROP", 500);                  // derruba a conexão -> módulo sai do túnel
         delay(500);
-        if (digitalRead(PIN_WAKE) == HIGH) { // PD3 espelha a conexão (AFTC/BEFC)
-            enviaLinha("HIB-FALHOU-DROP");   // ainda conectado -> túnel -> sem corte
+        if (digitalRead(PIN_WAKE) == HIGH) { // ainda conectado -> não dá p/ cortar
+            enviaLinha("HIB-FALHOU-DROP");
             return;
         }
-        at("AT+PIO61", 500);
-        EEPROM.update(EE_HIB, 1);
-        at("AT+PIO80", 60);
-        delay(3000);
+        at("AT+BEFC000", 200);               // ⭐ libera o PIO8 (senão BEFC020 re-liga)
+        at("AT+PIO60", 200);                 // arma a borda de wake (PIO6 baixo)
+        EEPROM.update(EE_HIB, 1);            // marca "desligou hibernando" p/ o wake
+        at("AT+PIO80", 60);                  // CORTA o MOSFET -> MCU morre se cortou
+        delay(3000);                         // se cortou, nunca passa daqui
         EEPROM.update(EE_HIB, 0);
-        DBGLN(F("[hib] ainda vivo = modulo nao cortou"));
-        beep(160, 400); beep(160, 400); beep(160, 400);   // 3 graves = falhou
+        beep(160, 400); beep(160, 400); beep(160, 400);   // 3 graves = NÃO cortou
         return;
     }
     if (t.startsWith("TST-ALL"))  {
@@ -936,6 +964,18 @@ void atenderBotao() {
 // Motor fica OUTPUT LOW (nunca Hi-Z — evita shoot-through na ponte H).
 void dormir() {
     motorPara();
+    // HIBERNAÇÃO (toggle EE_HIBERNA): corta o trilho pelo MOSFET (receita do
+    // FI_1_5_400). Chega aqui só quando OCIOSO+DESCONECTADO (atenderApp segura a
+    // janela enquanto PD3 alto), então o at() não vaza pro app. O MCU DESLIGA no
+    // AT+PIO80 e só volta por CONEXÃO (boot fresco). Requer BEFC000 (config de
+    // hibernação) — com BEFC020 o módulo re-liga o PIO8 e o corte não pega.
+    // Se o hardware NÃO cortar (placa sem o gate), o código segue pro IDLE abaixo.
+    if (g_hiberna && !placa10 && digitalRead(PIN_WAKE) == LOW) {
+        at("AT+DROP", 200);
+        at("AT+PIO60", 100);      // arma a borda de wake (PIO6 baixo)
+        at("AT+PIO80", 60);       // corta o MOSFET -> MCU morre aqui se cortou
+        delay(150);
+    }
     acordouBLE = false; acordouBtn = false;
     attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), isrBtn, FALLING);
     attachInterrupt(digitalPinToInterrupt(PIN_WAKE), isrBLE, RISING);
@@ -1006,6 +1046,8 @@ void setup() {
     if (g_moduloVers != 3 && g_moduloVers != 4) g_moduloVers = 0;
     g_wakeHib = (EEPROM.read(EE_HIB) == 1);
     if (g_wakeHib) EEPROM.update(EE_HIB, 0);
+    g_hiberna = (EEPROM.read(EE_HIBERNA) == 1);   // hibernação por MOSFET ligada?
+    DBG(F("[boot] hiberna=")); DBGLN(g_hiberna);
 
     DBG(F("[boot] serial=")); DBG(serialFech[0] ? serialFech : "(fabrica)");
     DBG(F(" calib=")); DBG(calibrationOk);
