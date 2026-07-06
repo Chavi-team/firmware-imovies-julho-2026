@@ -1375,21 +1375,36 @@ let SERIAL="", MCU="m328pb", busy=false;
 const $ = s=>document.querySelector(s);
 const ggg=$("#ggg"), nnn=$("#nnn");
 
-function serialAtual(){ const g=ggg.value.trim(), n=nnn.value.trim();
-  return (g.length===3 && n.length===6) ? ("CH"+g+"FI"+n) : null; }
+// Complementa com ZEROS À ESQUERDA: CH sempre 3 dígitos, FI sempre 6.
+// Ex.: digitar "3" -> "003"; "2585" -> "002585". Só dígitos.
+function padCH(v){ v=(v||"").replace(/\\D/g,""); return v ? v.padStart(3,'0').slice(-3) : ''; }
+function padFI(v){ v=(v||"").replace(/\\D/g,""); return v ? v.padStart(6,'0').slice(-6) : ''; }
 
-function onlyDigits(e){ e.target.value = e.target.value.replace(/\D/g,""); prev(); }
+function serialAtual(){
+  const g=padCH(ggg.value), n=padFI(nnn.value);
+  return (g && n) ? ("CH"+g+"FI"+n) : null;
+}
+
+function onlyDigits(e){
+  e.target.value = e.target.value.replace(/\\D/g,"");
+  // AO COMPLETAR a quantidade de dígitos, pula pro próximo campo.
+  if(e.target===ggg && ggg.value.length>=3) nnn.focus();
+  prev();
+}
 async function prev(){
   const s=serialAtual();
   if(s){ $("#prev").textContent="→  "+s; $("#prev").style.color="var(--ok)"; $("#btn-next").disabled=false;
     const r=await fetch("/api/seeds?serial="+s).then(r=>r.json());
     $("#seeds").textContent="seeds: "+r.seeds.join(" · ");
-  } else { $("#prev").textContent="preencha 3 + 6 dígitos"; $("#prev").style.color="var(--err)";
+  } else { $("#prev").textContent="digite o canal (CH) e o nº (FI) — completo com zeros à esquerda"; $("#prev").style.color="var(--err)";
     $("#seeds").textContent=""; $("#btn-next").disabled=true; }
 }
 ggg.addEventListener("input",onlyDigits); nnn.addEventListener("input",onlyDigits);
-ggg.addEventListener("keydown",e=>{if(e.key==="Enter")nnn.focus()});
-nnn.addEventListener("keydown",e=>{if(e.key==="Enter" && !$("#btn-next").disabled)irPassos()});
+// AO SAIR do campo, mostra já preenchido com os zeros à esquerda.
+ggg.addEventListener("blur",()=>{ if(ggg.value) ggg.value=padCH(ggg.value); prev(); });
+nnn.addEventListener("blur",()=>{ if(nnn.value) nnn.value=padFI(nnn.value); prev(); });
+ggg.addEventListener("keydown",e=>{if(e.key==="Enter"){ if(ggg.value) ggg.value=padCH(ggg.value); nnn.focus(); }});
+nnn.addEventListener("keydown",e=>{if(e.key==="Enter"){ if(nnn.value) nnn.value=padFI(nnn.value); prev(); if(!$("#btn-next").disabled)irPassos(); }});
 $("#btn-next").onclick=irPassos;
 
 function irPassos(){
