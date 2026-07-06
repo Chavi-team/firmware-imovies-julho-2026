@@ -64,7 +64,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.9.4"
+#define FW_VERSION   "2.9.5"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -1016,13 +1016,30 @@ void setup() {
             // app (túnel). Fica p/ o próximo boot limpo (flag continua 0).
             DBGLN(F("[boot] conectado - provisionamento adiado"));
         } else {
-            bleProvisionar();
+            // PROVISIONAMENTO AUTO-CURÁVEL: garante que QUALQUER módulo (virgem
+            // 9600, frota antiga 2400, ou estado de experimento) converge no 1º
+            // boot. Provisiona -> VERIFICA (bleVivo a 9600) -> re-tenta até 3x.
+            // Sem isto era cego: se a conversão de baud não pegasse, ficava mudo
+            // sem retry (só regravando). Cada tentativa varre todos os bauds de
+            // novo, então recupera módulo em qualquer estado alcançável.
+            for (uint8_t tent = 1; tent <= 3; tent++) {
+                DBG(F("[boot] provisionamento tentativa ")); DBGLN(tent);
+                bleProvisionar();
+                // VERIFICA com bleLerVersao (exige a string "ver." na resposta),
+                // NÃO bleVivo/bleResponde (que passam em qualquer byte = lixo de
+                // baud errado). Só passa se o módulo responder de fato a 9600.
+                if (bleLerVersao() != 0) { DBGLN(F("[boot] modulo verificou - ok")); break; }
+                DBGLN(F("[boot] nao verificou - re-tentando"));
+            }
         }
     } else {
         DBGLN(F("[boot] modulo ja provisionado - config leve"));
         configModuloLeve();
     }
-    moduloOk = bleVivo();
+    // Sinal final estrito: Rocky só toca se o módulo responder "ver." de fato
+    // (bleLerVersao), não em lixo de baud errado (bleVivo passava em qualquer
+    // byte). Assim a melodia é prova real de que a UART casou a 9600.
+    moduloOk = (bleLerVersao() != 0);
     DBG(F("[boot] moduloOk=")); DBGLN(moduloOk);
 
     // Feedback final do boot: Rocky = TUDO PRONTO; graves = módulo mudo.
