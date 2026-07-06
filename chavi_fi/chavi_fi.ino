@@ -63,7 +63,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.7.2"
+#define FW_VERSION   "2.7.3"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -111,7 +111,7 @@
 // sentido CONTRÁRIO para ALIVIAR a pressão do batente (senão o came fica
 // forçando o fim de curso e a próxima abertura pode travar). O legado usa
 // timeToLineUP=1000ms; aqui é ajustável. 0 = sem recuo.
-#define MOTOR_RECUO_MS   450
+#define MOTOR_RECUO_MS   900
 #define MOTOR_TST_MS 450       // pulso curto do motor no TESTE de bancada
                                // (menos energia de stall -> menos brownout)
 #define JANELA_MS    20000     // ocioso E desconectado: dorme após isso
