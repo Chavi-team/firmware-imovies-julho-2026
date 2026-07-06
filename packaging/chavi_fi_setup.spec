@@ -26,14 +26,27 @@ if os.path.isdir(avr_dir):
 
 block_cipher = None
 
+# Coleta TUDO do bleak e do backend CoreBluetooth (pyobjc): o connect no macOS
+# carrega submódulos/dylibs que o autodetect do PyInstaller perde -> o scan
+# funciona mas o connect quebra ("Error -3 while decompressing"/backend faltando).
+from PyInstaller.utils.hooks import collect_all
+_hidden, _datas, _bins = [], list(datas), []
+for _pkg in ("bleak", "CoreBluetooth", "libdispatch", "objc",
+             "Foundation", "AppKit", "WebKit"):
+    try:
+        b, d, h = collect_all(_pkg)
+        _bins += b; _datas += d; _hidden += h
+    except Exception:
+        pass
+
 a = Analysis(
     [os.path.join(TOOLS, "bancada.py")],
     pathex=[TOOLS],
-    binaries=[],
-    datas=datas,
-    hiddenimports=["bleak", "serial", "serial.tools.list_ports", "requests",
+    binaries=_bins,
+    datas=_datas,
+    hiddenimports=_hidden + ["bleak", "serial", "serial.tools.list_ports", "requests",
                    "webview", "webview.platforms.cocoa", "webview.platforms.winforms",
-                   "objc", "Foundation", "WebKit", "AppKit"],
+                   "objc", "Foundation", "WebKit", "AppKit", "CoreBluetooth", "libdispatch"],
     hookspath=[],
     runtime_hooks=[],
     excludes=["tkinter", "matplotlib", "numpy", "PIL"],
