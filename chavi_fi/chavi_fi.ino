@@ -64,7 +64,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.9.12"
+#define FW_VERSION   "2.9.13"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -258,12 +258,13 @@ void sinalModuloMudo() {
 // fica só sob demanda (TST-ROCKY).
 void sinalConectado() { beep(70, 784); beep(130, 1047); piscar(CRGB::Green, 2, 90); }
 
-// ABRIR/FECHAR com SUCESSO: aviso CURTO e rápido (1 pip) + 1 piscada verde.
-// Distinto da conexão (que são 2 notas): aqui é 1 pip só. Pista de sentido:
-//   agudo (si5) = ABRIR (sobe)  |  grave (ré5) = FECHAR (desce).
-void fbComandoOk(bool abrir) {
-    beep(70, abrir ? 988 : 587);
-    piscar(CRGB::Green, 1, 90);
+// ABRIR/FECHAR com SUCESSO: fanfarra do Rocky + 3 piscadas VERDES = "conseguiu!".
+// A melodia toca 1× por acionamento concluído (não pesa como pesaria na conexão,
+// que repete a cada reconexão do app — por isso a CONEXÃO fica com o aviso curto
+// de 2 notas e o ACIONAMENTO ganha a fanfarra completa).
+void fbComandoOk() {
+    melodiaRocky();
+    piscar(CRGB::Green, 3);
 }
 
 // DIAGNÓSTICO POR BIPES (sem cabo, sem BLE): quando o módulo não responde a
@@ -654,7 +655,7 @@ void acionarVerbo(unsigned long cmd) {
     g_ultimoAcionamentoMs = millis();     // re-marca no FIM (o giro levou tempo)
     delay(120);               // garante o pacote do status transmitido...
     enviaStatus(sentidoA);    // reconfirma no FIM se a conexão sobreviveu ("parou")
-    fbComandoOk(cmd == CMD_ABRIR);   // pip curto (agudo=abrir/grave=fecha) + verde
+    fbComandoOk();            // fanfarra do Rocky + verde = "abriu/fechou!"
 }
 
 // ---- calibração (espelha FI_1_5, com o timing que o app precisa) ----

@@ -80,10 +80,10 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.9.12"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.9.13"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.9.12"
+FIRMWARE_VERSION = "2.9.13"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 
 # snapshot compartilhado (preenchido em background; lido pelo endpoint)
