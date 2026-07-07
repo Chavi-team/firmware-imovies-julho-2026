@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.9.13"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.9.14"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.9.13"
@@ -1256,7 +1256,9 @@ PAGE = r"""<!DOCTYPE html>
   @media (max-width:900px){ #log{height:320px} }
   #log .ok{color:#4ADE80} #log .err{color:#F87171} #log .warn{color:#FBBF24} #log .hi{color:#FDBA74}
   /* modal */
-  .mask-bg{position:fixed; inset:0; background:rgba(15,23,42,.45); display:none; align-items:center; justify-content:center}
+  /* z-index ALTO: a modal fica acima de tudo — passo ativo (z2), barra #proc (z50)
+     e banner de update (z100). Sem isso, o destaque do passo atual subia por cima. */
+  .mask-bg{position:fixed; inset:0; background:rgba(15,23,42,.45); display:none; align-items:center; justify-content:center; z-index:1000}
   .modal{background:#fff; border-radius:16px; padding:24px; width:340px; text-align:center}
   .modal h3{margin:0 0 4px} .modal p{color:var(--muted); font-size:13px; margin:0 0 14px}
   .modal input{font:700 22px ui-monospace,Menlo,monospace; text-align:center; width:100%;
