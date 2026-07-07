@@ -80,12 +80,12 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.9.16"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.9.17"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.9.13"
 VERSION_DATE = "2026-07-07"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Scan blindado (nunca renomeia/mexe outra fechadura) · passo atual destacado · auto-preparo pós-gravação · avisos sonoros por evento · bloco de versão no header"
+VERSION_NOTES = "Scan blindado (nunca renomeia/mexe outra fechadura) · passo atual destacado · auto-preparo pós-gravação · avisos sonoros por evento · dica de quando remover o cabo · bloco de versão no header"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -762,7 +762,16 @@ def act_validar(serial, mcu):
     LOG(f"  {'✓' if ser_lido==esperado else '✗'} serial: chip={ser_lido!r} esperado={esperado!r}",
         "ok" if ser_lido == esperado else "err")
     if ok:
-        LOG("✓ Gravação validada.", "ok"); STATUS("validar", "ok"); return True
+        LOG("✓ Gravação validada.", "ok")
+        # Dica do CABO: só Gravar+Validar usam o USBasp; daqui em diante é tudo BLE.
+        m = MCU_REAL.get(serial, mcu)
+        if m == "m328pb":     # FI 1.5: roda pela própria bateria -> cabo já pode sair
+            LOG("🔌 Pode REMOVER o cabo USBasp agora — os próximos passos "
+                "(provisionar, conectar, hibernação, teste) são todos por Bluetooth.", "hi")
+        else:                 # FI 1.0 (_400): o USBasp ALIMENTA o MCU até provisionar
+            LOG("🔌 NÃO remova o cabo ainda — nesta placa (FI 1.0) o USBasp ALIMENTA a "
+                "fechadura. Espere a MELODIA de pronta e só então remova o cabo.", "warn")
+        STATUS("validar", "ok"); return True
     LOG("✗ Validação divergente. Regrave.", "err"); STATUS("validar", "fail"); return False
 
 
@@ -1461,7 +1470,7 @@ PAGE = r"""<!DOCTYPE html>
 <script>
 const PASSOS = [
   ["gravar","1 · Gravar firmware","Grava o programa e as seeds (cabo USBasp)."],
-  ["validar","2 · Validar gravação","Relê o chip e confere serial + seeds."],
+  ["validar","2 · Validar gravação","Relê o chip e confere serial + seeds. Último passo com o cabo USBasp (a partir do 3 é tudo Bluetooth)."],
   ["provisionar","3 · Provisionar (BLE)","Configura o rádio BLE (o firmware já faz no boot; isto confirma/reforça). Roda sozinho após gravar."],
   ["conectar","4 · Conectar (BLE)","Acha a fechadura por Bluetooth e dá um PING."],
   ["hibernar","5 · Hibernação","Valida o ciclo corta→religa e ATIVA a hibernação — só liga se passar; senão deixa IDLE seguro."],
