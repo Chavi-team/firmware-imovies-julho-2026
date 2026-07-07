@@ -1229,7 +1229,17 @@ PAGE = r"""<!DOCTYPE html>
   .head{display:flex; align-items:center; justify-content:space-between; margin-bottom:14px}
   .serial{font:800 26px ui-monospace,Menlo,monospace}
   .step{display:flex; align-items:center; gap:14px; padding:14px 16px; border:1px solid var(--line);
-        border-radius:14px; background:#fff; margin-bottom:10px}
+        border-radius:14px; background:#fff; margin-bottom:10px; position:relative;
+        transform-origin:center left; opacity:1;
+        transition:transform .38s cubic-bezier(.22,1,.36,1), box-shadow .38s ease,
+                   border-color .38s ease, background .38s ease, opacity .38s ease}
+  /* PASSO ATUAL: cresce um pouco + destaque laranja. O efeito DESLIZA pro próximo
+     conforme concluem (o anterior encolhe, o próximo cresce) — clareza imediata
+     de "onde estou". Só os passos CONCLUÍDOS apagam um pouco. */
+  .step.active{transform:scale(1.035); z-index:2;
+        border-color:var(--orange); background:#FFF8F3;
+        box-shadow:0 10px 26px rgba(232,102,40,.16)}
+  .step.done{opacity:.6}
   .chip{width:34px; height:34px; border-radius:50%; display:flex; align-items:center;
         justify-content:center; font-size:18px; font-weight:800; background:#F1F5F9; color:var(--muted); flex:0 0 auto}
   .chip.run{background:#FEF3C7; color:var(--amber)} .chip.ok{background:#DCFCE7; color:var(--ok)}
@@ -1484,15 +1494,17 @@ function irPassos(){
 function voltar(){ $("#tela-passos").classList.add("hide"); $("#tela-serial").classList.remove("hide"); }
 
 function renderSteps(){
-  const c=$("#steps"); c.innerHTML="";
+  const c=$("#steps"); c.innerHTML=""; STEP_STATE={};
   for(const [k,t,d] of PASSOS){
-    const el=document.createElement("div"); el.className="step";
+    const el=document.createElement("div"); el.className="step"; el.id="step-"+k;
     el.innerHTML=`<div class="chip" id="chip-${k}">○</div>
       <div class="t"><b>${t}</b><div>${d}</div></div>
       <button id="btn-${k}">Executar</button>`;
     c.appendChild(el);
+    STEP_STATE[k]="pending";
     $("#btn-"+k).onclick = (k==="autoteste") ? autoteste : ()=>runStep(k);
   }
+  atualizaPassoAtivo();   // 1º passo já nasce destacado
   const comp=$("#comp"); comp.innerHTML="";
   for(const t of TESTES){ const b=document.createElement("button");
     b.textContent=t.label; b.onclick=(e)=>teste1(t, e.currentTarget); comp.appendChild(b); }
@@ -1506,10 +1518,28 @@ function renderSteps(){
   $("#btn-hib-off").onclick=(e)=>runStep("hib-off", e.currentTarget);
 }
 
+let STEP_STATE={};
 function setChip(step,state){
   const el=$("#chip-"+step); if(!el)return;
   el.className="chip "+(state==="pending"?"":state);
   el.textContent={pending:"○",run:"⏳",ok:"✓",fail:"✗"}[state]||"○";
+  STEP_STATE[step]=state;
+  atualizaPassoAtivo();
+}
+
+// Destaca (AUMENTA) o passo ATUAL e desliza o efeito conforme avança: ativo = o
+// que está EXECUTANDO; senão o PRÓXIMO a fazer (1º ainda não concluído). Passos
+// já concluídos ganham .done (apagam um pouco). A transição do CSS faz o
+// anterior encolher e o próximo crescer suavemente.
+function atualizaPassoAtivo(){
+  const ordem = PASSOS.map(p=>p[0]);
+  let ativo = ordem.find(k=>STEP_STATE[k]==="run");
+  if(!ativo) ativo = ordem.find(k=>STEP_STATE[k]!=="ok");   // 1º pendente/falho
+  for(const k of ordem){
+    const el=$("#step-"+k); if(!el) continue;
+    el.classList.toggle("active", k===ativo);
+    el.classList.toggle("done", STEP_STATE[k]==="ok" && k!==ativo);
+  }
 }
 
 // Trava/destrava TODA a interface enquanto uma ação roda: desabilita os botões
