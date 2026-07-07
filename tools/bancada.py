@@ -80,12 +80,12 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.9.17"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.9.18"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.9.13"
 VERSION_DATE = "2026-07-07"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Scan blindado (nunca renomeia/mexe outra fechadura) · passo atual destacado · auto-preparo pós-gravação · avisos sonoros por evento · dica de quando remover o cabo · bloco de versão no header"
+VERSION_NOTES = "Scan blindado (nunca renomeia/mexe outra fechadura) · passo atual destacado · auto-preparo pós-gravação · avisos sonoros por evento · dica de quando remover o cabo · auto-cura de nome corrompido · header sem sobreposição"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -102,6 +102,23 @@ def _parse_versao(tag):
     """'bancada-v2.7.3' / 'v2.7.3' / '2.7.3' -> (2,7,3); tolerante -> None."""
     m = re.search(r"(\d+)\.(\d+)\.(\d+)", tag or "")
     return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _corrompido_do_alvo(nome_up, alvo_up):
+    """True se 'nome' é claramente o ALVO com o(s) último(s) char(es) GARBLED por
+    UART instável do módulo (ex.: alvo '002FI001874' anunciando '002FI00187<').
+    Regra SEGURA: mesmo tamanho e difere só em posições cujo char NÃO é [A-Z0-9]
+    (lixo). Um serial DIFERENTE é todo alfanumérico → NÃO casa (não renomeia
+    fechadura errada). Só cobre garble em char inválido (o observado)."""
+    if not nome_up or len(nome_up) != len(alvo_up) or nome_up == alvo_up:
+        return False
+    difs = 0
+    for a, b in zip(nome_up, alvo_up):
+        if a != b:
+            if a.isalnum():          # difere com char VÁLIDO -> outro serial
+                return False
+            difs += 1
+    return 1 <= difs <= 2            # até 2 chars de lixo (padrão: 1-2 no fim)
 
 
 def _checar_atualizacao():
@@ -479,17 +496,21 @@ class Ble:
         devs = await BleakScanner.discover(timeout=timeout, return_adv=True)
         alvo_up = alvo.upper()
         melhor = None
+        garbled = []   # candidatos = alvo com nome CORROMPIDO (garble no fim)
         for addr, (dev, adv) in devs.items():
             nome = (adv.local_name or dev.name or "")
             up = nome.upper()
             exato = (up == alvo_up)
             virgem = ("SOFT AT" in up or "MLT-BT05" in up or up.startswith("CHAVIFI"))
-            # OUTRA fechadura já gravada (serial \d+FI\d+ diferente do alvo): PROIBIDO.
-            outro_serial = bool(re.search(r"\d+FI\d+", up)) and not exato
+            corrompido = _corrompido_do_alvo(up, alvo_up)
+            # OUTRA fechadura já gravada (serial \d+FI\d+ ≠ alvo e NÃO corrompido do alvo): PROIBIDO.
+            outro_serial = bool(re.search(r"\d+FI\d+", up)) and not exato and not corrompido
             match = (exato or virgem) and not outro_serial
             if nome:
-                tag = "★" if match else ("⛔" if outro_serial else "·")
+                tag = "★" if match else ("⚠" if corrompido else ("⛔" if outro_serial else "·"))
                 LOG(f"  {tag} {nome}  {dev.address}  rssi={adv.rssi}")
+            if corrompido:
+                garbled.append((dev.address, nome, adv.rssi))
             if match:
                 peso = (10_000 if exato else 0) + adv.rssi   # serial exato ganha; senão RSSI
                 if melhor is None or peso > melhor[0]:
@@ -497,6 +518,20 @@ class Ble:
         if melhor:
             LOG(f"  → escolhido: {melhor[2] or '(sem nome)'}  {melhor[1]}")
             return melhor[1]
+        # sem alvo exato/virgem: se há UM único nome CORROMPIDO do alvo, é ele (o
+        # módulo garble o último byte do AT+NAME — UART instável). Reprovisionar por
+        # BLE (caminho confiável do Mac) conserta o nome. Ambíguo (2+) → aborta.
+        if len(garbled) == 1:
+            addr, nome, _ = garbled[0]
+            LOG(f"  ⚠ '{nome}' é o ALVO com o nome CORROMPIDO (garble de UART no módulo). "
+                f"Vou reprovisionar por BLE e corrigir o nome para {alvo}.", "warn")
+            return addr
+        if len(garbled) >= 2:
+            LOG("  ✗ Achei VÁRIOS nomes parecidos/corrompidos do alvo — ambíguo, NÃO vou "
+                "arriscar renomear o errado. Deixe só a fechadura-alvo ligada e repita:", "err")
+            for _a, _n, _r in garbled:
+                LOG(f"     · {_n}  {_a}  rssi={_r}")
+            return None
         LOG("  ✗ Não achei o alvo pelo serial nem um módulo VIRGEM (só outras "
             "fechaduras já nomeadas por perto). NÃO vou reconfigurar outra fechadura — "
             "religue a bateria da fechadura-alvo (ela deve anunciar 'SOFT AT' ou o "
