@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.9.14"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.9.15"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.9.13"
@@ -373,17 +373,26 @@ class Ble:
         LOG(f"Procurando fechadura '{alvo}' por BLE ({timeout:.0f}s)...", "hi")
         achado = {}
         devs = await BleakScanner.discover(timeout=timeout, return_adv=True)
+        alvo_up = alvo.upper()
         for addr, (dev, adv) in devs.items():
             nome = adv.local_name or dev.name or ""
+            up = nome.upper()
             uuids = [u.lower() for u in (adv.service_uuids or [])]
             ffe0 = any("ffe0" in u for u in uuids)
-            match = (nome == alvo) or nome in ("CHAVIFI", "CHAVIFIPR") or ffe0
+            # ⛔ SEGURANÇA: um device cujo nome é OUTRO serial \d+FI\d+ (≠ alvo) é
+            # OUTRA fechadura já gravada — NUNCA conectar/mexer nela (o ffe0 dela
+            # não pode "puxar" a conexão). Evita testar/hibernar a fechadura errada.
+            outro_serial = bool(re.search(r"\d+FI\d+", up)) and up != alvo_up
+            match = (up == alvo_up) or up.startswith("CHAVIFI") or (ffe0 and not outro_serial)
+            if outro_serial:
+                match = False
             if nome or ffe0:
-                LOG(f"  {'★' if match else '·'} {nome or '(sem nome)'}  {dev.address}  rssi={adv.rssi}")
+                tag = "★" if match else ("⛔" if outro_serial else "·")
+                LOG(f"  {tag} {nome or '(sem nome)'}  {dev.address}  rssi={adv.rssi}")
             if match:
-                # prioridade: nome exato > CHAVIFI > só ffe0
-                peso = 3 if nome == alvo else (2 if nome.startswith("CHAVIFI") else 1)
-                if peso > achado.get("peso", 0):
+                # prioridade: nome exato > CHAVIFI > só ffe0 (mais forte desempata)
+                peso = (3000 if up == alvo_up else (2000 if up.startswith("CHAVIFI") else 1000)) + adv.rssi
+                if peso > achado.get("peso", -1e9):
                     achado = {"addr": dev.address, "nome": nome, "peso": peso}
         return achado.get("addr")
 
@@ -460,30 +469,39 @@ class Ble:
         return self._call(self._cmd(texto, alvos, timeout), timeout=timeout + 15)
 
     # ---- provisionamento do módulo POR BLE (backup baud-agnóstico) ----
-    # Scan AMPLO: acha o módulo virgem ("Soft AT"/"MLT-BT05"), de fábrica CHAVIFI,
-    # já com o serial, ou por \d+FI\d+. Pega o de sinal MAIS FORTE (a fechadura na
-    # bancada é a mais perto) e loga os candidatos.
+    # ⚠️ SÓ provisiona o ALVO exato (nome == serial) ou um módulo VIRGEM ("Soft AT"/
+    # "MLT-BT05"/"CHAVIFI" de fábrica). NUNCA um device cujo nome já é OUTRO serial
+    # \d+FI\d+ — isso RENOMEARIA a fechadura errada (bug real: numa bancada com
+    # várias FIs, o "sinal mais forte" pegou a vizinha e a renomeou). Se só houver
+    # outras fechaduras nomeadas por perto, ABORTA (não reconfigura ninguém).
     async def _scan_prov(self, alvo, timeout):
         from bleak import BleakScanner
-        LOG(f"Procurando módulo p/ provisionar (serial {alvo} ou de fábrica, {timeout:.0f}s)...", "hi")
+        LOG(f"Procurando módulo p/ provisionar (serial {alvo} ou VIRGEM, {timeout:.0f}s)...", "hi")
         devs = await BleakScanner.discover(timeout=timeout, return_adv=True)
+        alvo_up = alvo.upper()
         melhor = None
         for addr, (dev, adv) in devs.items():
             nome = (adv.local_name or dev.name or "")
             up = nome.upper()
-            uuids = [u.lower() for u in (adv.service_uuids or [])]
-            ffe0 = any("ffe0" in u for u in uuids)
-            match = (nome == alvo or "SOFT AT" in up or "MLT-BT05" in up
-                     or up.startswith("CHAVIFI") or re.search(r"\d+FI\d+", up) or ffe0)
-            if nome or ffe0:
-                LOG(f"  {'★' if match else '·'} {nome or '(sem nome)'}  {dev.address}  rssi={adv.rssi}")
+            exato = (up == alvo_up)
+            virgem = ("SOFT AT" in up or "MLT-BT05" in up or up.startswith("CHAVIFI"))
+            # OUTRA fechadura já gravada (serial \d+FI\d+ diferente do alvo): PROIBIDO.
+            outro_serial = bool(re.search(r"\d+FI\d+", up)) and not exato
+            match = (exato or virgem) and not outro_serial
+            if nome:
+                tag = "★" if match else ("⛔" if outro_serial else "·")
+                LOG(f"  {tag} {nome}  {dev.address}  rssi={adv.rssi}")
             if match:
-                peso = (10_000 if nome == alvo else 0) + adv.rssi   # serial exato ganha; senão RSSI
+                peso = (10_000 if exato else 0) + adv.rssi   # serial exato ganha; senão RSSI
                 if melhor is None or peso > melhor[0]:
                     melhor = (peso, dev.address, nome)
         if melhor:
             LOG(f"  → escolhido: {melhor[2] or '(sem nome)'}  {melhor[1]}")
             return melhor[1]
+        LOG("  ✗ Não achei o alvo pelo serial nem um módulo VIRGEM (só outras "
+            "fechaduras já nomeadas por perto). NÃO vou reconfigurar outra fechadura — "
+            "religue a bateria da fechadura-alvo (ela deve anunciar 'SOFT AT' ou o "
+            "próprio serial) e rode o passo de novo.", "err")
         return None
 
     def scan_prov(self, alvo, timeout=8.0):
