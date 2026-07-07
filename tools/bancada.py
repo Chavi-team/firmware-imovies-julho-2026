@@ -85,9 +85,12 @@ BANCADA_VERSION = "2.9.16"                # versão desta bancada (bump a cada r
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.9.13"
 VERSION_DATE = "2026-07-07"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = ("Scan blindado (nunca renomeia/mexe outra fechadura) · passo atual "
-                 "destacado · auto-preparo pós-gravação · avisos sonoros por evento")
+VERSION_NOTES = "Scan blindado (nunca renomeia/mexe outra fechadura) · passo atual destacado · auto-preparo pós-gravação · avisos sonoros por evento · bloco de versão no header"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
+# O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
+# atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
+# que o workflow de release atualiza a cada versão. Leitura sem login (raw).
+BEACON_URL = "https://raw.githubusercontent.com/Chavi-team/chavi-bancada-latest/main/latest.json"
 
 # snapshot compartilhado (preenchido em background; lido pelo endpoint)
 _UPDATE = {"checado": False, "current": BANCADA_VERSION,
@@ -102,35 +105,27 @@ def _parse_versao(tag):
 
 
 def _checar_atualizacao():
-    """Consulta os Releases do GitHub e marca se há versão nova.
-    TOTALMENTE tolerante a falha: sem internet / rate limit / timeout →
-    não mostra nada, não loga erro, não trava (roda em thread daemon)."""
+    """Lê o BEACON PÚBLICO (latest.json) e marca se há versão nova.
+    TOTALMENTE tolerante a falha: sem internet / timeout / JSON inválido →
+    não mostra nada, não loga erro, não trava (roda em thread daemon).
+    (O repo do firmware é privado, por isso NÃO dá p/ usar a API de releases
+    sem token — o beacon público resolve sem embutir segredo no app.)"""
     try:
         import requests
-        r = requests.get(
-            f"https://api.github.com/repos/{GITHUB_REPO}/releases",
-            headers={"Accept": "application/vnd.github+json"},
-            params={"per_page": 30}, timeout=4)
+        r = requests.get(BEACON_URL, timeout=5,
+                         headers={"Cache-Control": "no-cache"})
         if not r.ok:
             return
-        cand = None                      # (versao_tupla, release) mais nova bancada-v*
-        for rel in (r.json() or []):
-            if rel.get("draft") or rel.get("prerelease"):
-                continue
-            tag = rel.get("tag_name", "") or ""
-            if not tag.startswith("bancada-v"):
-                continue                 # ignora releases de firmware etc.
-            v = _parse_versao(tag)
-            if v and (cand is None or v > cand[0]):
-                cand = (v, rel)
-        if not cand:
+        data = r.json() or {}
+        latest = data.get("version")
+        v = _parse_versao(latest)
+        if not v:
             return
-        v, rel = cand
         atual = _parse_versao(BANCADA_VERSION)
         _UPDATE.update({
-            "latest": ".".join(str(x) for x in v),
+            "latest": latest,
             "outdated": bool(atual and v > atual),
-            "url": rel.get("html_url"),
+            "url": data.get("url"),
         })
     except Exception:
         pass                             # silêncio total: rede/timeout/JSON

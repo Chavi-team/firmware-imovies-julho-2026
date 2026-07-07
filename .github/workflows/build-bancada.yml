@@ -73,3 +73,17 @@ jobs:
           files: packaging/dist/Chavi-Fi-Imoveis-Setup-*.zip
           draft: false
           prerelease: false
+
+  # Atualiza o BEACON PÚBLICO de versão (Chavi-team/chavi-bancada-latest/latest.json)
+  # que a bancada lê p/ detectar atualização (o repo do firmware é privado). Roda 1×
+  # por release. Precisa do secret BEACON_PAT; sem ele, o script só avisa e passa.
+  beacon:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/bancada-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Atualizar beacon público de versão
+        env:
+          BEACON_PAT: ${{ secrets.BEACON_PAT }}
+        run: python3 packaging/atualizar_beacon.py
