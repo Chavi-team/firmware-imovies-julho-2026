@@ -941,3 +941,37 @@ nome certo no ar, PONG + TST-BUZ + TST-INFO ok pelo ar. Falta: reset de 10s
 melodia — e rodar o auto-teste completo pela bancada.
 
 Flash 85% / RAM 73% (538 livres). Fluxo de gravação INALTERADO.
+
+## [BRANCH feature/variante-sem-mosfet] v2.11.0 (08/07/2026) — Variante FI 1.5 SEM MOSFET
+
+Placa IDÊNTICA à FI 1.5 (mesmo 328PB, mesmo módulo, mesma UART 9600, mesmos
+fuses), só que SEM o MOSFET de energia — o MCU é sempre alimentado direto.
+Confirmado pelo dev da Chavi (config em produção do firmware legado):
+- **com MOSFET**: BEFC020 / AFTC028 / STATUS8 (MOSFET no PIO8 + wake no PIO6)
+- **sem MOSFET**: BEFC000 / AFTC008 / STATUS6 (só o wake/status no PIO6; sem PIO8)
+
+O código do dev também revelou: a placa sem MOSFET TEM o fio de wake (PIO6→PD3)
+— o `goToSleep()` dela faz `attachInterrupt(pinWakeuC, ..., RISING)` + `powerDown`.
+E o `operateAllOk()` (motor/abrir) é idêntico com/sem MOSFET (indiferente ao gate),
+batendo com o nosso `acionar()`.
+
+**Implementação (mesmo .hex universal, byte de config):**
+- EEPROM **916 = 1** → variante sem MOSFET. Firmware: `g_semMosfet` no boot;
+  `configModuloLeve` usa BEFC000/AFTC008 e STATUS no PIO6; TST-INFO mostra
+  `MOSFET:SEM`. Hibernação forçada OFF (não há o que cortar).
+- `gerar_seed.py` (5º arg "1"/"nm") e `bancada.py` (`gerar_seed_bin(...sem_mosfet)`)
+  gravam o byte 916.
+- **Bancada**: nova opção no modelo — "FI 1.5 sem MOSFET" (valor `m328pb-nm`);
+  o `_step` tira o "-nm", usa o chip m328pb real p/ os fuses e liga o flag. Mesmo
+  hex, mesma gravação — só o byte 916 muda ("auto entende" pelo modelo escolhido).
+
+**Descoberta paralela (não implementada aqui):** o firmware do dev dorme em
+`powerDown` (µA); o NOSSO dorme em `SLEEP_MODE_IDLE` (mA) p/ acordar por dado.
+Ou seja o ganho REAL de bateria é IDLE→powerDown (não o sleep do módulo). A placa
+sem MOSFET tem o wake por PD3 garantido, então poderia usar powerDown — item
+FUTURO, precisa validação (alguns módulos clones não geram a borda de wake).
+
+⚠️ NÃO validado em hardware sem MOSFET ainda. Gravar uma placa sem MOSFET pela
+bancada (opção "FI 1.5 sem MOSFET"), auto-teste + abrir/fechar, e desligar/religar
+a bateria pra confirmar o wake pelo PD3. NÃO fazer merge no develop sem isso.
+Reverter: `git checkout develop`.
