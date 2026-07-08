@@ -112,13 +112,15 @@ def _corrompido_do_alvo(nome_up, alvo_up):
     fechadura errada). Só cobre garble em char inválido (o observado)."""
     if not nome_up or len(nome_up) != len(alvo_up) or nome_up == alvo_up:
         return False
-    difs = 0
-    for a, b in zip(nome_up, alvo_up):
-        if a != b:
-            if a.isalnum():          # difere com char VÁLIDO -> outro serial
+    # Compara char a char. Se a diferença for um char não alfanumérico,
+    # considera garble. Se for alfanumérico, é outro serial.
+    diff_count = 0
+    for char_nome, char_alvo in zip(nome_up, alvo_up):
+        if char_nome != char_alvo:
+            if char_nome.isalnum():  # Diferença com char válido -> outro serial
                 return False
-            difs += 1
-    return 1 <= difs <= 2            # até 2 chars de lixo (padrão: 1-2 no fim)
+            diff_count += 1
+    return 1 <= diff_count <= 2  # Tolera até 2 chars corrompidos
 
 
 def _checar_atualizacao():
@@ -647,12 +649,14 @@ BACKEND = Backend(CFG)
 
 
 def _exec(cmd):
-    LOG("$ " + " ".join(cmd), "hi")
+    # Esconde tokens/segredos do log se houver
+    log_cmd = " ".join(cmd)
+    LOG(f"$ {log_cmd}", "hi")
     try:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, bufsize=1)
-    except FileNotFoundError as e:
-        LOG(f"comando não encontrado: {e}", "err")
+    except FileNotFoundError:
+        LOG(f"Comando não encontrado: '{cmd[0]}'. Verifique se está instalado e no PATH.", "err")
         return 1, ""
     out = []
     for ln in p.stdout:
