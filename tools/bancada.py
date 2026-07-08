@@ -80,12 +80,12 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.11.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.11.1"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.11.0"
+FIRMWARE_VERSION = "2.11.1"
 VERSION_DATE = "2026-07-07"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Variante FI 1.5 SEM MOSFET (opcao no modelo; wake/status no PIO6 = BEFC000/AFTC008/STATUS6, byte 916) · FLUXO ENXUTO de 3 passos (Gravar-e-preparar → Testar → Cadastrar; provisionar+conectar unificados; hibernação saiu p/ Avançado e não roda mais automática) · BOD corrigido p/ 2,7V (0xFD — 4,3V dava reset perpétuo, caso 002584) · destrava módulos com herança legada PWRM1 (firmware manda PWRM0 primeiro em todo baud; bancada conserta PELO AR) · ADOÇÃO automática por ciclo de energia · teste direto por BLE sem regravar"
+VERSION_NOTES = "Placas SEM MOSFET: usar a opcao FI 1.5 normal (provado em bancada+app que funcionam com a config padrao — a opcao beta 'sem MOSFET' da v2.11.0 foi removida) · FLUXO ENXUTO de 3 passos (Gravar-e-preparar → Testar → Cadastrar; provisionar+conectar unificados; hibernação saiu p/ Avançado e não roda mais automática) · BOD corrigido p/ 2,7V (0xFD — 4,3V dava reset perpétuo, caso 002584) · destrava módulos com herança legada PWRM1 (firmware manda PWRM0 primeiro em todo baud; bancada conserta PELO AR) · ADOÇÃO automática por ciclo de energia · teste direto por BLE sem regravar"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -187,7 +187,7 @@ def calcular_hex_befc_aftc(mosfet_pin):
 
 # Gera o seed.bin INTERNAMENTE (espelho do gerar_seed.py — no pacote não há
 # interpretador Python para subprocess). Layout idêntico ao seedGenerator legado.
-def gerar_seed_bin(serial, placa, caminho, mosfet="8", sem_mosfet=False):
+def gerar_seed_bin(serial, placa, caminho, mosfet="8"):
     eeprom = bytearray(1024)
     eeprom[1] = 0x01     # setupSeedOk
     eeprom[101] = 0x01   # warning sound
@@ -209,13 +209,12 @@ def gerar_seed_bin(serial, placa, caminho, mosfet="8", sem_mosfet=False):
     except Exception:
         m = 8
     eeprom[914] = m if 4 <= m <= 9 else 8
-    # byte 916 = variante SEM MOSFET (FI 1.5 sem o gate; wake/status no PIO6).
-    eeprom[916] = 0x01 if sem_mosfet else 0x00
+    # 916 QUEIMADO (ex-variante sem MOSFET, removida na v2.11.1): fica 0 —
+    # placas sem MOSFET usam a config NORMAL (o MCU delas é sempre alimentado).
     with open(caminho, "wb") as f:
         f.write(eeprom)
-    _pl = "FI 1.5 SEM MOSFET" if sem_mosfet else ("FI 1.0" if placa == "fi10" else "FI 1.5")
-    _mf = "SEM (wake PIO6)" if sem_mosfet else f"PIO{eeprom[914]}"
-    LOG(f"seed.bin gerado: {serial} placa={_pl} mosfet={_mf} seeds={seeds_de(serial)}")
+    LOG(f"seed.bin gerado: {serial} placa={'FI 1.0' if placa == 'fi10' else 'FI 1.5'} "
+        f"mosfet=PIO{eeprom[914]} seeds={seeds_de(serial)}")
 
 
 # ---------------------------------------------------------------------------
@@ -724,7 +723,7 @@ def _placa_de(mcu):
 MCU_REAL = {}
 
 
-def act_gravar(serial, mcu, mosfet="8", sem_mosfet=False):
+def act_gravar(serial, mcu, mosfet="8"):
     STATUS("gravar", "run")
     os.makedirs(BIN_DIR, exist_ok=True)
     if FROZEN:
@@ -740,7 +739,7 @@ def act_gravar(serial, mcu, mosfet="8", sem_mosfet=False):
             LOG("Falha ao compilar.", "err"); STATUS("gravar", "fail"); return False
     seed_bin = _seed_bin(serial)
     try:
-        gerar_seed_bin(serial, _placa_de(mcu), seed_bin, mosfet, sem_mosfet)
+        gerar_seed_bin(serial, _placa_de(mcu), seed_bin, mosfet)
     except Exception as e:
         LOG(f"Falha ao gerar as seeds: {e}", "err"); STATUS("gravar", "fail"); return False
     LOG("Gravando... NÃO mexa no cabo agora.", "hi")
@@ -751,7 +750,7 @@ def act_gravar(serial, mcu, mosfet="8", sem_mosfet=False):
         if i > 0:
             LOG(f"Assinatura não bateu — tentando chip {m}...", "warn")
             try:
-                gerar_seed_bin(serial, _placa_de(m), seed_bin, mosfet, sem_mosfet)
+                gerar_seed_bin(serial, _placa_de(m), seed_bin, mosfet)
             except Exception:
                 break
         # CRISTAL EXTERNO 16MHz (a placa TEM — schema): OBRIGATÓRIO p/
@@ -1549,8 +1548,7 @@ PAGE = r"""<!DOCTYPE html>
         <label style="color:var(--muted);font-size:14px">Placa</label>
         <!-- só a GERAÇÃO da placa; o chip exato (328/328P/328PB) a gravação
              descobre sozinha pelo retry de assinatura -->
-        <select id="mcu"><option value="m328pb">FI 1.5 (com MOSFET)</option>
-          <option value="m328pb-nm">FI 1.5 sem MOSFET</option>
+        <select id="mcu"><option value="m328pb">FI 1.5</option>
           <option value="m328p">FI 1.0</option></select>
       </div>
       <div class="row center" style="margin-top:12px">
@@ -2073,15 +2071,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _step(self, b):
         step, serial, mcu = b.get("step"), b.get("serial", ""), b.get("mcu", "m328pb")
-        # Modelo "FI 1.5 sem MOSFET" = mesmo chip (m328pb) + flag: valor "m328pb-nm".
-        sem_mosfet = mcu.endswith("-nm")
-        if sem_mosfet:
-            mcu = mcu[:-3]           # tira o "-nm" -> chip real p/ os fuses
         if step == "provisionar":
             r = act_provisionar(serial, mcu, b.get("mosfet", "8"))
             return {"ok": bool(r)}
         if step == "gravar":
-            r = act_gravar(serial, mcu, b.get("mosfet", "8"), sem_mosfet)
+            r = act_gravar(serial, mcu, b.get("mosfet", "8"))
             return {"ok": bool(r)}
         if step == "hibernar":
             r = act_hibernar_seguro(serial, mcu)
