@@ -991,3 +991,64 @@ apagar a frota), gerar_seed/bancada zeram o byte (regravação cura placas beta)
 e o select da bancada volta a só "FI 1.5" e "FI 1.0".
 
 Regra operacional: placa sem MOSFET → gravar como "FI 1.5" normal.
+
+## Sessão 08/07/2026 (tarde) — App v1.7.14, caso iPhone X, bateria e resposta do engenheiro da Soft
+
+### App-imoveis v1.7.14+262 (repo chavi-team/Flutterflow, master bea63f5)
+Correções de DESCOBERTA BLE (protocolo intocado — retrocompatível com todos os firmwares):
+- **Match pelo advName**: o iOS pode devolver o nome CACHEADO (antigo) de fechadura
+  regravada/renomeada no `platformName`; o scan agora compara o alvo também com o
+  `advName` (nome fresco do advertisement, imune a cache) — no match direto e no
+  fallback amplo (`scan_devices_b_l_e.dart`).
+- **checkBluetooth no iOS**: passa a detectar Modo de Baixa Energia (Low Power Mode
+  degrada o scan BLE — checagem existia SÓ no Android) e Bluetooth desligado nos
+  Ajustes (falhava silencioso). 36/36 testes ok.
+- Publicação: APK em `https://core.chavi.com.br/downloads/chavi-imoveis-1.7.14-262.apk`
+  (+ alias fixo `app-imoveis.apk`; nginx serve `/var/www/downloads/` no host chavi).
+  AAB buildado p/ Play Store; iOS arquivado/assinado (Organizer → TestFlight).
+
+### Caso iPhone X — ENCERRADO: era o Modo de Baixa Energia
+Um iPhone X não achava a fechadura que os outros celulares achavam (F01 "Erro ao
+PAREAR" = falha de conexão, linha 632 do funcao_blue_tooth). Investigamos cache de
+GATT/nome e UUIDs — mas a checagem nova da v1.7.14 revelou a causa real: **o
+aparelho estava em Modo de Baixa Energia**, que degrada o scan BLE a ponto de a
+fechadura sumir do scan de 8s. Antes o app falhava mudo; agora avisa o usuário.
+Lição: "um celular específico falha, os outros não" → checar Low Power Mode e
+cache de nome ANTES de suspeitar de firmware. (A sugestão do dev de buscar por
+"FFE0/FFF1" não procedia: FFF1 não existe — era cor do tema no grep — e o módulo
+Soft NÃO anuncia o serviço FFE0 no advertisement; manuais confirmam FFE0/FFE1
+como GATT fixo das duas famílias, sem comando p/ pôr UUID no anúncio.)
+
+### Bateria — decisões e fatos (08/07)
+- `ina219.powerSave(true)` sugerido pelo dev **JÁ EXISTE no firmware** v2.10.1+
+  (boot dorme o INA; motorGira/teste acordam antes de medir e dormem depois).
+- **LEDs WS2812 serão removidos FISICAMENTE** (decisão Leonardo): ~0,6-1mA CADA
+  mesmo apagados × 3 = 2-3mA, maior consumidor da placa. Firmware NÃO muda
+  (escreve no barramento vazio); feedback vira só sonoro. Estimativa do dev: ~76
+  dias de bateria (a confirmar por medição em série com a bateria).
+- Orçamento de repouso hoje: módulo 1,5mA (PWRM0) + MCU IDLE ~2-4mA + LEDs 2-3mA
+  + quiescente do StepUp. Alavanca GRANDE segue sendo MCU IDLE→powerDown (µA).
+
+### Resposta do engenheiro da Soft (4 pontos) — análise consolidada
+1. **PWRM1 @ 9600 exige controlar o pino WAKE** → confirma a saga da 002584
+   (módulo surdo) e por que PWRM1 está FORA nas placas atuais (nenhuma tem a
+   linha MCU→wake). ⚠️ CONTRADIÇÃO a esclarecer: manual diz "GND constante"
+   acorda; ele disse "nível alto" — polaridade oposta (com pull-up 100k o pino
+   fica alto sozinho, o que tornaria PWRM1@9600 funcional — e não é o que
+   observamos). Perguntar antes de projetar revisão de placa.
+2. **2400-slow "deve funcionar", precisão 0,010%** → derruba a hipótese da deriva
+   de 32kHz; o nosso 18/20 de falha veio provavelmente da COMBINAÇÃO/ordem de
+   AT+PWRM/AT+UART (ele não deu os valores). 2400-slow volta a ser possível, mas
+   SÓ com a receita exata dele + revalidação (20 ciclos) por família de módulo.
+   Custo: perna UART 4× mais lenta ≈ +0,3-0,5s na abertura; BLE/app inalterados.
+3. **BEFC/AFTC é a melhor opção; STATUS foi paliativo da REV.03** → ✅ VALIDA a
+   nossa arquitetura v2.10+ (BEFC020/AFTC028 padrão + STATUSx só p/ 5.2 rev<04).
+4. **Wake com pull-up 100k; desnecessário em 2400, obrigatório acima** → consistente.
+Perguntas pendentes p/ ele: (a) receita exata do 2400-slow (valores/ordem de
+PWRM+UART, precisa RESET?, vale p/ 1010 E 5.2, desde qual rev?); (b) polaridade
+real do wake; (c) no 2400-slow o módulo repassa dado BLE→UART imediatamente ao
+acordar ou perde os primeiros bytes?
+Decisão: NADA a mexer agora (padrão atual validado em campo e alinhado ao ponto 3).
+Qualquer experimento futuro: branch + validação de 20 ciclos por variante de
+placa (1.5 com/sem MOSFET, 1.0 com/sem MOSFET) × família de módulo (1010 rev12,
+5.2 rev05, 5.2 rev03). Revisão de placa futura = linha de wake + MCU powerDown.
