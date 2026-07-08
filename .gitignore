@@ -11,3 +11,6 @@ packaging/.venv-build/
 packaging/avrdude/
 .DS_Store
 **/.DS_Store
+
+# harness local (settings + worktrees)
+.claude/

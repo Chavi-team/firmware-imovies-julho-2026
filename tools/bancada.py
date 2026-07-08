@@ -80,12 +80,12 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.9.18"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.10.1"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.9.13"
+FIRMWARE_VERSION = "2.10.1"
 VERSION_DATE = "2026-07-07"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Scan blindado (nunca renomeia/mexe outra fechadura) · passo atual destacado · auto-preparo pós-gravação · avisos sonoros por evento · dica de quando remover o cabo · auto-cura de nome corrompido · header sem sobreposição"
+VERSION_NOTES = "FLUXO ENXUTO de 3 passos (Gravar-e-preparar → Testar → Cadastrar; provisionar+conectar unificados; hibernação saiu p/ Avançado e não roda mais automática) · BOD corrigido p/ 2,7V (0xFD — 4,3V dava reset perpétuo, caso 002584) · destrava módulos com herança legada PWRM1 (firmware manda PWRM0 primeiro em todo baud; bancada conserta PELO AR) · ADOÇÃO automática por ciclo de energia · teste direto por BLE sem regravar"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -185,7 +185,7 @@ def calcular_hex_befc_aftc(mosfet_pin):
 
 # Gera o seed.bin INTERNAMENTE (espelho do gerar_seed.py — no pacote não há
 # interpretador Python para subprocess). Layout idêntico ao seedGenerator legado.
-def gerar_seed_bin(serial, placa, caminho):
+def gerar_seed_bin(serial, placa, caminho, mosfet="8"):
     eeprom = bytearray(1024)
     eeprom[1] = 0x01     # setupSeedOk
     eeprom[101] = 0x01   # warning sound
@@ -200,10 +200,17 @@ def gerar_seed_bin(serial, placa, caminho):
         eeprom[a:a + 4] = get_seed(serial, i + 1).to_bytes(4, "little")
     eeprom[900] = 0x01   # layout de telemetria
     eeprom[912] = 0x01 if placa == "fi10" else 0x00   # byte de PLACA
+    # byte 914 = PIO do MOSFET (campo da UI; o firmware calcula BEFC/AFTC/
+    # AT+PIOx0 em runtime a partir dele — 90% das FIs = 8)
+    try:
+        m = int(mosfet)
+    except Exception:
+        m = 8
+    eeprom[914] = m if 4 <= m <= 9 else 8
     with open(caminho, "wb") as f:
         f.write(eeprom)
     LOG(f"seed.bin gerado: {serial} placa={'FI 1.0' if placa == 'fi10' else 'FI 1.5'} "
-        f"seeds={seeds_de(serial)}")
+        f"mosfet=PIO{eeprom[914]} seeds={seeds_de(serial)}")
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +421,26 @@ class Ble:
 
     def scan(self, alvo, timeout=8.0):
         return self._call(self._scan(alvo, timeout), timeout=timeout + 20)
+
+    # ---- mapa de dispositivos "cara de fechadura" no ar (p/ a ADOÇÃO) ----
+    # Devolve {addr: nome} de tudo que parece módulo de FI: nome de serial
+    # (\d+FI\d+), virgem ("SOFT AT"/"MLT-BT05"/"CHAVIFI") ou serviço FFE0.
+    async def _scan_mapa(self, timeout):
+        from bleak import BleakScanner
+        devs = await BleakScanner.discover(timeout=timeout, return_adv=True)
+        mapa = {}
+        for addr, (dev, adv) in devs.items():
+            nome = adv.local_name or dev.name or ""
+            up = nome.upper()
+            uuids = [u.lower() for u in (adv.service_uuids or [])]
+            ffe0 = any("ffe0" in u for u in uuids)
+            if re.search(r"\d+FI\d+", up) or "SOFT AT" in up or "MLT-BT05" in up \
+               or up.startswith("CHAVIFI") or ffe0:
+                mapa[dev.address] = nome or "(sem nome)"
+        return mapa
+
+    def scan_mapa(self, timeout=6.0):
+        return self._call(self._scan_mapa(timeout), timeout=timeout + 20)
 
     # ---- conectar ----
     async def _connect(self, addr):
@@ -690,7 +717,7 @@ def _placa_de(mcu):
 MCU_REAL = {}
 
 
-def act_gravar(serial, mcu):
+def act_gravar(serial, mcu, mosfet="8"):
     STATUS("gravar", "run")
     os.makedirs(BIN_DIR, exist_ok=True)
     if FROZEN:
@@ -706,7 +733,7 @@ def act_gravar(serial, mcu):
             LOG("Falha ao compilar.", "err"); STATUS("gravar", "fail"); return False
     seed_bin = _seed_bin(serial)
     try:
-        gerar_seed_bin(serial, _placa_de(mcu), seed_bin)
+        gerar_seed_bin(serial, _placa_de(mcu), seed_bin, mosfet)
     except Exception as e:
         LOG(f"Falha ao gerar as seeds: {e}", "err"); STATUS("gravar", "fail"); return False
     LOG("Gravando... NÃO mexa no cabo agora.", "hi")
@@ -717,17 +744,24 @@ def act_gravar(serial, mcu):
         if i > 0:
             LOG(f"Assinatura não bateu — tentando chip {m}...", "warn")
             try:
-                gerar_seed_bin(serial, _placa_de(m), seed_bin)
+                gerar_seed_bin(serial, _placa_de(m), seed_bin, mosfet)
             except Exception:
                 break
         # CRISTAL EXTERNO 16MHz (a placa TEM — schema): OBRIGATÓRIO p/
         # SoftwareSerial a 9600 (baud de fábrica do módulo) ser confiável. O RC
         # de 8MHz não fala 9600 bem -> não convertia o módulo (ficava mudo).
-        #   lfuse: 328PB=0xFF, 328/328P=0xF7 (16MHz, CKDIV8 off)
-        #   efuse: 0xF7 (BOD; 2.7V p/ reintroduzir depois de estabilizar)
+        #   lfuse: 328PB=0xFF (low-power crystal — o PB NÃO TEM full-swing;
+        #          0xF7 num PB deixa o chip SEM CLOCK!), 328/328P=0xF7
+        #          (full-swing, mais imune a ruído de motor)
+        #   efuse: ⭐ BOD LIGADO em 2,7V (0xFD) nos DOIS chips. ⚠️ NUNCA 0xF4
+        #          (4,3V): provado em bancada (07/07/2026, CH003FI002584) que o
+        #          trilho real fica abaixo de 4,3V → MCU em RESET PERPÉTUO
+        #          (grava por ISP normal, mas nunca boota — silêncio total na
+        #          bateria). A frota legada roda até SEM BOD (efuse 0xF7 lido
+        #          da FI de produção 002FI001767); 2,7V já protege as seeds.
         #   hfuse: 0xD7 (EESAVE liga, sem bootloader) | lock: 0xCF
         lfuse = "0xFF" if m == "m328pb" else "0xF7"
-        efuse = "0xF7"
+        efuse = "0xFD"
         rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
                         "-U", f"lfuse:w:{lfuse}:m", "-U", "hfuse:w:0xD7:m",
                         "-U", f"efuse:w:{efuse}:m", "-U", "lock:w:0xCF:m",
@@ -813,12 +847,67 @@ def act_validar(serial, mcu):
 _GRAVA_TS = 0.0   # timestamp do fim da última gravação (p/ esperar o boot)
 BOOT_ESPERA_S = 30   # boot + provisionamento + melodia levam ~24s; margem p/ 30s
 
+# Receita AT v2.10.1 aplicada PELO AR (MODE2 = controle remoto, padrão de
+# fábrica dos DOIS módulos — manuais 5.2 §7 / 1010 §7). Deterministica: a
+# CONEXÃO BLE acorda o módulo mesmo com auto-sleep legado (PWRM1) — foi assim
+# que a CH003FI002584 (surda p/ UART) foi recuperada em 07/07/2026.
+#   PWRM0 PRIMEIRO: mata o auto-sleep herdado da esteira legada (PWRM1), que
+#   deixava a UART do módulo DORMINDO — em 9600 nada a acorda pela serial.
+#   Depois: baud 9600 + config de dados/wake + nome + reset.
+def receita_ar(alvo, mosfet_pin):
+    befc, aftc = calcular_hex_befc_aftc(mosfet_pin)
+    return ["AT+PWRM0", "AT+BAUD2", "AT+ROLE0", "AT+TYPE0", "AT+DELI3",
+            "AT+NOTI1", "AT+ADVI2", f"AT+BEFC{befc}", f"AT+AFTC{aftc}",
+            f"AT+NAME{alvo}", "AT+RESET"]
+
+
+# ADOÇÃO POR CICLO DE ENERGIA — identifica FISICAMENTE a fechadura da bancada
+# quando o módulo dela anuncia um nome antigo/errado (fechadura REGRAVADA: o
+# scan blindado recusa por segurança, e recusaria pra sempre). O operador
+# desliga/religa a bateria e a bancada observa QUEM sumiu e voltou do ar —
+# identificação mais forte que nome, sem risco de pegar a fechadura vizinha.
+def act_adotar(alvo):
+    LOG("🔎 ADOÇÃO por ciclo de energia — vou identificar a fechadura da bancada "
+        "pelo desliga/religa da bateria (à prova de nome errado).", "hi")
+    base = BLE.scan_mapa(6.0)
+    if base:
+        LOG("  No ar agora: " + " · ".join(f"{n}" for n in base.values()))
+    LOG("👉 DESLIGUE a bateria da fechadura AGORA (aguardando ela sumir do ar...)", "warn")
+    cand, faltando = None, {}
+    t0 = time.time()
+    while time.time() - t0 < 60:
+        atual = BLE.scan_mapa(5.0)
+        sumidos = {a: n for a, n in base.items() if a not in atual}
+        # exige o MESMO addr sumido em 2 varreduras seguidas (scan BLE é flaky)
+        confirmados = [a for a in sumidos if a in faltando]
+        if len(confirmados) == 1:
+            cand = confirmados[0]
+            LOG(f"  ✓ Sumiu do ar: '{base[cand]}' ({cand}) — é a fechadura da bancada.", "ok")
+            break
+        faltando = sumidos
+    if not cand:
+        LOG("✗ Não vi nenhuma fechadura sumir do ar em 60s. Repita o passo e "
+            "desligue a bateria quando eu pedir.", "err")
+        return None
+    LOG("👉 RELIGUE a bateria AGORA (aguardando ela voltar ao ar...)", "warn")
+    t0 = time.time()
+    while time.time() - t0 < 60:
+        atual = BLE.scan_mapa(5.0)
+        if cand in atual:
+            LOG(f"  ✓ Voltou ao ar: '{atual[cand]}' — ADOTADA como {alvo}.", "ok")
+            return cand
+    LOG("✗ Ela não voltou ao ar em 60s. Religue a bateria e repita o passo.", "err")
+    return None
+
+
 def act_provisionar(serial, mcu, mosfet_pin):
-    """PASSO 3 — garante o rádio BLE provisionado. O firmware JÁ se auto-provisiona
-    no 1º boot pós-gravação; aqui confirmamos por PONG e só REFORÇAMOS pela sequência
-    AT por BLE (método do AT.py do dev) se o módulo não responder — evita um AT+RESET
-    e um segundo boot à toa no caso comum. Alvo do reforço = padrão NOVO: 9600
-    (AT+BAUD2) + PWRM0 (auto-sleep OFF) + BEFC/AFTC (gate do MOSFET + wake) + nome."""
+    """PASSO 3 — garante o rádio BLE provisionado, entendendo os DOIS mundos:
+    · VIRGEM de fábrica: o firmware se auto-provisiona no 1º boot; aqui só
+      confirmamos por PONG (rápido) e reforçamos pelo ar se preciso.
+    · REGRAVADA (módulo com nome antigo e/ou herança legada PWRM1 = UART
+      dormindo): o scan não acha o serial → ADOÇÃO automática por ciclo de
+      energia + receita v2.10.1 pelo ar (PWRM0 acorda, renomeia, reseta).
+    Tudo sem cabo — a conexão BLE acorda o módulo mesmo dormindo."""
     global _GRAVA_TS
     STATUS("provisionar", "run")
     alvo = serial[2:] if serial.startswith("CH") else serial
@@ -846,38 +935,64 @@ def act_provisionar(serial, mcu, mosfet_pin):
                 return True
         return False
 
+    def _reforcar(addr):
+        global _GRAVA_TS
+        try:
+            ok = BLE.provisionar_at(addr, receita_ar(alvo, mosfet_pin))
+        except Exception as e:
+            LOG(f"✗ Erro ao provisionar pelo ar: {e}", "err"); return False
+        if not ok:
+            LOG("⚠️ Algum AT ficou sem resposta — repetindo uma vez...", "warn")
+            time.sleep(3)
+            try:
+                ok = BLE.provisionar_at(addr, receita_ar(alvo, mosfet_pin))
+            except Exception:
+                ok = False
+        # ⭐ CRÍTICO (aprendido na 002FI001767): depois do AT+RESET, o MÓDULO já
+        # está 100% configurado (todos OK+Set acima) — mas o MCU faz o PRÓPRIO
+        # provisionamento no boot, e enquanto NÓS estivermos conectados o módulo
+        # fica em modo TÚNEL e não responde ao MCU → o MCU entra em loop (os
+        # "AT+VERS?" que vazam pro túnel são ELE tentando) e nunca chega a
+        # responder PONG. A cura é DESCONECTAR e deixar o MCU terminar SOZINHO.
+        # Foi exatamente o "esperei e reconectei" que resolveu na mão.
+        BLE.disconnect()
+        for tentativa in (1, 2):
+            LOG(f"Módulo configurado. Deixando o MCU terminar sozinho "
+                f"(desconectado, ~30s — tentativa {tentativa}/2)...", "hi")
+            time.sleep(30)   # DESCONECTADO de propósito: não competir com o MCU
+            if _pong():
+                LOG("✓ Rádio provisionado pelo ar (PWRM0 + 9600 + wake + nome) e "
+                    "respondendo (PONG).", "ok")
+                return True
+        # 2 tentativas sem PONG: o rádio está OK (provado pelos OK+Set), o MCU não
+        _GRAVA_TS = time.time()
+        LOG("⚠️ Rádio configurado pelo ar, mas sem PONG do MCU após ~60s. "
+            "DIAGNÓSTICO PELO SOM ao religar a bateria: SILÊNCIO = sem energia "
+            "(bateria/fuses) · 1 bipe + 4 GRAVES = MCU vivo mas UART módulo→MCU "
+            "marginal (solda) · MELODIA = pronto, é só conectar de novo.", "warn")
+        return bool(ok)
+
     LOG("Verificando o rádio BLE (o firmware se auto-provisiona no boot)...", "hi")
     if _pong():
         LOG("✓ Rádio provisionado e respondendo (PONG). Reforço por BLE dispensado.", "ok")
         STATUS("provisionar", "ok"); return True
 
-    # não respondeu -> reforça a config do rádio pela sequência AT por BLE
-    befc, aftc = calcular_hex_befc_aftc(mosfet_pin)
-    LOG(f"Sem PONG — reforçando o rádio por BLE (pino MOSFET={mosfet_pin} → "
-        f"BEFC{befc}/AFTC{aftc})...", "hi")
-    comandos = ["AT+SHIELD1", "AT+BAUD2", "AT+PWRM0",
-                f"AT+BEFC{befc}", f"AT+AFTC{aftc}", f"AT+NAME{alvo}", "AT+RESET"]
+    # Sem PONG → acha o módulo: alvo exato, virgem ou garble (scan blindado)...
+    LOG("Sem PONG — procurando o módulo (virgem, pelo serial ou nome corrompido)...", "hi")
     BLE.disconnect(); time.sleep(1.0)
     try:
         addr = BLE.scan_prov(alvo, timeout=8.0)
     except Exception as e:
         LOG(f"✗ Erro no scan BLE: {e}", "err"); STATUS("provisionar", "fail"); return False
+    # ...e se só houver fechadura com OUTRO nome (regravada!), ADOTA por ciclo
+    # de energia — identificação física, sem risco de pegar a vizinha.
     if not addr:
-        LOG("✗ Módulo não encontrado (anuncia como 'Soft AT' virgem ou pelo serial). "
-            "Religue a bateria e tente de novo.", "err")
+        addr = act_adotar(alvo)
+    if not addr:
         STATUS("provisionar", "fail"); return False
-    try:
-        ok = BLE.provisionar_at(addr, comandos)
-    except Exception as e:
-        LOG(f"✗ Erro ao provisionar: {e}", "err"); STATUS("provisionar", "fail"); return False
-    if not ok:
-        LOG("⚠️ Provisionamento parcial (algum AT sem resposta). Pode repetir o passo 3.", "warn")
-        STATUS("provisionar", "fail"); return False
-    # o AT+RESET reiniciou o módulo -> o passo 4 (Conectar) precisa esperar o reboot
-    _GRAVA_TS = time.time()
-    LOG("✓ Rádio reforçado por BLE (9600 + PWRM0 + wake + nome). O passo 4 vai "
-        "esperar o reboot e conectar.", "ok")
-    STATUS("provisionar", "ok"); return True
+    ok = _reforcar(addr)
+    STATUS("provisionar", "ok" if ok else "fail")
+    return ok
 
 
 def act_conectar(serial, mcu):
@@ -912,25 +1027,26 @@ def act_conectar(serial, mcu):
         BLE.connect(addr)
     except Exception as e:
         LOG(f"✗ Erro ao conectar: {e}", "err"); STATUS("conectar", "fail"); return False
-    # Baud é FIXO em 2400 (provisionado no 1º boot após gravar). Se o PING não
-    # virar PONG: (a) a fechadura ainda estava terminando o provisionamento —
-    # espere a MELODIA de pronta e reconecte; (b) o wake não subiu (conectou e
-    # ela não bipou) — módulo/solda do pino de wake.
+    # Baud é FIXO em 9600 (BAUD_MODULO; provisionado no 1º boot após gravar).
+    # Se o PING não virar PONG: (a) a fechadura ainda estava terminando o
+    # provisionamento — espere a MELODIA de pronta e reconecte; (b) módulo com
+    # herança legada PWRM1 (UART dormindo) — o passo 1 conserta pelo ar.
     LOG("Conectado. A fechadura deve dar 1 bipe curto (acordou por BLE).", "hi")
     for i in range(6):
         ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=3)
         if ok:
             LOG("✓ Fechadura conectada por BLE (PONG).", "ok")
             STATUS("conectar", "ok"); return True
-    LOG("✗ Sem PONG. Se ela NÃO bipou ao conectar, o wake (PD3) não subiu — "
-        "religue a bateria (espere a melodia) e tente de novo; persistindo, "
-        "suspeite do módulo/solda.", "err")
+    LOG("✗ Sem PONG. Rode o passo 1 (ele acorda módulos dormindo pelo ar). "
+        "DIAGNÓSTICO PELO SOM ao religar a bateria: SILÊNCIO = sem energia "
+        "(bateria/BOD) · 1 bipe + 4 GRAVES = módulo surdo p/ o MCU (passo 1 "
+        "resolve) · MELODIA = firmware ok, só reconectar.", "err")
     STATUS("conectar", "fail"); return False
 
 
 def act_autoteste(serial, mcu):
     if not BLE.conectado():
-        LOG("Conecte por BLE (passo 3) antes do auto-teste.", "warn"); return False
+        LOG("Faça o passo 1 (Gravar e preparar) antes do teste.", "warn"); return False
     STATUS("autoteste", "run")
     etapas = [("Ping", "TST-PING", ["PONG"], 3), ("Buzzer", "TST-BUZ", ["OK-BUZ"], 6),
               ("LEDs", "TST-LED", ["OK-LED"], 6), ("Motor →", "TST-MOT1", ["FIM-MOT1"], 6),
@@ -963,7 +1079,7 @@ def act_teste1(serial, cmd):
     """Roda UM comando de teste e devolve {ok, resp}. A confirmação FÍSICA
     (o motor girou? apitou?) é feita no navegador e cruzada com este resultado."""
     if not BLE.conectado():
-        LOG("Conecte por BLE (passo 3) antes de testar.", "warn")
+        LOG("Faça o passo 1 (Gravar e preparar) antes de testar.", "warn")
         return {"ok": False, "resp": "", "erro": "sem BLE"}
     # Motor: aceita OK-MOT (motor JÁ começou a girar) e NÃO espera FIM-MOT — o
     # giro puxa corrente e pode dar brownout que derruba o BLE antes do FIM. Com
@@ -1029,7 +1145,7 @@ def act_renomear(serial, nome_errado):
     except Exception:
         addr2 = None
     if addr2:
-        LOG(f"✓ Módulo renomeado: '{alvo}' está anunciando. Use o passo 3 normalmente.", "ok")
+        LOG(f"✓ Módulo renomeado: '{alvo}' está anunciando. Use o passo 1 normalmente.", "ok")
         return True
     LOG("Ainda não apareceu com o nome novo — RELIGUE A BATERIA e escaneie de "
         "novo (alguns módulos só aplicam o nome no próximo boot). Se voltar com "
@@ -1053,29 +1169,36 @@ def act_consertar_modulo(serial):
         BLE.connect(addr)
     except Exception as e:
         LOG(f"✗ Erro ao conectar: {e}", "err"); return False
-    for q in ("AT+VERS?", "AT+BAUD?", "AT+MODE?", "AT+ROLE?", "AT+BEFC?", "AT+AFTC?"):
+    for q in ("AT+VERS?", "AT+BAUD?", "AT+MODE?", "AT+ROLE?", "AT+PWRM?",
+              "AT+NAME?", "AT+BEFC?", "AT+AFTC?"):
         BLE.cmd(q, ["ver", "OK", "+", "Get"], timeout=2)   # respostas vão pro log
         time.sleep(0.3)
+    # ⭐ Leia o AT+PWRM? acima: "Get:1" = AUTO-SLEEP LIGADO (herança da esteira
+    # legada) — é a causa nº1 de "módulo surdo": em 9600 a UART dele DORME e só
+    # a conexão BLE acorda (caso CH003FI002584, 07/07/2026). O conserto abaixo
+    # manda PWRM0 pelo ar de qualquer forma.
     if is10:
         # RESGATE DA FI 1.0 PELO AR: religa o trilho de energia (gate do MOSFET
         # num PIO do módulo — pino 4/5/7/8/9). Grava na NVM: BEFCFF7/AFTCFFF =
         # todos os PIOs altos (menos PIO6, p/ o wake). Assim, ao religar a
         # bateria, o módulo já sobe o gate e o MCU liga sozinho. NÃO mexe no
-        # baud (o lote 1.0 pode não ser 2400 — deixa como está).
+        # baud (o lote 1.0 pode não ser 9600 — deixa como está).
         LOG("Religando o trilho de energia da 1.0 (PIOs do MOSFET) na NVM do módulo...", "hi")
-        for c in ("AT+PIO41", "AT+PIO51", "AT+PIO71", "AT+PIO81", "AT+PIO91",
-                  "AT+BEFCFF7", "AT+AFTCFFF"):
+        for c in ("AT+PWRM0", "AT+PIO41", "AT+PIO51", "AT+PIO71", "AT+PIO81",
+                  "AT+PIO91", "AT+BEFCFF7", "AT+AFTCFFF"):
             BLE.cmd(c, ["OK", "+", "Set"], timeout=2)
             time.sleep(0.3)
         BLE.cmd("AT+RESET", ["OK", "+"], timeout=2)
         BLE.disconnect()
         LOG("✓ Config de energia gravada. AGORA: tire o USBasp, RELIGUE A BATERIA "
             "e veja se ela dá o bipe/melodia sozinha (= trilho religado). Depois "
-            "reconecte no passo 3.", "ok")
+            "refaça o passo 1.", "ok")
         time.sleep(4)
         return True
-    LOG("Forçando a UART do módulo para 2400 (AT+BAUD0) + reset...", "hi")
-    BLE.cmd("AT+BAUD0", ["OK", "+"], timeout=2)
+    LOG("Aplicando o padrão v2.10.1 pelo ar: PWRM0 (acorda a UART) + 9600 + reset...", "hi")
+    BLE.cmd("AT+PWRM0", ["OK", "+"], timeout=2)
+    time.sleep(0.4)
+    BLE.cmd("AT+BAUD2", ["OK", "+"], timeout=2)
     time.sleep(0.4)
     BLE.cmd("AT+RESET", ["OK", "+"], timeout=2)
     BLE.disconnect()
@@ -1084,7 +1207,7 @@ def act_consertar_modulo(serial):
     try:
         addr2 = BLE.scan(alvo, timeout=10.0)
         if not addr2:
-            LOG("✗ Sumiu do scan após o reset — religue a bateria e rode o passo 3.", "warn")
+            LOG("✗ Sumiu do scan após o reset — religue a bateria e rode o passo 1.", "warn")
             return False
         BLE.connect(addr2)
     except Exception as e:
@@ -1092,11 +1215,12 @@ def act_consertar_modulo(serial):
     for i in range(6):
         ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=3)
         if ok:
-            LOG("✓✓ PONG! A UART do módulo estava em baud errado — PLACA RECUPERADA. "
-                "Rode o auto-teste completo.", "ok")
+            LOG("✓✓ PONG! O módulo estava dormindo (PWRM1 legado) ou em baud "
+                "errado — PLACA RECUPERADA. Rode o auto-teste completo.", "ok")
             return True
-    LOG("✗ Sem PONG mesmo com a UART forçada a 2400 e módulo comprovadamente bom "
-        "→ solda/trilha TX-RX entre módulo e MCU = DEFEITO FÍSICO (laudo fechado).", "err")
+    LOG("✗ Sem PONG mesmo com o módulo acordado (PWRM0) a 9600 e comprovadamente "
+        "bom pelo ar → solda/trilha TX-RX entre módulo e MCU = DEFEITO FÍSICO "
+        "(laudo fechado).", "err")
     return False
 
 
@@ -1167,7 +1291,7 @@ def act_testar_hibernacao(serial, mcu):
 
 def act_ativar_hibernacao(serial, mcu):
     if not BLE.conectado():
-        LOG("Conecte por BLE (passo 3) antes de ativar a hibernação.", "warn"); return False
+        LOG("Faça o passo 1 (Gravar e preparar) antes de ativar a hibernação.", "warn"); return False
     ok, _ = BLE.cmd("TST-HIB-ON", ["OK-HIB-ON"], timeout=5)
     if ok:
         LOG("✅ Hibernação ATIVADA — vale no próximo boot. Religue a bateria.", "ok")
@@ -1178,7 +1302,7 @@ def act_ativar_hibernacao(serial, mcu):
 
 def act_desativar_hibernacao(serial, mcu):
     if not BLE.conectado():
-        LOG("Conecte por BLE (passo 3) antes de desativar a hibernação.", "warn"); return False
+        LOG("Faça o passo 1 (Gravar e preparar) antes de desativar a hibernação.", "warn"); return False
     ok, _ = BLE.cmd("TST-HIB-OFF", ["OK-HIB-OFF"], timeout=5)
     if ok:
         LOG("🔌 Hibernação desativada (modo seguro IDLE).", "ok")
@@ -1188,11 +1312,11 @@ def act_desativar_hibernacao(serial, mcu):
 
 
 def act_hibernar_seguro(serial, mcu):
-    """PASSO 5 — Hibernação segura. VALIDA o ciclo (corta a energia do MCU pelo
+    """HIBERNAÇÃO (Avançado) — segura. VALIDA o ciclo (corta a energia do MCU pelo
     MOSFET e confere se RELIGA sozinha) e SÓ ATIVA a hibernação se o corte→religa
     passar; senão deixa em IDLE seguro (a fechadura funciona 100%, só não hiberna).
     NUNCA liga às cegas — ativar é irreversível-por-cabo se o hardware não religar,
-    então o teste é o portão anti-brick. Requer o passo 4 (Conectar) feito."""
+    então o teste é o portão anti-brick. Requer o passo 1 (rádio conectado) feito."""
     if not act_testar_hibernacao(serial, mcu):
         LOG("⚠️ Hibernação NÃO validada nesta fechadura — mantida DESLIGADA (IDLE "
             "seguro). A fechadura está pronta e funciona 100%; apenas não hiberna.", "warn")
@@ -1429,6 +1553,10 @@ PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
     <button class="big" id="btn-next" style="margin-top:20px" disabled>PRÓXIMO ▶</button>
+    <!-- fechadura JÁ GRAVADA (nesta ou noutra bancada): testa direto por BLE,
+         sem cabo — pula Gravar/Validar e roda rádio→conectar→auto-teste. -->
+    <button class="big" id="btn-ble-direct" style="margin-top:10px;background:var(--muted)" disabled>
+      📶 JÁ GRAVADA — testar por BLE (sem cabo)</button>
   </div>
 
   <!-- TELA 2 -->
@@ -1448,18 +1576,19 @@ PAGE = r"""<!DOCTYPE html>
       <div class="rec-sub">No fluxo NORMAL você <b>não precisa</b> destes botões — basta seguir os passos numerados acima. Use um destes só quando o problema abaixo acontecer:</div>
       <div class="rec-item">
         <button id="btn-consertar">🩺 Consertar módulo</button>
-        <div class="rec-desc">Use se a comunicação estiver <b>saindo com lixo/travando</b>.</div>
+        <div class="rec-desc">Diagnóstico completo pelo ar (VERS/BAUD/MODE/PWRM/NAME) + conserto: <b>acorda módulo dormindo</b> (PWRM1 legado) e força 9600. Use se a comunicação estiver <b>muda/saindo com lixo</b>.</div>
       </div>
       <div class="rec-item">
         <button id="btn-renomear">🔧 Renomear módulo</button>
-        <div class="rec-desc">Use se no scan aparecer um <b>nome errado/antigo</b> em vez do serial.</div>
+        <div class="rec-desc">Manual — normalmente <b>não precisa</b>: o passo 1 já adota sozinho a fechadura com nome errado (ciclo desliga/religa). Use só se quiser renomear digitando o nome errado.</div>
       </div>
 
       <div class="rec-item" style="margin-top:16px;border-top:1px dashed var(--amber);padding-top:14px">
-        <div class="rec-title" style="font-size:14px">🔋 Hibernação (economia de bateria — avançado)</div>
-        <div class="rec-desc" style="margin-bottom:10px">O <b>passo 5</b> já testa e ativa a hibernação com segurança. Use o botão abaixo só para <b>DESLIGAR</b> a hibernação de uma fechadura (volta ao modo seguro IDLE).</div>
+        <div class="rec-title" style="font-size:14px">🔋 Hibernação (economia de bateria — AVANÇADO, opcional)</div>
+        <div class="rec-desc" style="margin-bottom:10px">NÃO faz parte do fluxo normal — a fechadura já sai no modo IDLE seguro. Use só se quiser <b>ligar</b> a hibernação profunda numa unidade (corta o MCU no repouso): o botão testa o ciclo corta→religa e só ativa se passar. O outro botão volta ao modo seguro.</div>
         <div class="row" style="flex-wrap:wrap;gap:8px">
-          <button id="btn-hib-off">🔌 Desativar hibernação (modo seguro)</button>
+          <button id="btn-hib-on">🔋 Testar e ativar hibernação</button>
+          <button id="btn-hib-off">🔌 Desativar (modo seguro)</button>
         </div>
       </div>
     </div>
@@ -1506,14 +1635,14 @@ PAGE = r"""<!DOCTYPE html>
 </div>
 
 <script>
+// FLUXO ENXUTO (3 passos que o operador vê). Provisionar+Conectar viraram
+// UMA fase interna do passo 1 (o "Gravar e preparar" encadeia gravar →
+// validar → prepara rádio → conecta, tudo sozinho). Hibernação saiu do fluxo
+// (agora é só Avançado). Os 3 passos batem com a tarefa, não com a engenharia.
 const PASSOS = [
-  ["gravar","1 · Gravar firmware","Grava o programa e as seeds (cabo USBasp)."],
-  ["validar","2 · Validar gravação","Relê o chip e confere serial + seeds. Último passo com o cabo USBasp (a partir do 3 é tudo Bluetooth)."],
-  ["provisionar","3 · Provisionar (BLE)","Configura o rádio BLE (o firmware já faz no boot; isto confirma/reforça). Roda sozinho após gravar."],
-  ["conectar","4 · Conectar (BLE)","Acha a fechadura por Bluetooth e dá um PING."],
-  ["hibernar","5 · Hibernação","Valida o ciclo corta→religa e ATIVA a hibernação — só liga se passar; senão deixa IDLE seguro."],
-  ["autoteste","6 · Auto-teste","Testa cada peça e PERGUNTA se funcionou de verdade."],
-  ["cadastrar","7 · Cadastrar no sistema","Registra só o serial no backend."],
+  ["gravar","1 · Gravar e preparar","Grava o firmware e as seeds (cabo USBasp), valida, e já PREPARA o rádio + CONECTA por Bluetooth — tudo de uma vez. Só este passo usa o cabo."],
+  ["autoteste","2 · Testar","Testa cada peça e PERGUNTA se funcionou de verdade (buzzer, LEDs, motor, bateria)."],
+  ["cadastrar","3 · Cadastrar no sistema","Registra só o serial no backend."],
 ];
 // Testes com a PERGUNTA física (o firmware pode dizer OK e a peça não funcionar).
 // Ordem: os leves primeiro; os MOTORES por ÚLTIMO (puxam corrente e podem dar
@@ -1554,10 +1683,11 @@ function onlyDigits(e){
 async function prev(){
   const s=serialAtual();
   if(s){ $("#prev").textContent="→  "+s; $("#prev").style.color="var(--ok)"; $("#btn-next").disabled=false;
+    $("#btn-ble-direct").disabled=false;
     const r=await fetch("/api/seeds?serial="+s).then(r=>r.json());
     $("#seeds").textContent="seeds: "+r.seeds.join(" · ");
   } else { $("#prev").textContent="digite o canal (CH) e o nº (FI) — completo com zeros à esquerda"; $("#prev").style.color="var(--err)";
-    $("#seeds").textContent=""; $("#btn-next").disabled=true; }
+    $("#seeds").textContent=""; $("#btn-next").disabled=true; $("#btn-ble-direct").disabled=true; }
 }
 ggg.addEventListener("input",onlyDigits); nnn.addEventListener("input",onlyDigits);
 // AO SAIR do campo, mostra já preenchido com os zeros à esquerda.
@@ -1566,12 +1696,22 @@ nnn.addEventListener("blur",()=>{ if(nnn.value) nnn.value=padFI(nnn.value); prev
 ggg.addEventListener("keydown",e=>{if(e.key==="Enter"){ if(ggg.value) ggg.value=padCH(ggg.value); nnn.focus(); }});
 nnn.addEventListener("keydown",e=>{if(e.key==="Enter"){ if(nnn.value) nnn.value=padFI(nnn.value); prev(); if(!$("#btn-next").disabled)irPassos(); }});
 $("#btn-next").onclick=irPassos;
+$("#btn-ble-direct").onclick=irPassosBle;
 
 function irPassos(){
   SERIAL=serialAtual(); MCU=$("#mcu").value;
   $("#serial-lbl").textContent=SERIAL;
   $("#tela-serial").classList.add("hide"); $("#tela-passos").classList.remove("hide");
   renderSteps();
+}
+
+// FECHADURA JÁ GRAVADA: pula o CABO (passo 1) e roda sozinho o caminho BLE —
+// prepara rádio (adoção/conserto pelo ar se preciso) → conecta → auto-teste.
+async function irPassosBle(){
+  irPassos();
+  setChip("gravar","skip");
+  if(!(await prepararRadio())) return;
+  await autoteste();
 }
 function voltar(){ $("#tela-passos").classList.add("hide"); $("#tela-serial").classList.remove("hide"); }
 
@@ -1596,15 +1736,16 @@ function renderSteps(){
   $("#btn-consertar").onclick=doConsertar;
   // renomeia o módulo pelo ar (nome residual/corrompido de gravação antiga)
   $("#btn-renomear").onclick=doRenomear;
-  // HIBERNAÇÃO (recuperação): só DESLIGAR (o passo 5 testa+ativa com segurança).
+  // HIBERNAÇÃO (Avançado, sob demanda): testar+ativar (ciclo seguro) ou desligar.
+  $("#btn-hib-on").onclick=(e)=>runStep("hibernar", e.currentTarget);
   $("#btn-hib-off").onclick=(e)=>runStep("hib-off", e.currentTarget);
 }
 
 let STEP_STATE={};
 function setChip(step,state){
   const el=$("#chip-"+step); if(!el)return;
-  el.className="chip "+(state==="pending"?"":state);
-  el.textContent={pending:"○",run:"⏳",ok:"✓",fail:"✗"}[state]||"○";
+  el.className="chip "+(state==="pending"?"":(state==="skip"?"":state));
+  el.textContent={pending:"○",run:"⏳",ok:"✓",fail:"✗",skip:"—"}[state]||"○";
   STEP_STATE[step]=state;
   atualizaPassoAtivo();
 }
@@ -1616,11 +1757,11 @@ function setChip(step,state){
 function atualizaPassoAtivo(){
   const ordem = PASSOS.map(p=>p[0]);
   let ativo = ordem.find(k=>STEP_STATE[k]==="run");
-  if(!ativo) ativo = ordem.find(k=>STEP_STATE[k]!=="ok");   // 1º pendente/falho
+  if(!ativo) ativo = ordem.find(k=>STEP_STATE[k]!=="ok" && STEP_STATE[k]!=="skip");   // 1º pendente/falho
   for(const k of ordem){
     const el=$("#step-"+k); if(!el) continue;
     el.classList.toggle("active", k===ativo);
-    el.classList.toggle("done", STEP_STATE[k]==="ok" && k!==ativo);
+    el.classList.toggle("done", (STEP_STATE[k]==="ok"||STEP_STATE[k]==="skip") && k!==ativo);
   }
 }
 
@@ -1658,18 +1799,25 @@ async function runStep(step, btn){
     body:JSON.stringify({step,serial:SERIAL,mcu:MCU,mosfet})}).then(r=>r.json()).catch(()=>({ok:false}));
   setBusy(false);
   if(r && r.need_login){ abrirLogin(); return r; }
-  // AUTO-FLUXO pós-gravação: assim que 'Gravar' passa, a bancada segue SOZINHA
-  // por validar → provisionar → conectar → hibernação, pro funcionário não
-  // esquecer de deixar a fechadura pronta. Para em qualquer falha (o operador vê
-  // o passo que travou e re-executa). Os testes físicos (auto-teste) e o cadastro
-  // seguem manuais — precisam de humano.
+  // AUTO-FLUXO do passo 1 ("Gravar e preparar"): grava → valida → prepara
+  // rádio → conecta, tudo SOZINHO — o operador vê só 1 passo. Para em qualquer
+  // falha (o REGISTRO à direita mostra onde travou). O passo 2 (Testar) fica
+  // manual: precisa do humano confirmar que apitou/girou. Hibernação NÃO roda
+  // mais aqui (virou Avançado, sob demanda).
   if(step==="gravar" && r && r.ok){
-    const v = await runStep("validar", $("#btn-validar"));      if(!(v&&v.ok)) return r;
-    const p = await runStep("provisionar", $("#btn-provisionar")); if(!(p&&p.ok)) return r;
-    const c = await runStep("conectar", $("#btn-conectar"));    if(!(c&&c.ok)) return r;
-    await runStep("hibernar", $("#btn-hibernar"));
+    setChip("gravar","run");
+    const v = await runStep("validar");   if(!(v&&v.ok)){ setChip("gravar","fail"); return r; }
+    if(!(await prepararRadio())){ setChip("gravar","fail"); return {ok:false}; }
+    setChip("gravar","ok");
   }
   return r;
+}
+// Fase interna "preparar rádio" = provisionar (confere/conserta pelo ar/adota)
+// + conectar (PONG). Usada tanto pelo passo 1 quanto pelo atalho "JÁ GRAVADA".
+async function prepararRadio(){
+  const p = await runStep("provisionar"); if(!(p&&p.ok)) return false;
+  const c = await runStep("conectar");    if(!(c&&c.ok)) return false;
+  return true;
 }
 // pede o comando ao firmware e, se físico, PERGUNTA se funcionou de verdade.
 async function teste1(t, btn){
@@ -1919,6 +2067,9 @@ class Handler(BaseHTTPRequestHandler):
         step, serial, mcu = b.get("step"), b.get("serial", ""), b.get("mcu", "m328pb")
         if step == "provisionar":
             r = act_provisionar(serial, mcu, b.get("mosfet", "8"))
+            return {"ok": bool(r)}
+        if step == "gravar":
+            r = act_gravar(serial, mcu, b.get("mosfet", "8"))
             return {"ok": bool(r)}
         if step == "hibernar":
             r = act_hibernar_seguro(serial, mcu)
