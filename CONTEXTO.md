@@ -829,3 +829,115 @@ teste ponta-a-ponta pelo app-imoveis (instalar→calibrar→abrir→fechar), bot
    isso; decidir se o Tauri será atualizado ou aposentado em favor do script.
 4. **Sentido de giro entre app-imoveis e app-tester** é invertido — garantir que a
    calibração de bancada use o mesmo app que o cliente usa em campo.
+
+## v2.10.0 (07/07/2026) — Identificação do módulo + MOSFET parametrizado + fuses com BOD
+
+Base: releitura perita dos 3 manuais oficiais da Soft (`manual/`) + datasheets
+Microchip (DS40001906C/DS40002061B/AT15007). Premissas: robustez, velocidade,
+economia de bateria, nunca falhar — e diagnóstico SEM multímetro.
+
+### 1. Identificação da FAMÍLIA do módulo (`bleIdentificar()`)
+O `AT+VERS?` devolve a família na própria string (manuais):
+`Soft AT 5.2 ver.XX` = BLE 5.2 (EFR32BG22) · `Soft AT ver.XX`/`Soft ATm...` =
+BLE-1010 (CSR-1010). O firmware agora guarda a string inteira e persiste
+família (EEPROM 915) + rev (768). Regras derivadas dos manuais:
+- **5.2 rev<04**: BEFC/AFTC/PIO/COL QUEBRADOS (só 0x000; corrigido na REV04 —
+  histórico do manual R05) → wake por `AT+STATUSx` (único que funciona).
+- **1010**: `AT+STATUS` NÃO EXISTE → wake sempre por AFTC; nunca BAUDD/UTIM/
+  UDTB/MFRD; NAME ≤12 chars (serial de 11 cabe).
+- Família desconhecida + rev<4 → conservador (STATUS + BEFC/AFTC, regra antiga).
+
+### 2. Pino do MOSFET parametrizado (EEPROM 914)
+A esteira legada usou PIO 4..9 conforme a placa (90% = 8). O byte 914 (gravado
+por `gravar.sh SERIAL [mcu] [mosfet]`, `gerar_seed.py` 4º arg, e pelo campo
+"Pino MOSFET" da bancada no passo Gravar) dirige em runtime: máscaras
+BEFC/AFTC (`mascaraPio`/`atMascara`), o corte da hibernação (`AT+PIOx0`) e o
+`AT+STATUSx` dos 5.2 rev<04. Default/legado = 8 (BEFC020/AFTC028, idêntico ao
+que já rodava). Pino 6 = gate colide com o wake (mesmo bit) — evitar.
+
+### 3. Fuses com BROWN-OUT (proteção das seeds — dossiê ATmega328PB)
+Sem BOD, bateria afundando no giro do motor = execução errática + EEPROM
+(SEEDS!) corrompida. Agora `gravar.sh`/bancada gravam:
+- **328PB (FI 1.5)**: efuse **0xF4 = BOD 4,3V** — a placa tem StepUp 5V
+  (MT3608, schema) e o SOA de 16MHz exige VCC≥3,78V; se o trilho afundar,
+  reset limpo em vez de rodar fora de spec.
+- **328/328P (FI 1.0)**: efuse **0xFD = BOD 2,7V** — trilho não confirmado 5V;
+  2,7V protege a EEPROM sem risco de reset-perpétuo.
+- lfuse continua por chip: 0xFF no PB (low-power crystal — o PB NÃO TEM
+  full-swing; 0xF7 num PB deixa o chip SEM CLOCK) e 0xF7 no 328/P (full-swing).
+
+### 4. Auto-cura do NOME no firmware (todo boot)
+Após `AT+NAME`, o firmware LÊ DE VOLTA (`AT+NAME?`) e compara com o serial —
+UART marginal garble o último byte (caso real `002FI00187<`). Mismatch →
+reescreve (até 3×). Módulo mudo p/ consulta segue o fluxo antigo às cegas.
+
+### 5. Diagnóstico de UART SEM multímetro
+- `TST-UART` → 5 linhas-padrão `UARTn:0123456789ABCDEF` (conferir integridade
+  na bancada; garble = nível/solda marginal — causa física do nome corrompido).
+- `TST-ECO<x>` → `ECO:<x>` (payload chega em MAIÚSCULAS; prova RX+TX do MCU).
+- `TST-INFO` agora reporta `MODF:` (família 5.2/1010/?) e `MOSFET:` (pino).
+
+### 6. Economia de rádio
+Provisionamento agora manda `AT+ADVI2` (advertising 100→211,25ms): ~metade do
+duty do rádio por ~+55ms médios na descoberta (dentro do recomendado p/ iOS,
+teto 1285ms). Reverter: `AT+ADVI0` pela bancada.
+
+Flash 84% / RAM 73% (538 livres). Fluxo de gravação INALTERADO:
+`./tools/gravar.sh CH003FIxxxxxx` (ou bancada) → melodia Rocky = pronta.
+Recomendação futura (revisão de placa): módulo BLE no USART1 de hardware do
+328PB (PB3/PB4, hoje só ISP) + divisor resistivo no TX-MCU→RX-módulo (o TX de
+5V viola o máximo de 3,6V do módulo — causa provável da corrupção de UART).
+
+## v2.10.1 (07/07/2026) — O caso da fechadura surda: BOD, PWRM legado e adoção pelo ar
+
+Sessão de depuração ao vivo na CH003FI002584 (regravada por engano como 002465).
+TRÊS camadas de defeito de software empilhadas — nenhum defeito de hardware:
+
+### 1. efuse 0xF4 (BOD 4,3V) = RESET PERPÉTUO — corrigido p/ 0xFD (2,7V)
+O trilho real da FI 1.5 fica abaixo de 4,3V: grava por ISP normal, mas o MCU
+nunca boota na bateria (silêncio total). Dump da FI de produção 002FI001767
+(porta do Leonardo, backup byte-a-byte em `backups/fi-porta-002FI001767/`)
+provou que a frota legada roda com **BOD DESLIGADO** (efuse 0xF7). Novo padrão:
+**0xFD (2,7V) nos dois chips** — protege as seeds sem risco de reset-perpétuo.
+`gravar.sh` + `bancada.py` corrigidos. ⚠️ Fechadura gravada com 0xF4: regravar
+só o efuse (`avrdude ... -U efuse:w:0xFD:m`).
+
+### 2. Herança legada PWRM1 = módulo SURDO por design (a grande descoberta)
+A esteira legada terminava com **AT+PWRM1 = auto-sleep LIGADO** (segredo de
+bateria do legado: módulo dorme p/ sempre; MCU liga só na conexão via STATUS8).
+Manuais (5.2 §57 / 1010 §54, idênticos): com sleep ativo e baud ≠ 2400-slow,
+**dado serial NÃO acorda o módulo** — só GND no pino 24 ou CONEXÃO BLE. Módulo
+regravado com essa herança: anuncia normal, mas é surdo a TODO AT do MCU
+(nosso PWRM0 nunca entrava — ovo-e-galinha). Sintomas: 4 bipes graves, sem
+PONG, `AT+VERS?` mudo, nome antigo preso no ar, MODF:? no TST-INFO.
+- **Fix firmware**: `AT+PWRM0` é o PRIMEIRO comando em CADA baud do PASSO 1
+  (pega a janela acordada pós-power-on do módulo) e antes de cada NAME cego;
+  flag 0xC9 virou HONESTA (só marca com módulo vivo → todo ciclo de bateria
+  re-tenta o provisionamento completo).
+- **Fix bancada (determinístico)**: a CONEXÃO BLE acorda o módulo mesmo
+  dormindo, e em **MODE2 (padrão de fábrica) ele executa AT PELO AR** (só o
+  próprio AT+MODE não muda por BLE). `receita_ar()` = PWRM0 + BAUD2 + ROLE0 +
+  TYPE0 + DELI3 + NOTI1 + ADVI2 + BEFC/AFTC + NAME + RESET. Foi exatamente
+  assim que a 002584 foi recuperada na mão (AT+PWRM? devolvia Get:1!).
+
+### 3. Bancada v2.10.1 — entende virgem × regravada, o mais automático possível
+- **Passo 3 novo**: PONG? ok → senão scan blindado (alvo/virgem/garble) →
+  senão **ADOÇÃO POR CICLO DE ENERGIA**: operador desliga/religa a bateria e a
+  bancada identifica FISICAMENTE quem sumiu/voltou do ar (2 varreduras de
+  confirmação; à prova de nome errado e de fechadura vizinha) → aplica a
+  receita_ar (renomeia p/ o serial digitado) → confere por PONG.
+- **Botão "JÁ GRAVADA — testar por BLE (sem cabo)"** na tela do serial: pula
+  Gravar/Validar (chips "—") e roda sozinho rádio → conectar → auto-teste.
+- **Consertar módulo** atualizado p/ o padrão novo: diagnóstico pelo ar inclui
+  AT+PWRM?/AT+NAME?; conserto = PWRM0 + BAUD2 (era AT+BAUD0/2400 — OBSOLETO).
+- Diagnóstico PELO SOM nas mensagens de falha: SILÊNCIO = energia/BOD ·
+  1 bipe + 4 GRAVES = módulo surdo (passo 3 resolve) · MELODIA = ok.
+- Reset TOTAL pelo botão físico (10s) confirmado em campo e mantido p/ sempre.
+
+### Estado da CH003FI002584 (cobaia da sessão)
+EEPROM correta (serial/seeds 002584, efuse 0xFD), módulo acordado (PWRM0),
+nome certo no ar, PONG + TST-BUZ + TST-INFO ok pelo ar. Falta: reset de 10s
+(ou regravar) p/ o firmware identificar a família (MODF:1010 rev 12) e tocar a
+melodia — e rodar o auto-teste completo pela bancada.
+
+Flash 85% / RAM 73% (538 livres). Fluxo de gravação INALTERADO.

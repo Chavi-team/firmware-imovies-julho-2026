@@ -8,12 +8,16 @@ que aqui NÃO geramos SerialNumber.h nem recompilamos nada: o .hex é universal 
 o serial vai só na EEPROM (endereço 769).
 
 Uso:
-    python3 gerar_seed.py CH003FI002465 [saida.bin] [fi10|fi15]
+    python3 gerar_seed.py CH003FI002465 [saida.bin] [fi10|fi15] [mosfet]
 
 Placa (byte 912 da EEPROM — o firmware universal decide os pinos por ele):
     fi15 (default) = FI 1.5: motor PB1/PB2, WS2812 no PB3
     fi10           = FI 1.0: motor PB2/PB3, LEDs discretos 7/8/9
     Sem o argumento, o canal CH001 assume fi10 (geração 1.0 de campo).
+
+Pino do MOSFET (byte 914 da EEPROM): PIO do módulo BLE que chaveia o gate de
+energia — dirige as máscaras BEFC/AFTC e o corte AT+PIOx0 da hibernação em
+runtime. 90% das FIs = 8 (default); placas antigas usaram 6 ou 7.
 
 Seed (determinística do serial, igual backend DeviceSeedHelper.php):
     seed_k = int(sha256(serial + SECRET + k)[:8], 16) % 429496729   (k = 1..4)
@@ -32,7 +36,7 @@ def get_seed(serial_number: str, seed_number: int) -> int:
     return int(sha256(s.encode()).hexdigest()[:8], 16) % SEED_MAX_RANGE
 
 
-def montar_eeprom(serial_number: str, placa: str = "fi15") -> bytearray:
+def montar_eeprom(serial_number: str, placa: str = "fi15", mosfet: int = 8) -> bytearray:
     if not serial_number.startswith("CH"):
         raise SystemExit(f"Serial deve começar com 'CH': {serial_number}")
 
@@ -62,6 +66,11 @@ def montar_eeprom(serial_number: str, placa: str = "fi15") -> bytearray:
     # placa (912): 1 = FI 1.0 (motor PB2/PB3, LEDs discretos); 0 = FI 1.5
     eeprom[912] = 0x01 if placa == "fi10" else 0x00
 
+    # pino do MOSFET (914): PIO do módulo que chaveia o gate (4..9; 8 = frota)
+    if not 4 <= mosfet <= 9:
+        raise SystemExit(f"Pino do MOSFET inválido: {mosfet} (use 4..9; 90% das FIs = 8)")
+    eeprom[914] = mosfet
+
     return eeprom
 
 
@@ -78,13 +87,15 @@ def main():
     else:
         # canal CH001 = geração FI 1.0 de campo; demais = FI 1.5
         placa = "fi10" if serial[2:5] == "001" else "fi15"
+    mosfet = int(sys.argv[4]) if len(sys.argv) > 4 else 8
 
-    eeprom = montar_eeprom(serial, placa)
+    eeprom = montar_eeprom(serial, placa, mosfet)
     with open(saida, "wb") as f:
         f.write(eeprom)
 
     print(f"Serial : {serial}")
     print(f"Placa  : {'FI 1.0' if placa == 'fi10' else 'FI 1.5'}")
+    print(f"MOSFET : PIO{mosfet}")
     for i in range(4):
         print(f"  seed{i + 1} = {get_seed(serial, i + 1)}")
     print(f"Gravado: {saida} ({len(eeprom)} bytes)")

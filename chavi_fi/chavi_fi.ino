@@ -5,15 +5,28 @@
  * não valida token, aceita tudo — mas fala o MESMO protocolo dos ~1000 apps em
  * campo (desafio -> 2 saltos -> 3 writes -> comando), então nada muda no app.
  *
- * BAUD DO MÓDULO = 2400, FIXO (frota de produção). A esteira antiga de
- * provisionamento (Firmware-Antigo/src/at.js) configura todo módulo com
- * AT+BAUD0 (= 2400 nos clones "Soft AT 5.2"), então as fechaduras em produção
- * já falam 2400. Módulo NOVO de fábrica pode vir em 9600: a config completa do
- * 1º boot (bleProvisionar) converge o módulo para 2400 ÀS CEGAS (manda
- * AT+BAUD0+AT+RESET em cada baud candidato — os clones não respondem "OK" a um
- * "AT" pelado, então detecção por resposta não é confiável). Depois do 1º boot
- * o baud está gravado no módulo (NVM) e os boots seguintes só fazem a config
- * leve (sem reset — reset a cada boot derruba a conexão e cospe lixo).
+ * BAUD DO MÓDULO = 9600 (padrão de FÁBRICA — se o módulo resetar, volta pro
+ * baud do firmware = auto-cura). O provisionamento do 1º boot converge módulos
+ * em outros bauds via sweep às cegas (AT+BAUD2+AT+RESET em cada candidato — os
+ * clones não respondem "OK" a um "AT" pelado, detecção por resposta não é
+ * confiável). Boots seguintes = só config leve (sem reset).
+ *
+ * ⭐ IDENTIFICAÇÃO DO MÓDULO (v2.10, manuais oficiais Soft 1010 REV11 + 5.2 R05):
+ * a frota mistura DOIS chips que falam a mesma AT — o AT+VERS? diz qual é:
+ *   "Soft AT 5.2 ver.XX"           -> BLE 5.2 (EFR32BG22)
+ *   "Soft AT ver.XX"/"Soft ATm..." -> BLE-1010 (CSR-1010, BT 4.1)
+ * A FAMÍLIA+REV dirigem a config: AT+STATUS só existe no 5.2; no 5.2 rev<04 o
+ * BEFC/AFTC/PIO/COL são QUEBRADOS (respondem só 0x000 — corrigido na REV04,
+ * histórico do manual R05) e o STATUS é o único wake que funciona; no 1010 o
+ * wake é SEMPRE o AFTC. Família (EEPROM 915) e rev (768) ficam persistidas.
+ *
+ * PINO DO MOSFET parametrizado (EEPROM 914, default 8): a esteira legada usou
+ * PIO 4..9 conforme a placa — as máscaras BEFC/AFTC e o corte da hibernação
+ * (AT+PIOx0) são calculadas em runtime do byte gravado pelo gravar.sh/bancada.
+ *
+ * AUTO-CURA DO NOME (v2.10): após o AT+NAME o firmware LÊ DE VOLTA (AT+NAME?)
+ * e compara com o serial — UART marginal garble o último byte (caso real:
+ * "002FI00187<") e antes só a bancada consertava; agora todo boot conserta.
  *
  * FEEDBACK SONORO/VISUAL (o instalador entende o que está acontecendo):
  *   ligar bateria: 1 bipe curto ......... "estou vivo" (se não tocar = energia)
@@ -42,7 +55,10 @@
  *   TST-MOT1  -> gira o motor sentido A, "OK-MOT1".."FIM-MOT1"
  *   TST-MOT2  -> gira o motor sentido B, "OK-MOT2".."FIM-MOT2"
  *   TST-BAT   -> "BAT:x.xx" (ADC da bateria)
- *   TST-INFO  -> SER/CAL/SEEDS/MOD/WAKE/VER, "FIM-INFO"
+ *   TST-INFO  -> SER/CAL/SEEDS/MOD/MODF/INA/PLACA/MOSFET/WAKE/VER, "FIM-INFO"
+ *   TST-UART  -> rajada-padrão "UARTn:0123456789ABCDEF" ×5 (a bancada confere a
+ *                integridade — diagnóstico de UART marginal SEM multímetro)
+ *   TST-ECO<x>-> "ECO:<x>" (eco do payload — testa RX+TX do MCU pelo túnel)
  *   TST-ALL   -> roda tudo em sequência, "FIM-TST"
  *
  * TIMING DA CALIBRAÇÃO (pegadinha do app): depois de escrever (tokens+190720,
@@ -51,9 +67,12 @@
  * PERDE e vira CALIBRACAOERROR. Por isso as respostas "11" da calibração são
  * seguradas ~1,2-1,5s e enviadas EM DOBRO (o app espera 2 notificações).
  *
- * ATmega328/328PB @ 8MHz interno (MiniCore). Módulo BLE "Soft AT 5.2" em
- * SoftwareSerial, com AT+DELI3: cada write BLE chega na UART terminado em
- * '\n', e cada linha que enviamos vira UMA notificação (o '\n' é consumido).
+ * ATmega328/328PB @ 16MHz CRISTAL (MiniCore; a placa FI 1.5 tem StepUp 5V
+ * MT3608 -> MCU a 5V, dentro do SOA de 16MHz que exige VCC>=3,78V). Módulo BLE
+ * em SoftwareSerial (PD4/PD5 — nesses pinos NÃO existe UART de hardware em
+ * nenhum 328; o USART1 do 328PB fica em PB3/PB4 = candidato p/ revisão de
+ * placa). Com AT+DELI3: cada write BLE chega na UART terminado em '\n', e cada
+ * linha que enviamos vira UMA notificação (o '\n' é consumido).
  */
 #include <EEPROM.h>
 #include <SoftwareSerial.h>
@@ -64,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.9.13"
+#define FW_VERSION   "2.10.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -144,7 +163,7 @@
 #define EE_CALIB_VERIF  4      // verifierCalibration (calibração feita)
 #define EE_SEED01       5
 #define EE_SEED02       15
-#define EE_VERS_BLE     768    // versão do módulo lida no provisionamento (3/4/0)
+#define EE_VERS_BLE     768    // REV do firmware do módulo (3, 5, 12... 0=não leu)
 #define EE_SERIAL       769    // 11 chars sem "CH"
 #define EE_MOD_CFG      910    // 0xC9 = módulo já provisionado (baud+config+nome)
 #define MOD_CFG_MAGIC   0xC9
@@ -154,6 +173,14 @@
                                // 0 = sono leve IDLE, seguro). Ativa via HIB-ON após
                                // validar o ciclo corta->religa na bancada (TST-HIB).
                                // (gravado pelo seed.bin/gerar_seed.py conforme a placa)
+#define EE_MOSFET       914    // PIO do módulo que chaveia o MOSFET (4..9; fora da
+                               // faixa/0xFF = default 8). Gravado pelo gravar.sh.
+#define EE_MOD_FAM      915    // família do módulo (FAM_*), persistida na identificação
+
+// ---- família do módulo BLE (identificada pelo AT+VERS? — manuais Soft) ----
+#define FAM_DESCONHECIDA 0
+#define FAM_1010         1     // "Soft AT ver.XX" / "Soft ATm ver.XX" (CSR-1010)
+#define FAM_52           2     // "Soft AT 5.2 ver.XX" (EFR32BG22)
 
 // ---- protocolo ----
 #define CMD_ABRIR   1
@@ -186,7 +213,9 @@ uint8_t g_pinMotorB = PIN_PB2;
 CRGB leds[NUM_LEDS];
 unsigned long seed01 = 0, seed02 = 0;
 uint8_t calibrationOk = 0;
-uint8_t g_moduloVers = 0;      // 3 (ver.03), 4 (ver.04+) ou 0 (não leu)
+uint8_t g_moduloVers = 0;      // REV do módulo (3, 5, 12...; 0 = não leu)
+uint8_t g_moduloFam = FAM_DESCONHECIDA;   // família (AT+VERS? — 1010 × 5.2)
+uint8_t g_pinMosfet = 8;       // PIO do MOSFET (EEPROM 914; default 8 = frota)
 char serialFech[12] = {0};
 volatile bool acordouBLE = false, acordouBtn = false;
 bool moduloOk = false;
@@ -278,7 +307,7 @@ void diagBaudBipes() {
         bluetooth.begin(cand[i]);
         delay(30);
         bool respondeu = bleResponde();
-        if (!respondeu) respondeu = (bleLerVersao() != 0);
+        if (!respondeu) respondeu = (bleIdentificar() != 0);
         if (respondeu) {
             delay(500);
             for (uint8_t k = 0; k <= i; k++) { beep(140, 2600); delay(180); }
@@ -394,9 +423,16 @@ bool bleVivo() {
     return false;
 }
 
-// Lê AT+VERS? e devolve a geração do módulo: 3 (ver.03), 4 (ver.04+) ou 0
-// (não respondeu). Igual ao CheckVersBLE do FI_1_5.
-uint8_t bleLerVersao() {
+// ⭐ IDENTIFICA o módulo pelo AT+VERS? — a string inteira diz a FAMÍLIA
+// (manuais oficiais: 1010 responde "Soft AT ver.XX"/"Soft ATm ver.XX"; o 5.2
+// responde "Soft AT 5.2 ver.XX") e o número diz a REV do firmware dele.
+// Preenche g_moduloFam + g_moduloVers e PERSISTE na EEPROM (telemetria/boots
+// futuros). Devolve a rev (0 = não respondeu = módulo mudo p/ consulta).
+// Regras derivadas (ver cabeçalho): 5.2 rev<04 = BEFC/AFTC quebrados -> wake
+// por STATUS; 1010 = sem STATUS, wake por AFTC. "ver.00..02" viram rev 1..2
+// via atoi; resposta com "ver." mas número ilegível vira rev=1 (conta como
+// vivo e cai no caminho conservador rev<4).
+uint8_t bleIdentificar() {
     for (uint8_t t = 0; t < 3; t++) {
         while (bluetooth.available()) bluetooth.read();
         bluetooth.print("AT+VERS?\r");
@@ -406,10 +442,51 @@ uint8_t bleLerVersao() {
         while (millis() - tt < 450) {
             if (bluetooth.available() && n < sizeof(resp) - 1) resp[n++] = bluetooth.read();
         }
-        if (strstr(resp, "ver.03") || strstr(resp, "ver.3")) return 3;
-        if (strstr(resp, "ver."))  return 4;   // achou versão e não é 03
+        char* v = strstr(resp, "ver.");
+        if (!v) continue;
+        g_moduloFam = strstr(resp, "5.2") ? FAM_52 : FAM_1010;
+        uint8_t rev = (uint8_t)atoi(v + 4);
+        if (rev == 0) rev = 1;                 // respondeu mas rev ilegível/00
+        g_moduloVers = rev;
+        EEPROM.update(EE_VERS_BLE, g_moduloVers);
+        EEPROM.update(EE_MOD_FAM, g_moduloFam);
+        return rev;
     }
-    return 0;                                  // não leu
+    return 0;                                  // não leu (NÃO zera o que já sabíamos)
+}
+
+// Máscara dos comandos BEFC/AFTC (3 dígitos hex; bit = PIO−3, manual dos dois
+// módulos). Calculada em runtime do pino do MOSFET (EEPROM 914) — a esteira
+// legada usou PIO 4..9 conforme a placa; 90% da frota = 8 (BEFC020/AFTC028).
+uint16_t mascaraPio(uint8_t pio) { return (pio >= 3 && pio <= 12) ? (uint16_t)(1u << (pio - 3)) : 0; }
+void atMascara(const char* cmd, uint16_t mask) {
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%s%03X", cmd, mask);
+    at(buf);
+}
+
+// AUTO-CURA DO NOME: lê AT+NAME? e confere se o anúncio é EXATAMENTE o serial.
+// true = confere OU o módulo não respondeu à consulta (inconclusivo — clones
+// mudos p/ consulta seguem o fluxo às cegas de sempre, sem reprovar).
+// false = respondeu um nome DIFERENTE (ex.: garble "002FI00187<") -> reescrever.
+bool bleNomeConfere() {
+    if (digitalRead(PIN_WAKE) == HIGH) return true;   // conectado: AT tunelaria
+    while (bluetooth.available()) bluetooth.read();
+    bluetooth.print("AT+NAME?\r");
+    char resp[40] = {0};
+    uint8_t n = 0;
+    unsigned long t0 = millis();
+    while (millis() - t0 < 400) {
+        if (bluetooth.available() && n < sizeof(resp) - 1) resp[n++] = bluetooth.read();
+    }
+    if (n == 0) return true;                          // mudo p/ consulta: inconclusivo
+    char* g = strstr(resp, "Get:");
+    if (!g) return strstr(resp, serialFech) != NULL;  // resposta fora do padrão
+    g += 4;
+    uint8_t i = 0;
+    while (serialFech[i] && g[i] == serialFech[i]) i++;
+    return serialFech[i] == 0 &&
+           (g[i] == 0 || g[i] == '\r' || g[i] == '\n');  // match EXATO até o fim
 }
 
 // Config LEVE — roda em TODO boot (auto-cura de drift), SEM reset, SEM nome,
@@ -435,14 +512,21 @@ void configModuloLeve() {
     // PWRM0 mantém o módulo sempre acordado e responsivo. O MCU continua dormindo
     // (powerDown) — a economia real de bateria está nele, não no módulo.
     at("AT+PWRM0");
-    at("AT+TYPE0");    // sem pareamento
-    // NOME reafirmado a CADA boot (como o changeName do FI_1_5). Fica ANTES do
-    // MODE2 por garantia (nome só era tentado no 1º boot antes; se falhasse,
-    // ficava o de fábrica). AT+NAME só vale no papel slave (ROLE0), manual pág.19.
+    at("AT+TYPE0");    // sem pareamento (TYPE1 residual = pede PIN em toda conexão)
+    // NOME reafirmado a CADA boot (como o changeName do FI_1_5), ANTES do MODE2.
+    // ⭐ v2.10 AUTO-CURA: escreve, LÊ DE VOLTA (AT+NAME?) e compara — se a UART
+    // marginal garblou o fim (caso real "002FI00187<"), REESCREVE (até 3×).
+    // Módulo mudo p/ consulta (clone): bleNomeConfere devolve true na 1ª e o
+    // fluxo fica idêntico ao antigo (1 write às cegas). Serial tem 11 chars —
+    // cabe no limite dos DOIS módulos (1010 = 12; 5.2 rev05+ = 18).
     if (serialFech[0]) {
         char nm[24];
         snprintf(nm, sizeof(nm), "AT+NAME%s", serialFech);
-        at(nm, 200);
+        for (uint8_t t = 0; t < 3; t++) {
+            at(nm, 200);
+            if (bleNomeConfere()) break;
+            DBGLN(F("[cfg] nome nao confere - reescrevendo"));
+        }
     }
     // AT+MODE2 = modo controle remoto / túnel de dados (é o PADRÃO DE FÁBRICA,
     // manual pág.8). ORDEM DA v2.7.6 (provada em bancada com PONG): MODE2 logo
@@ -466,22 +550,31 @@ void configModuloLeve() {
         at("AT+BEFCFF7");
         at("AT+AFTCFFF");
     } else if (g_hiberna) {
-        // HIBERNAÇÃO (receita do FI_1_5_400 de produção): PIO8 (MOSFET) NÃO é
-        // forçado alto -> o AT+PIO80 do dormir() consegue CORTAR o trilho.
-        //   BEFC000 = tudo baixo antes da conexão (MCU desligado no repouso)
-        //   AFTC008 = PIO6 alto depois -> borda de wake que religa o MCU
-        at("AT+BEFC000");
-        at("AT+AFTC008");
+        // HIBERNAÇÃO (receita do FI_1_5_400 de produção): o PIO do MOSFET NÃO é
+        // forçado alto -> o AT+PIOx0 do dormir() consegue CORTAR o trilho.
+        //   BEFC 000        = tudo baixo antes da conexão (MCU desligado no repouso)
+        //   AFTC mask(PIO6) = PIO6 alto depois -> borda de wake que religa o MCU
+        atMascara("AT+BEFC", 0);
+        atMascara("AT+AFTC", mascaraPio(6));
     } else {
-        // MODO NORMAL (IDLE): MOSFET SEMPRE ligado (PIO8=1 antes e depois), MCU
-        // nunca desliga — comunicação robusta, mais bateria. É a config do AT.py.
-        at("AT+BEFC020");  // MOSFET(PIO8)=1, wake(PIO6)=0 antes da conexão
-        at("AT+AFTC028");  // MOSFET(PIO8)=1, wake(PIO6)=1 depois -> borda de wake
+        // MODO NORMAL (IDLE): MOSFET SEMPRE ligado (antes e depois da conexão),
+        // MCU nunca desliga — comunicação robusta, mais bateria. Config do AT.py.
+        // Pino do MOSFET vem da EEPROM 914 (default 8 -> BEFC020/AFTC028, os
+        // valores históricos da esteira; placas com gate no 6/7 gravam o byte).
+        atMascara("AT+BEFC", mascaraPio(g_pinMosfet));                  // MOSFET=1 antes
+        atMascara("AT+AFTC", mascaraPio(g_pinMosfet) | mascaraPio(6)); // +wake depois
     }
     at("AT+PIO60");    // repouso arma a próxima borda de wake
-    // Módulos ver.03: wake por STATUS — o opcode difere por placa no firmware
-    // de produção: FI 1.0/1.5 sem mosfet usam STATUS6; a linha _400 usa STATUS8.
-    if (g_moduloVers == 3) at(placa10 ? "AT+STATUS6" : "AT+STATUS8");
+    // Wake por FAMÍLIA/REV (manuais oficiais): AT+STATUS só existe no 5.2 — no
+    // 1010 é no-op e o wake é o AFTC (que existe e funciona nos dois). No 5.2
+    // rev<04 o BEFC/AFTC é QUEBRADO (respondia só 0x000; corrigido na REV04) ->
+    // o STATUS é o ÚNICO wake que funciona nesses módulos ("ver.03" da frota).
+    // Família desconhecida + rev<4 = manda também (conservador, era a regra antiga).
+    if (g_moduloFam != FAM_1010 && g_moduloVers != 0 && g_moduloVers < 4) {
+        char st[14];
+        snprintf(st, sizeof(st), "AT+STATUS%X", placa10 ? 6 : g_pinMosfet);
+        at(st);
+    }
 }
 
 // Provisionamento COMPLETO com DESCONTAMINAÇÃO — só na 1ª vez após gravar
@@ -495,10 +588,12 @@ void configModuloLeve() {
 //    que persiste na NVM do módulo e pode até IMPEDIR O ANÚNCIO: ROLE1
 //    (módulo virou central), IMME1 (só anuncia após AT+START), ADTY errado
 //    (anúncio não-conectável), PWRM, baud e nome tortos. Volta ao default.
-//  PASSO 1 — CONVERGE para 2400: AT+BAUD0 + AT+RESET em cada baud candidato.
-//  PASSO 2 — CONFIG COMPLETA a 2400: o lote AT da esteira de produção
-//    (SHIELD1/BAUD0/PWRM1) + anti-resíduo (ROLE0/IMME0/ADTY0/START) + a config
-//    de dados/wake (configModuloLeve) + NAME + RESET final.
+//  PASSO 1 — ACORDA (PWRM0) e CONVERGE para 9600: em cada baud candidato,
+//    AT+PWRM0 (v2.10.1: auto-sleep OFF primeiro — pega a janela acordada de
+//    módulos com herança legada PWRM1) + AT+BAUD2 + AT+RESET.
+//  PASSO 2 — CONFIG COMPLETA a 9600: SHIELD1/BAUD2/PWRM0 + anti-resíduo
+//    (ROLE0/IMME0/ADTY0/START) + a config de dados/wake (configModuloLeve)
+//    + NAME + RESET final. Flag 0xC9 SÓ se o módulo deu sinal de vida.
 //
 // Custo: ~20s, uma vez por gravação (na bancada). A melodia de "pronta" só
 // toca no fim — o operador já espera por ela.
@@ -540,6 +635,16 @@ void bleProvisionar() {
         bluetooth.begin(TODOS[i]);
         delay(30);
         for (uint8_t k = 0; k < 3; k++) at("AT", 40);   // acorda o módulo
+        // ⭐ v2.10.1: PWRM0 (auto-sleep OFF) PRIMEIRO, no baud REAL do módulo.
+        // Módulo com herança legada (esteira mandava PWRM1 = auto-sleep LIGADO)
+        // fica com a UART DORMINDO — em baud != 2400-slow, dado serial NÃO o
+        // acorda (manuais 5.2 §57 / 1010 §54: só GND no pino 24 ou conexão BLE).
+        // A única brecha por UART é a JANELA ACORDADA logo após o power-on do
+        // módulo (bateria recém-ligada) — e ela fechava antes do PWRM0 antigo,
+        // que só vinha no PASSO 2 (~10s depois). Caso real: CH003FI002584,
+        // surda p/ SEMPRE até o PWRM0 entrar pelo ar (bancada). Aqui é a
+        // primeira coisa dita em CADA baud: se a janela existir, destrava já.
+        at("AT+PWRM0", 120);
         at(AT_BAUD_CMD, 250);                  // -> 9600
         at("AT+RESET", 150);
         delay(600);                            // módulo reinicia no baud novo
@@ -555,9 +660,15 @@ void bleProvisionar() {
     at("AT+ROLE0");                            // slave (ROLE1 residual = não anuncia)
     at("AT+IMME0");                            // anuncia sozinho ao ligar
     at("AT+ADTY0");                            // anúncio conectável
-    g_moduloVers = bleLerVersao();
-    DBG(F("[prov] AT+VERS? -> geracao ")); DBGLN(g_moduloVers);
-    EEPROM.update(EE_VERS_BLE, g_moduloVers);
+    // ⭐ ECONOMIA DE RÁDIO: advertising de 100ms (fábrica) -> 211,25ms (ADVI2).
+    // Corta o duty do rádio quase pela METADE com custo médio de ~+55ms na
+    // descoberta (bem dentro dos intervalos recomendados p/ iOS, teto 1285ms).
+    // No 1010 o ADVI exige RESET p/ valer — o RESET final deste provisionamento
+    // cobre. Reverter: AT+ADVI0 pela bancada.
+    at("AT+ADVI2");
+    bleIdentificar();                          // família+rev (persiste na EEPROM)
+    DBG(F("[prov] AT+VERS? -> fam ")); DBG(g_moduloFam);
+    DBG(F(" rev ")); DBGLN(g_moduloVers);
     // O AT+NAME é enviado DENTRO do configModuloLeve, ANTES do AT+MODE2 (em
     // MODE2 o clone ignora o NAME) — e é reafirmado em todo boot. Reforço extra
     // aqui em VÁRIOS BAUDS às cegas: se a convergência de baud não fechou, o
@@ -568,15 +679,19 @@ void bleProvisionar() {
         const long bd[] = {2400, 9600, 38400, 19200, 57600, 4800};
         for (uint8_t i = 0; i < sizeof(bd) / sizeof(long); i++) {
             bluetooth.begin(bd[i]); delay(30);
-            at("AT", 50); at(nm, 180);
+            at("AT", 50); at("AT+PWRM0", 100); at(nm, 180);   // v2.10.1: acorda antes do nome
         }
         bluetooth.begin(BAUD_MODULO); delay(100);
     }
     configModuloLeve();
     at("AT+START", 150);                       // se IMME1 residual, inicia o anúncio
-    // Flag ANTES do reset final: se a bateria afundar durante o reset/espera,
-    // o provisionamento não fica re-rodando (pesado) em todo boot.
-    EEPROM.update(EE_MOD_CFG, MOD_CFG_MAGIC);
+    // ⭐ v2.10.1: a flag SÓ é gravada se o módulo deu SINAL DE VIDA. Módulo mudo
+    // (herança PWRM1 dormindo, UART com problema) fica SEM a flag -> todo boot
+    // re-tenta o provisionamento completo (cada ciclo de bateria = nova janela
+    // acordada do módulo). Se vivo, marca ANTES do reset (bateria afundando no
+    // reset não re-roda o pesado à toa — motivo original da flag).
+    if (bleVivo()) EEPROM.update(EE_MOD_CFG, MOD_CFG_MAGIC);
+    else DBGLN(F("[prov] modulo MUDO - flag nao marcada (re-tenta no proximo boot)"));
     at("AT+RESET", 150);
     delay(1500);                               // BAUD/NAME valem após o reset
     while (bluetooth.available()) bluetooth.read();
@@ -776,11 +891,18 @@ void enviaInfo() {
     enviaLinha(buf);
     snprintf(buf, sizeof(buf), "MOD:%s", moduloOk ? "OK" : "SEM-AT");
     enviaLinha(buf);
+    // Família do módulo identificada pelo AT+VERS? (5.2 = EFR32BG22; 1010 =
+    // CSR-1010; ? = nunca respondeu à consulta — clone ou UART marginal).
+    snprintf(buf, sizeof(buf), "MODF:%s",
+             g_moduloFam == FAM_52 ? "5.2" : g_moduloFam == FAM_1010 ? "1010" : "?");
+    enviaLinha(buf);
     snprintf(buf, sizeof(buf), "INA:%s", inaOk ? "OK" : "SEM");  // batente por corrente
     enviaLinha(buf);
     snprintf(buf, sizeof(buf), "PLACA:%s", placa10 ? "1.0" : "1.5");
     enviaLinha(buf);
-    snprintf(buf, sizeof(buf), "WAKE:v%02u", g_moduloVers);   // 03, 04 ou 00 (não leu)
+    snprintf(buf, sizeof(buf), "MOSFET:%u", g_pinMosfet);     // PIO do gate (EEPROM 914)
+    enviaLinha(buf);
+    snprintf(buf, sizeof(buf), "WAKE:v%02u", g_moduloVers);   // rev do módulo (00 = não leu)
     enviaLinha(buf);
     enviaLinha("VER:" FW_VERSION);
     enviaLinha("FIM-INFO");
@@ -804,6 +926,27 @@ void testeBancada(const String& t) {
     if (t.startsWith("TST-BAT"))  { enviaBateria(); return; }
     if (t.startsWith("TST-INFO")) { enviaInfo(); return; }
     if (t.startsWith("TST-ROCKY")) { melodiaRocky(); enviaLinha("OK-ROCKY"); return; }
+    // DIAGNÓSTICO DE UART SEM MULTÍMETRO: conectado, cada byte MCU<->app passa
+    // pela MESMA UART MCU<->módulo — então dá pra medir a saúde dela por
+    // software. TST-UART manda 5 linhas-padrão conhecidas; a bancada confere a
+    // integridade (garble = nível/solda marginal — a causa física do nome
+    // corrompido). TST-ECO<x> devolve "ECO:<x>" = prova o caminho RX+TX.
+    if (t.startsWith("TST-UART")) {
+        for (uint8_t i = 0; i < 5; i++) {
+            char buf[28];
+            snprintf(buf, sizeof(buf), "UART%u:0123456789ABCDEF", i);
+            enviaLinha(buf);
+            delay(GAP_NOTIF_MS);
+        }
+        enviaLinha("FIM-UART");
+        return;
+    }
+    if (t.startsWith("TST-ECO")) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "ECO:%s", t.c_str() + 7);
+        enviaLinha(buf);
+        return;
+    }
     // Prova do mecanismo de hibernação. LIÇÃO da bancada (12:37): com um
     // cliente CONECTADO o módulo está em modo túnel e NÃO interpreta AT do
     // MCU (o "AT+PIO80" apareceu como texto no cliente). Por isso a ordem de
@@ -837,10 +980,12 @@ void testeBancada(const String& t) {
             enviaLinha("HIB-FALHOU-DROP");
             return;
         }
-        at("AT+BEFC000", 200);               // ⭐ libera o PIO8 (senão BEFC020 re-liga)
+        atMascara("AT+BEFC", 0);             // ⭐ libera o gate (senão o BEFC re-liga)
         at("AT+PIO60", 200);                 // arma a borda de wake (PIO6 baixo)
         EEPROM.update(EE_HIB, 1);            // marca "desligou hibernando" p/ o wake
-        at("AT+PIO80", 60);                  // CORTA o MOSFET -> MCU morre se cortou
+        { char pio[12];                      // corta pelo PIO do MOSFET (EEPROM 914)
+          snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
+          at(pio, 60); }                     // CORTA o MOSFET -> MCU morre se cortou
         delay(3000);                         // se cortou, nunca passa daqui
         EEPROM.update(EE_HIB, 0);
         beep(160, 400); beep(160, 400); beep(160, 400);   // 3 graves = NÃO cortou
@@ -998,7 +1143,9 @@ void dormir() {
     if (g_hiberna && !placa10 && digitalRead(PIN_WAKE) == LOW) {
         at("AT+DROP", 200);
         at("AT+PIO60", 100);      // arma a borda de wake (PIO6 baixo)
-        at("AT+PIO80", 60);       // corta o MOSFET -> MCU morre aqui se cortou
+        char pio[12];             // corta pelo PIO do MOSFET (EEPROM 914, default 8)
+        snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
+        at(pio, 60);              // corta o MOSFET -> MCU morre aqui se cortou
         delay(150);
     }
     acordouBLE = false; acordouBtn = false;
@@ -1070,7 +1217,12 @@ void setup() {
     inaOk = ina219.begin();
     if (inaOk) ina219.powerSave(true);
     g_moduloVers = EEPROM.read(EE_VERS_BLE);
-    if (g_moduloVers != 3 && g_moduloVers != 4) g_moduloVers = 0;
+    if (g_moduloVers == 0xFF || g_moduloVers > 40) g_moduloVers = 0;  // vazio/lixo
+    g_moduloFam = EEPROM.read(EE_MOD_FAM);
+    if (g_moduloFam > FAM_52) g_moduloFam = FAM_DESCONHECIDA;
+    // Pino do MOSFET (gravado pelo gravar.sh/bancada; 90% da frota = 8).
+    g_pinMosfet = EEPROM.read(EE_MOSFET);
+    if (g_pinMosfet < 4 || g_pinMosfet > 9) g_pinMosfet = 8;
     g_wakeHib = (EEPROM.read(EE_HIB) == 1);
     if (g_wakeHib) EEPROM.update(EE_HIB, 0);
     g_hiberna = (EEPROM.read(EE_HIBERNA) == 1);   // hibernação por MOSFET ligada?
@@ -1081,7 +1233,7 @@ void setup() {
     DBG(F(" seeds=")); DBG((seed01 && seed02) ? F("ok") : F("VAZIAS"));
     DBG(F(" versBLE=")); DBGLN(g_moduloVers);
 
-    // Rádio: 2400 fixo. 1º boot após gravar = provisionamento completo
+    // Rádio: 9600 fixo (BAUD_MODULO). 1º boot após gravar = provisionamento completo
     // (converge baud + config + nome + reset); boots seguintes = config leve.
     // Boot de WAKE da hibernação = caminho RÁPIDO: o módulo já está configurado
     // e tem um app conectado ESPERANDO — nada de config/melodia, só atender.
@@ -1102,18 +1254,20 @@ void setup() {
         DBGLN(F("[boot] conectado - provisionamento adiado"));
     } else {
         configModuloLeve();                        // caminho rápido: 9600 direto
-        moduloOk = (bleLerVersao() != 0);
+        moduloOk = (bleIdentificar() != 0);
         for (uint8_t t = 0; !moduloOk && t < 2 && digitalRead(PIN_WAKE) == LOW; t++) {
             DBG(F("[boot] 9600 falhou - sweep passada ")); DBGLN(t + 1);
             bleProvisionar();                      // converte de qualquer baud -> 9600
-            moduloOk = (bleLerVersao() != 0);
+            moduloOk = (bleIdentificar() != 0);
         }
     }
-    EEPROM.update(EE_MOD_CFG, MOD_CFG_MAGIC);       // marca provisionado
     // Verifica o módulo com RETRY p/ NÃO dar 4 beeps à toa: logo após o
     // provisionamento (AT+RESET) o módulo fica grogue e não responde AT+VERS? na
     // 1ª — era o falso "mudo" que tocava 4 graves mesmo com o BLE OK depois.
-    for (uint8_t t = 0; !moduloOk && t < 5; t++) { delay(250); moduloOk = (bleLerVersao() != 0); }
+    for (uint8_t t = 0; !moduloOk && t < 5; t++) { delay(250); moduloOk = (bleIdentificar() != 0); }
+    // v2.10.1: a flag de provisionado é HONESTA — só marca com o módulo vivo
+    // (mudo fica sem flag e o próximo boot re-tenta na janela acordada dele).
+    if (moduloOk) EEPROM.update(EE_MOD_CFG, MOD_CFG_MAGIC);
     DBG(F("[boot] moduloOk=")); DBGLN(moduloOk);
 
     // Feedback do boot: o aviso curto de sucesso toca na CONEXÃO (OK+CONN), não aqui.
