@@ -975,3 +975,19 @@ FUTURO, precisa validação (alguns módulos clones não geram a borda de wake).
 bancada (opção "FI 1.5 sem MOSFET"), auto-teste + abrir/fechar, e desligar/religar
 a bateria pra confirmar o wake pelo PD3. NÃO fazer merge no develop sem isso.
 Reverter: `git checkout develop`.
+
+## v2.11.1 (08/07/2026) — Placa sem MOSFET: caso encerrado (usa a config NORMAL)
+
+Validado em bancada E no app (dev, placa Chavi v2-6 / CH002): a placa FI 1.5
+SEM MOSFET funciona PERFEITA com o firmware/config normal de FI 1.5. Prova
+decisiva: botão físico responde em repouso = o MCU dela é SEMPRE alimentado
+(igual à com-MOSFET com o gate seguro). Os comandos de MOSFET (BEFC020 etc.)
+são inócuos sem o gate; o wake segue pelo PIO6.
+
+→ A "variante sem MOSFET" da v2.11.0 (BEFC000/AFTC008/STATUS6) era desnecessária
+e ATRAPALHAVA (deixava o PIO6 baixo em repouso — F01/lentidão no app). REMOVIDA
+por inteiro na v2.11.1: firmware ignora o byte 916 (QUEIMADO — não reusar sem
+apagar a frota), gerar_seed/bancada zeram o byte (regravação cura placas beta),
+e o select da bancada volta a só "FI 1.5" e "FI 1.0".
+
+Regra operacional: placa sem MOSFET → gravar como "FI 1.5" normal.

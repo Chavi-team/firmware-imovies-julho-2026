@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.11.0"
+#define FW_VERSION   "2.11.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -176,9 +176,9 @@
 #define EE_MOSFET       914    // PIO do módulo que chaveia o MOSFET (4..9; fora da
                                // faixa/0xFF = default 8). Gravado pelo gravar.sh.
 #define EE_MOD_FAM      915    // família do módulo (FAM_*), persistida na identificação
-#define EE_SEM_MOSFET   916    // 1 = placa FI 1.5 SEM MOSFET (MCU sempre alimentado
-                               // direto; wake/status no PIO6 -> BEFC000/AFTC008/STATUS6).
-                               // default 0 = FI 1.5 com MOSFET (BEFC020/AFTC028/STATUS8)
+// 916: QUEIMADO — foi a "variante sem MOSFET" (v2.11.0, removida na v2.11.1:
+// provado em bancada+app que a placa sem MOSFET funciona com a config NORMAL,
+// pois o MCU dela é sempre alimentado). Não reusar o byte sem apagar a frota.
 
 // ---- família do módulo BLE (identificada pelo AT+VERS? — manuais Soft) ----
 #define FAM_DESCONHECIDA 0
@@ -224,7 +224,6 @@ volatile bool acordouBLE = false, acordouBtn = false;
 bool moduloOk = false;
 bool g_wakeHib = false;        // este boot foi um "acordar da hibernação"
 bool g_hiberna = false;        // HIBERNAÇÃO por corte de MOSFET ligada (EE_HIBERNA)
-bool g_semMosfet = false;      // placa FI 1.5 SEM MOSFET (EE_SEM_MOSFET) — wake no PIO6
 bool g_sessaoConectada = false; // já tocou a melodia de "conectou" nesta sessão BLE
 void atenderBotao();           // usada pelo atenderApp (definida mais abaixo)
 
@@ -560,13 +559,6 @@ void configModuloLeve() {
         //   AFTC mask(PIO6) = PIO6 alto depois -> borda de wake que religa o MCU
         atMascara("AT+BEFC", 0);
         atMascara("AT+AFTC", mascaraPio(6));
-    } else if (g_semMosfet) {
-        // VARIANTE SEM MOSFET (placa idêntica à FI 1.5, mas sem o gate de energia):
-        // o MCU é sempre alimentado direto, então NÃO há PIO8 pra segurar. O PIO6
-        // é só o wake/status -> PD3. Valores da esteira do dev (config comprovada):
-        //   BEFC000 = nada alto antes da conexão · AFTC008 = só PIO6 alto depois.
-        atMascara("AT+BEFC", 0);              // sem MOSFET: nada segurado antes
-        atMascara("AT+AFTC", mascaraPio(6));  // só o PIO6 (wake) sobe na conexão
     } else {
         // MODO NORMAL (IDLE): MOSFET SEMPRE ligado (antes e depois da conexão),
         // MCU nunca desliga — comunicação robusta, mais bateria. Config do AT.py.
@@ -582,10 +574,8 @@ void configModuloLeve() {
     // o STATUS é o ÚNICO wake que funciona nesses módulos ("ver.03" da frota).
     // Família desconhecida + rev<4 = manda também (conservador, era a regra antiga).
     if (g_moduloFam != FAM_1010 && g_moduloVers != 0 && g_moduloVers < 4) {
-        // pino do STATUS: FI 1.0 e SEM-MOSFET = PIO6 (o wake); FI 1.5 c/ MOSFET = PIO8.
-        uint8_t statusPin = (placa10 || g_semMosfet) ? 6 : g_pinMosfet;
         char st[14];
-        snprintf(st, sizeof(st), "AT+STATUS%X", statusPin);
+        snprintf(st, sizeof(st), "AT+STATUS%X", placa10 ? 6 : g_pinMosfet);
         at(st);
     }
 }
@@ -913,9 +903,7 @@ void enviaInfo() {
     enviaLinha(buf);
     snprintf(buf, sizeof(buf), "PLACA:%s", placa10 ? "1.0" : "1.5");
     enviaLinha(buf);
-    // MOSFET: pino do gate; "SEM" na variante sem MOSFET (wake/status no PIO6).
-    if (g_semMosfet) snprintf(buf, sizeof(buf), "MOSFET:SEM");
-    else             snprintf(buf, sizeof(buf), "MOSFET:%u", g_pinMosfet);
+    snprintf(buf, sizeof(buf), "MOSFET:%u", g_pinMosfet);     // PIO do gate (EEPROM 914)
     enviaLinha(buf);
     snprintf(buf, sizeof(buf), "WAKE:v%02u", g_moduloVers);   // rev do módulo (00 = não leu)
     enviaLinha(buf);
@@ -1241,10 +1229,7 @@ void setup() {
     g_wakeHib = (EEPROM.read(EE_HIB) == 1);
     if (g_wakeHib) EEPROM.update(EE_HIB, 0);
     g_hiberna = (EEPROM.read(EE_HIBERNA) == 1);   // hibernação por MOSFET ligada?
-    g_semMosfet = (EEPROM.read(EE_SEM_MOSFET) == 1);  // placa FI 1.5 sem MOSFET?
-    if (g_semMosfet) g_hiberna = false;           // sem MOSFET não há o que cortar
-    DBG(F("[boot] hiberna=")); DBG(g_hiberna);
-    DBG(F(" semMosfet=")); DBGLN(g_semMosfet);
+    DBG(F("[boot] hiberna=")); DBGLN(g_hiberna);
 
     DBG(F("[boot] serial=")); DBG(serialFech[0] ? serialFech : "(fabrica)");
     DBG(F(" calib=")); DBG(calibrationOk);

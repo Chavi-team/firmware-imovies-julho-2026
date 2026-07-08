@@ -36,8 +36,7 @@ def get_seed(serial_number: str, seed_number: int) -> int:
     return int(sha256(s.encode()).hexdigest()[:8], 16) % SEED_MAX_RANGE
 
 
-def montar_eeprom(serial_number: str, placa: str = "fi15", mosfet: int = 8,
-                  sem_mosfet: bool = False) -> bytearray:
+def montar_eeprom(serial_number: str, placa: str = "fi15", mosfet: int = 8) -> bytearray:
     if not serial_number.startswith("CH"):
         raise SystemExit(f"Serial deve começar com 'CH': {serial_number}")
 
@@ -72,9 +71,7 @@ def montar_eeprom(serial_number: str, placa: str = "fi15", mosfet: int = 8,
         raise SystemExit(f"Pino do MOSFET inválido: {mosfet} (use 4..9; 90% das FIs = 8)")
     eeprom[914] = mosfet
 
-    # variante SEM MOSFET (916): placa FI 1.5 sem o gate de energia — o firmware
-    # usa BEFC000/AFTC008/STATUS6 (wake/status no PIO6) em vez de PIO8.
-    eeprom[916] = 0x01 if sem_mosfet else 0x00
+    # 916 QUEIMADO (ex-variante sem MOSFET, removida na v2.11.1) — fica 0.
 
     return eeprom
 
@@ -93,16 +90,13 @@ def main():
         # canal CH001 = geração FI 1.0 de campo; demais = FI 1.5
         placa = "fi10" if serial[2:5] == "001" else "fi15"
     mosfet = int(sys.argv[4]) if len(sys.argv) > 4 else 8
-    # 5º arg: "1"/"nm" = placa FI 1.5 SEM MOSFET (wake/status no PIO6)
-    sem_mosfet = len(sys.argv) > 5 and sys.argv[5].strip().lower() in ("1", "nm", "sem")
-
-    eeprom = montar_eeprom(serial, placa, mosfet, sem_mosfet)
+    eeprom = montar_eeprom(serial, placa, mosfet)
     with open(saida, "wb") as f:
         f.write(eeprom)
 
     print(f"Serial : {serial}")
-    print(f"Placa  : {'FI 1.0' if placa == 'fi10' else ('FI 1.5 SEM MOSFET' if sem_mosfet else 'FI 1.5')}")
-    print(f"MOSFET : {'SEM (wake no PIO6)' if sem_mosfet else f'PIO{mosfet}'}")
+    print(f"Placa  : {'FI 1.0' if placa == 'fi10' else 'FI 1.5'}")
+    print(f"MOSFET : PIO{mosfet}")
     for i in range(4):
         print(f"  seed{i + 1} = {get_seed(serial, i + 1)}")
     print(f"Gravado: {saida} ({len(eeprom)} bytes)")
