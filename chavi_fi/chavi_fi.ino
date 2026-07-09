@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.11.1"
+#define FW_VERSION   "2.12.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -1122,18 +1122,30 @@ void atenderBotao() {
     }
 }
 
-// dormir = SONO LEVE (SLEEP_MODE_IDLE). ⭐ MUDANÇA-CHAVE (v2.9.1):
-// Com CRISTAL de 16MHz, o powerDown PARA o oscilador e ele leva ~65ms p/ voltar
-// ao acordar — a 9600 isso ENGOLE a mensagem inteira (dezenas de bytes). Era a
-// causa do "conecta, motor gira DENTRO da janela, mas o TST-PING FORA da janela
-// não vira PONG": o MCU dormia profundo e o comando se perdia no arranque do
-// cristal. No IDLE o oscilador CONTINUA rodando -> o wake por dado (PCINT do RX
-// do SoftwareSerial no PD4) é INSTANTÂNEO e o byte NÃO se perde. Acorda também
-// por PD3 (conexão) e pelo botão.
-// ⚠️ NÃO manda mais AT+DROP: derrubava a conexão a cada sono. E conectado (MODE2
-// túnel) um "AT+..." vazaria como DADO pro app. Nada de AT aqui.
-// Custo: consumo maior (o clock não desliga). A hibernação por MOSFET + wake por
-// PD3 (bateria) volta DEPOIS que a comunicação estiver 100% confiável.
+// dormir = SONO EM DOIS NÍVEIS (⭐ v2.12, base da economia de bateria):
+//
+//  · DESCONECTADO (PD3 LOW — 99,9% do tempo) -> SLEEP_MODE_PWR_DOWN (MCU ~µA).
+//    Em power-down, interrupt por BORDA (INT0/INT1) NÃO dispara (a detecção de
+//    borda precisa do clkIO, que para) — por isso o wake da CONEXÃO usa o
+//    PCINT19 (PD3), habilitado no MESMO grupo PCINT2 que o SoftwareSerial já
+//    usa pro RX (PD4): o ISR dele atende o evento à toa, mas o wake acontece.
+//    Botão = INT0 por NÍVEL LOW (nível funciona em power-down). O cristal de
+//    16MHz demora a religar no acordar — SEM problema aqui: quem acorda é a
+//    CONEXÃO (PD3), e o app ainda leva centenas de ms até o 1º write. Módulo
+//    clone sem borda no PIO6 ("ver.12"): os DADOS no RX (PCINT20) acordam; o
+//    1º write pode se perder no arranque do cristal e o app/bancada retransmite
+//    (comportamento antigo documentado — só vale pros clones).
+//
+//  · CONECTADO (PD3 HIGH) -> SLEEP_MODE_IDLE (lição da v2.9.1): o oscilador
+//    continua rodando, wake por dado é INSTANTÂNEO e nenhum byte se perde ->
+//    o 2º/3º/N-ésimo comando NA MESMA conexão funcionam. Power-down aqui era
+//    o bug "2º comando não acontece; fechar o app e reabrir funciona" (o
+//    OK+CONN da reconexão acordava o MCU antes do comando; na mesma conexão o
+//    próprio comando era o despertador e morria no arranque do cristal).
+//
+// ADC desligado durante o power-down (restaurado ao acordar) + BOD desligado
+// durante o sono (sleep_bod_disable; religa sozinho no wake).
+// ⚠️ NÃO manda AT aqui: conectado (MODE2 túnel) vazaria como DADO pro app.
 // Motor fica OUTPUT LOW (nunca Hi-Z — evita shoot-through na ponte H).
 void dormir() {
     motorPara();
@@ -1153,16 +1165,46 @@ void dormir() {
     }
     acordouBLE = false; acordouBtn = false;
     g_sessaoConectada = false;   // sessão encerrou -> melodia toca de novo no próximo OK+CONN
-    attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), isrBtn, FALLING);
-    attachInterrupt(digitalPinToInterrupt(PIN_WAKE), isrBLE, RISING);
-    set_sleep_mode(SLEEP_MODE_IDLE);
-    cli();
-    sleep_enable();
-    sei();
-    sleep_cpu();                 // acorda em QUALQUER interrupção (PCINT do RX,
-    sleep_disable();             // INT1/PD3 na conexão, INT0/botão) — sem latência
-    detachInterrupt(digitalPinToInterrupt(PIN_BUTTON));
-    detachInterrupt(digitalPinToInterrupt(PIN_WAKE));
+
+    if (digitalRead(PIN_WAKE) == LOW) {
+        // ---- DESCONECTADO: PWR_DOWN profundo ----
+        attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), isrBtn, LOW);
+        PCICR  |= _BV(PCIE2);          // grupo PCINT2 ligado (o SoftwareSerial já liga,
+        PCMSK2 |= _BV(PCINT19);        // garantia barata) + PD3 acorda na conexão
+        uint8_t adcsraSalvo = ADCSRA;
+        ADCSRA &= ~_BV(ADEN);          // ADC off no sono profundo
+        set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+        cli();
+        // Re-checa JÁ SEM interrupts: se a conexão/botão/dado chegou entre o
+        // digitalRead lá de cima e este cli(), NÃO dorme (senão o evento que
+        // já foi atendido pelo ISR se perderia e o MCU dormiria conectado).
+        // sei()+sleep_cpu() consecutivos são atômicos (a instrução seguinte ao
+        // SEI executa antes de qualquer interrupt pendente — garantia do AVR).
+        if (digitalRead(PIN_WAKE) == LOW && !acordouBtn && !bluetooth.available()) {
+            sleep_enable();
+            sleep_bod_disable();       // BOD off SÓ durante o sono
+            sei();
+            sleep_cpu();
+            sleep_disable();
+        }
+        sei();
+        ADCSRA = adcsraSalvo;
+        PCMSK2 &= ~_BV(PCINT19);
+        detachInterrupt(digitalPinToInterrupt(PIN_BUTTON));
+        if (digitalRead(PIN_WAKE) == HIGH) acordouBLE = true;
+    } else {
+        // ---- CONECTADO: IDLE (wake instantâneo, byte nenhum se perde) ----
+        attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), isrBtn, FALLING);
+        attachInterrupt(digitalPinToInterrupt(PIN_WAKE), isrBLE, RISING);
+        set_sleep_mode(SLEEP_MODE_IDLE);
+        cli();
+        sleep_enable();
+        sei();
+        sleep_cpu();
+        sleep_disable();
+        detachInterrupt(digitalPinToInterrupt(PIN_BUTTON));
+        detachInterrupt(digitalPinToInterrupt(PIN_WAKE));
+    }
 }
 
 void setup() {
@@ -1178,6 +1220,23 @@ void setup() {
     pinMode(PIN_WAKE, INPUT);
     motorPara();
 
+    // ⭐ v2.12 — ECONOMIA ESTÁTICA (vale no ativo, no IDLE e no power-down).
+    // NÃO desligar: TWI (INA219), TIM0 (millis), TIM1/TIM2 (tone/core),
+    // USART0 (debug), ADC (bateria — desligado só durante o power-down).
+    PRR  |= _BV(PRSPI);          // SPI nunca é usado (WS2812 é bit-bang)
+    ACSR |= _BV(ACD);            // comparador analógico nunca é usado
+    // Extras do 328PB (FI 1.5). O hex universal é compilado p/ 328P, então os
+    // registradores novos do PB não têm NOME aqui — endereços conforme
+    // iom328pb.h/DS40001906. No 328/328P real (FI 1.0) são reservados, por
+    // isso o gate por placa.
+    if (!placa10) {
+        *(volatile uint8_t *)0x2D &= (uint8_t)~0x0F;  // DDRE : PE0..PE3 entrada
+        *(volatile uint8_t *)0x2E |= 0x0F;   // PORTE: pullup — PE0..3 não têm
+                                             // trilha na placa; flutuando drenam
+        *(volatile uint8_t *)0x64 |= 0x10;   // PRR0.PRUSART1 (UART1 ociosa)
+        *(volatile uint8_t *)0x65 |= 0x3D;   // PRR1: TIM3|SPI1|TIM4|PTC|TWI1
+    }
+
     // ESTOU VIVO — a PRIMEIRA coisa, antes de tudo. Beep curto e AGUDO ao energizar.
     // Se não tocar = hardware/energia.
     beep(70, 2600);
@@ -1188,6 +1247,9 @@ void setup() {
 #endif
 
     randomSeed(analogRead(A0) ^ micros());
+    pinMode(A0, INPUT_PULLUP);   // v2.12: A0 só serve pra semente (flutuando de
+                                 // propósito na leitura acima); depois dela, pullup
+                                 // pra não ficar flutuando o resto do tempo
 
     // LEDs inicializados e APAGADOS. Nada aceso de forma CONTÍNUA no boot: os 3
     // WS2812 puxam corrente e, numa bateria fraca, seguravam o trilho baixo e

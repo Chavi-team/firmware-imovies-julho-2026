@@ -80,17 +80,24 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.11.1"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.12.0"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.11.1"
-VERSION_DATE = "2026-07-07"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Placas SEM MOSFET: usar a opcao FI 1.5 normal (provado em bancada+app que funcionam com a config padrao — a opcao beta 'sem MOSFET' da v2.11.0 foi removida) · FLUXO ENXUTO de 3 passos (Gravar-e-preparar → Testar → Cadastrar; provisionar+conectar unificados; hibernação saiu p/ Avançado e não roda mais automática) · BOD corrigido p/ 2,7V (0xFD — 4,3V dava reset perpétuo, caso 002584) · destrava módulos com herança legada PWRM1 (firmware manda PWRM0 primeiro em todo baud; bancada conserta PELO AR) · ADOÇÃO automática por ciclo de energia · teste direto por BLE sem regravar"
+FIRMWARE_VERSION = "2.12.0"
+VERSION_DATE = "2026-07-09"               # data desta versão (ISO; bump a cada release)
+VERSION_NOTES = "Firmware v2.12.0: POWER-DOWN real quando DESCONECTADA (MCU em µA; conectada segue IDLE — o 2º comando na MESMA conexão funciona) + periféricos ociosos sem clock + pullup nos pinos PE do 328PB · MODO DEV opcional (rodar com BANCADA_DEV=1: executa só Gravar/Validar; demais passos PULADOS com aviso; cadastro BLOQUEADO) · tools/advi_test.py p/ experimento de advertising (ADVI) medido · mensagens de erro mais claras"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
 # que o workflow de release atualiza a cada versão. Leitura sem login (raw).
 BEACON_URL = "https://raw.githubusercontent.com/Chavi-team/chavi-bancada-latest/main/latest.json"
+
+# ⚡ MODO DEV (opt-in explícito: BANCADA_DEV=1 no ambiente) — para iterar
+# firmware rápido na mesa. Executa DE VERDADE só Gravar e Validar; os demais
+# passos são PULADOS com aviso claro no log (nunca fingem aprovação) e o
+# CADASTRO é BLOQUEADO (nenhum device de teste vaza pro backend). O header da
+# UI mostra o badge. Produção = rodar SEM a variável (fluxo completo).
+DEV_MODE = os.environ.get("BANCADA_DEV", "") == "1"
 
 # snapshot compartilhado (preenchido em background; lido pelo endpoint)
 _UPDATE = {"checado": False, "current": BANCADA_VERSION,
@@ -680,8 +687,9 @@ def _exec(cmd):
     try:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, bufsize=1)
-    except FileNotFoundError as e:
-        LOG(f"comando não encontrado: {e}", "err")
+    except FileNotFoundError:
+        LOG(f"comando não encontrado: '{cmd[0]}' — verifique se está instalado "
+            f"e no PATH", "err")
         return 1, ""
     out = []
     for ln in p.stdout:
@@ -1953,6 +1961,12 @@ async function updateCheck(tent){
   if($("#brand-ver")) $("#brand-ver").title =
     `Bancada v${d.current} (${fmtData(d.date)}) · firmware v${d.firmware}`+(d.notes?`\n${d.notes}`:"");
   const st=$("#bv-status");
+  if(d.dev){                                 // ⚡ MODO DEV: badge fixo, vence tudo
+    if(st){ st.className="bv-old";
+      st.textContent="⚡ MODO DEV — só grava/valida; passos pulados; cadastro bloqueado";
+      st.onclick=null; }
+    return;
+  }
   if(!d.checado){                            // checagem ainda rodando: re-tenta
     if(st){ st.className="bv-check"; st.textContent="verificando atualização…"; st.onclick=null; }
     if((tent||0)<5) setTimeout(()=>updateCheck((tent||0)+1), 2500);
@@ -2014,7 +2028,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/state":
             self._send(200, {"logged": BACKEND.tem_token()}); return
         if self.path == "/api/update-check":
-            self._send(200, dict(_UPDATE)); return
+            self._send(200, {**_UPDATE, "dev": DEV_MODE}); return
         if self.path == "/events":
             self._sse(); return
         self._send(404, {"erro": "nao encontrado"})
@@ -2067,6 +2081,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _step(self, b):
         step, serial, mcu = b.get("step"), b.get("serial", ""), b.get("mcu", "m328pb")
+        # ⚡ MODO DEV: só Gravar/Validar rodam de verdade. Os demais passos são
+        # PULADOS com aviso (nunca "aprovados" em silêncio) e Cadastrar é
+        # BLOQUEADO — fechadura de iteração não entra no backend.
+        if DEV_MODE and step not in ("gravar", "validar"):
+            if step == "cadastrar":
+                LOG("⚡ modo DEV: CADASTRO BLOQUEADO — rode a bancada sem "
+                    "BANCADA_DEV p/ cadastrar de verdade", "err")
+                return {"ok": False, "erro": "cadastro bloqueado no modo dev"}
+            LOG(f"⚡ modo DEV: passo '{step}' PULADO (não executado, não testado)", "hi")
+            return {"ok": True, "pulado": True}
         if step == "provisionar":
             r = act_provisionar(serial, mcu, b.get("mosfet", "8"))
             return {"ok": bool(r)}
@@ -2141,6 +2165,9 @@ def main():
     srv = ThreadingHTTPServer(("127.0.0.1", porta), Handler)
     url = f"http://127.0.0.1:{porta}/"
     print(f">> Bancada Chavi FI em {url}")
+    if DEV_MODE:
+        print(">> ⚡ MODO DEV ativo (BANCADA_DEV=1): só Gravar/Validar executam; "
+              "demais passos PULADOS; cadastro BLOQUEADO")
     # Servidor numa thread daemon; a GUI (webview) precisa da MAIN thread no macOS.
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     threading.Timer(1.0, _checar_ferramentas).start()

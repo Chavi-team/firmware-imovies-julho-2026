@@ -1052,3 +1052,44 @@ Decisão: NADA a mexer agora (padrão atual validado em campo e alinhado ao pont
 Qualquer experimento futuro: branch + validação de 20 ciclos por variante de
 placa (1.5 com/sem MOSFET, 1.0 com/sem MOSFET) × família de módulo (1010 rev12,
 5.2 rev05, 5.2 rev03). Revisão de placa futura = linha de wake + MCU powerDown.
+
+## v2.12.0 (09/07/2026) — Power-down de verdade quando DESCONECTADA (a "alavanca grande")
+
+Consolida (em cima da master) as ideias boas da branch `novo-sistema` do Guilherme,
+SEM os pontos que reintroduziam bugs documentados. Análise completa na conversa de
+09/07 (Claude): PWRM1@9600 vetado (surdez de UART — caso 002584 / "ONG" sem P; o
+próprio Guilherme concordou e voltou a PWRM0), botão desativado vetado, fuses
+0xD9/0xDA vetados (matam EESAVE / ligam BOOTRST sem bootloader), bancada
+"aprova-tudo" vetada, ADVI9/PCTL0 vetados.
+
+**`dormir()` agora tem DOIS níveis:**
+- **DESCONECTADO (PD3 LOW)** → `SLEEP_MODE_PWR_DOWN` (MCU ~µA). Wake da conexão =
+  PCINT19/PD3 no grupo PCINT2 que o SoftwareSerial já usa (borda de INT0/INT1 NÃO
+  acorda de power-down — precisa de clkIO). Botão = INT0 por NÍVEL LOW (funciona
+  em power-down). O arranque do cristal (~1-65ms) é inofensivo aqui: quem acorda é
+  a CONEXÃO e o app demora centenas de ms até o 1º write. Clones sem borda no
+  PIO6: dados no RX acordam (1º write pode se perder; app retransmite — igual
+  antes). Entrada de sono com RE-CHECK sob cli() (sei+sleep atômicos) — sem corrida.
+- **CONECTADO (PD3 HIGH)** → `SLEEP_MODE_IDLE` (lição v2.9.1): wake instantâneo,
+  byte nenhum se perde → 2º/3º comando NA MESMA conexão funcionam. Era o bug da
+  branch do dev ("2º comando não acontece; fechar e reabrir o app funciona" — o
+  OK+CONN da reconexão acordava o MCU a tempo; na mesma conexão o comando era o
+  próprio despertador e morria no arranque do cristal).
+- ADC off durante o power-down (restaurado no wake) + `sleep_bod_disable()`.
+
+**Economia estática no `setup()`:** PRR (SPI off; no PB via endereço cru: USART1,
+TIM3, TIM4, SPI1, PTC, TWI1 — gate por `!placa10`, hex é compilado p/ 328P),
+comparador analógico off (ACD), PE0..PE3 do 328PB em pullup via
+DDRE/PORTE (0x2D/0x2E — sem trilha na placa, flutuando drenam; a versão do dev
+usava `pinMode(PE0..)` que na real configurava PD0..PD3), A0 em pullup após a
+semente do random.
+
+**Mantido como estava:** PWRM0 + 9600 + ADVI2 (rádio), fuses da bancada
+(0xFF/0xD7/0xFD — EESAVE protege seeds), botão físico (curto=motor, 10s=reset),
+fluxo completo da bancada, hibernação-MOSFET gated (EE_HIBERNA).
+
+Consumo esperado em repouso: ~4mA (módulo 1,5 PWRM0 + LEDs 2-3 + quiescentes;
+MCU sai da conta). Com os WS2812 removidos fisicamente (decisão já tomada),
+~1,5-2mA. Compila 85% flash / 538B RAM livres. **PENDENTE: validar em bancada**
+(gravar → PONG → abrir/fechar 2× na MESMA conexão → botão → TST-HIB abortar
+limpo) e medir consumo em série antes de qualquer lote.
