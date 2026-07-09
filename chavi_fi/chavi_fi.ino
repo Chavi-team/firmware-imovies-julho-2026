@@ -515,7 +515,7 @@ void configModuloLeve() {
     // "P" do "PONG" sumia (app recebia "ONG" != "PONG" -> sem PONG p/ sempre).
     // PWRM0 mantém o módulo sempre acordado e responsivo. O MCU continua dormindo
     // (powerDown) — a economia real de bateria está nele, não no módulo.
-    at("AT+PWRM0");
+    at("AT+PWRM1");
     at("AT+TYPE0");    // sem pareamento (TYPE1 residual = pede PIN em toda conexão)
     // NOME reafirmado a CADA boot (como o changeName do FI_1_5), ANTES do MODE2.
     // ⭐ v2.10 AUTO-CURA: escreve, LÊ DE VOLTA (AT+NAME?) e compara — se a UART
@@ -641,7 +641,7 @@ void bleProvisionar() {
             bluetooth.begin(TODOS[i]);
             delay(30);
             for (uint8_t k = 0; k < 6; k++) at("AT", 40);   // acorda o módulo
-            at("AT+PWRM0", 120);   // auto-sleep OFF (sempre acordado)
+            at("AT+PWRM1", 120);   // auto-sleep OFF (sempre acordado)
             at("AT+PIO41", 60); at("AT+PIO51", 60); at("AT+PIO71", 60);
             at("AT+PIO81", 60); at("AT+PIO91", 60);
             at("AT+BEFCFF7", 80); at("AT+AFTCFFF", 80);
@@ -657,7 +657,7 @@ void bleProvisionar() {
         delay(30);
         for (uint8_t k = 0; k < 3; k++) at("AT", 40);   // acorda o módulo
         // ⭐ v2.10.1: PWRM0 (auto-sleep OFF) PRIMEIRO, no baud REAL do módulo.
-        at("AT+PWRM0", 120);
+        at("AT+PWRM1", 120);
         at(AT_BAUD_CMD, 250);                  // -> 9600
         at("AT+RESET", 150);
         delay(600);                            // módulo reinicia no baud novo
@@ -669,7 +669,7 @@ void bleProvisionar() {
     // PASSO 2 — config completa no baud alvo.
     at("AT+SHIELD1");
     at(AT_BAUD_CMD);                           // reafirma (só vale após reset)
-    at("AT+PWRM0");                            // auto-sleep OFF (sempre acordado)
+    at("AT+PWRM1");                            // auto-sleep OFF (sempre acordado)
     at("AT+ROLE0");                            // slave (ROLE1 residual = não announces)
     at("AT+IMME0");                            // anuncia sozinho ao ligar
     at("AT+ADTY0");                            // anúncio conectável
@@ -700,7 +700,7 @@ void bleProvisionar() {
         const long bd[] = {2400, 9600, 38400, 19200, 57600, 4800};
         for (uint8_t i = 0; i < sizeof(bd) / sizeof(long); i++) {
             bluetooth.begin(bd[i]); delay(30);
-            at("AT", 50); at("AT+PWRM0", 100); at(nm, 180);   // v2.10.1: acorda antes do nome
+            at("AT", 50); at("AT+PWRM1", 100); at(nm, 180);   // v2.10.1: acorda antes do nome
         }
         bluetooth.begin(BAUD_MODULO); delay(100);
     }
@@ -1145,6 +1145,7 @@ void atenderBotao() {
         beep(120, 500);                              // segurou e soltou: cancelado
     }
 }
+
 void dormir() {
     motorPara(); // Garante desligamento físico dos pinos do motor antes do sono
     
@@ -1183,11 +1184,13 @@ void dormir() {
     
     detachInterrupt(digitalPinToInterrupt(PIN_WAKE));
 
-    // ⭐ Correção crucial: Damos um tempo para o cristal estabilizar 
-    // e forçamos o sinalizador do BLE para processar os comandos do app
+    // ⭐ CORREÇÃO DO BLE1010 (Sincronismo de Acordar):
+    // Se o pino WAKE subiu ou já existem bytes, setamos a flag IMEDIATAMENTE.
+    // O pequeno delay de 30ms serve apenas para o clock de transmissão do BLE1010
+    // estabilizar a linha TX sem corromper o primeiro byte do aplicativo.
     if (digitalRead(PIN_WAKE) == HIGH || bluetooth.available()) {
-        delay(50); 
         acordouBLE = true;
+        delay(30); // Tempo exato para o chip CSR-1010 estabilizar a UART ativa
     }
 }
 
