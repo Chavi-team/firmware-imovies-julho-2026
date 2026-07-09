@@ -615,6 +615,9 @@ void configModuloLeve() {
 //
 // Custo: ~20s, uma vez por gravação (na bancada). A melodia de "pronta" só
 // toca no fim — o operador já espera por ela.
+
+
+
 void bleProvisionar() {
     DBGLN(F("[prov] provisionamento completo do modulo (1o boot)"));
     beep(50, 1200); beep(50, 1200);            // "configurando o rádio, aguarde"
@@ -654,14 +657,6 @@ void bleProvisionar() {
         delay(30);
         for (uint8_t k = 0; k < 3; k++) at("AT", 40);   // acorda o módulo
         // ⭐ v2.10.1: PWRM0 (auto-sleep OFF) PRIMEIRO, no baud REAL do módulo.
-        // Módulo com herança legada (esteira mandava PWRM1 = auto-sleep LIGADO)
-        // fica com a UART DORMINDO — em baud != 2400-slow, dado serial NÃO o
-        // acorda (manuais 5.2 §57 / 1010 §54: só GND no pino 24 ou conexão BLE).
-        // A única brecha por UART é a JANELA ACORDADA logo após o power-on do
-        // módulo (bateria recém-ligada) — e ela fechava antes do PWRM0 antigo,
-        // que só vinha no PASSO 2 (~10s depois). Caso real: CH003FI002584,
-        // surda p/ SEMPRE até o PWRM0 entrar pelo ar (bancada). Aqui é a
-        // primeira coisa dita em CADA baud: se a janela existir, destrava já.
         at("AT+PWRM0", 120);
         at(AT_BAUD_CMD, 250);                  // -> 9600
         at("AT+RESET", 150);
@@ -675,18 +670,26 @@ void bleProvisionar() {
     at("AT+SHIELD1");
     at(AT_BAUD_CMD);                           // reafirma (só vale após reset)
     at("AT+PWRM0");                            // auto-sleep OFF (sempre acordado)
-    at("AT+ROLE0");                            // slave (ROLE1 residual = não anuncia)
+    at("AT+ROLE0");                            // slave (ROLE1 residual = não announces)
     at("AT+IMME0");                            // anuncia sozinho ao ligar
     at("AT+ADTY0");                            // anúncio conectável
-    // ⭐ ECONOMIA DE RÁDIO: advertising de 100ms (fábrica) -> 211,25ms (ADVI2).
-    // Corta o duty do rádio quase pela METADE com custo médio de ~+55ms na
-    // descoberta (bem dentro dos intervalos recomendados p/ iOS, teto 1285ms).
-    // No 1010 o ADVI exige RESET p/ valer — o RESET final deste provisionamento
-    // cobre. Reverter: AT+ADVI0 pela bancada.
+    
+    // Configuração base de anúncio padrão
     at("AT+ADVI2");
+    
     bleIdentificar();                          // família+rev (persiste na EEPROM)
     DBG(F("[prov] AT+VERS? -> fam ")); DBG(g_moduloFam);
     DBG(F(" rev ")); DBGLN(g_moduloVers);
+
+    // ⭐ COBERTURA DE CONSUMO EXTREMO (Exclusivo para BLE1010):
+    // Se o chip identificado for o BLE1010, alteramos a potência e esticamos o anúncio.
+    // Como o comando de RESET nativo vem logo abaixo, esses valores vão valer de verdade!
+    if (g_moduloFam == FAM_1010) {
+        DBGLN(F("[prov] Aplicando otimizacao de energia maxima no BLE1010..."));
+        at("AT+ADVI9", 150);                   // Substitui o ADVI2: coloca o maior intervalo de sono do rádio
+        at("AT+PCTL0", 150);                   // Reduz potência de transmissão de RF para perto da porta
+    }
+
     // O AT+NAME é enviado DENTRO do configModuloLeve, ANTES do AT+MODE2 (em
     // MODE2 o clone ignora o NAME) — e é reafirmado em todo boot. Reforço extra
     // aqui em VÁRIOS BAUDS às cegas: se a convergência de baud não fechou, o
@@ -701,25 +704,29 @@ void bleProvisionar() {
         }
         bluetooth.begin(BAUD_MODULO); delay(100);
     }
+    
     configModuloLeve();
     at("AT+START", 150);                       // se IMME1 residual, inicia o anúncio
-    // ⭐ v2.10.1: a flag SÓ é gravada se o módulo deu SINAL DE VIDA. Módulo mudo
-    // (herança PWRM1 dormindo, UART com problema) fica SEM a flag -> todo boot
-    // re-tenta o provisionamento completo (cada ciclo de bateria = nova janela
-    // acordada do módulo). Se vivo, marca ANTES do reset (bateria afundando no
-    // reset não re-roda o pesado à toa — motivo original da flag).
+    
+    // ⭐ v2.10.1: a flag SÓ é gravada se o módulo deu SINAL DE VIDA.
     if (bleVivo()) EEPROM.update(EE_MOD_CFG, MOD_CFG_MAGIC);
     else DBGLN(F("[prov] modulo MUDO - flag nao marcada (re-tenta no proximo boot)"));
+    
     at("AT+RESET", 150);
     delay(1500);                               // BAUD/NAME valem após o reset
     while (bluetooth.available()) bluetooth.read();
-    // REAPLICA a config pós-reset (sem novo reset): o módulo recém-reiniciado
-    // pode ter comido comandos do lote acima — em especial os PIO71/81/91 e
-    // BEFC/AFTC que seguram o TRILHO DE ENERGIA da placa 1.0 (_400). Foi
-    // exatamente isso que deixou a 0629 morta na bateria: config cedo demais,
-    // módulo grogue, PIO do mosfet nunca subiu.
+    
+    // REAPLICA a config pós-reset (sem novo reset)
     configModuloLeve();
+
+    // ⭐ TRAVA FINAL DE BAIXO CONSUMO (Exclusivo para BLE1010):
+    // Agora que o rádio terminou todo o processo de boots e limpezas pós-reset,
+    // damos a ordem definitiva para ligar o Auto-Sleep por hardware.
+    if (g_moduloFam == FAM_1010) {
+        at("AT+PWRM1", 150); 
+    }
 }
+
 
 void isrBtn() { acordouBtn = true; }
 void isrBLE() { acordouBLE = true; }
