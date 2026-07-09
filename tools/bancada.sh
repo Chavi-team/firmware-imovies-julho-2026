@@ -1,37 +1,34 @@
 #!/usr/bin/env bash
 #
-# bancada.sh — Abre o Assistente de Bancada das fechaduras Chavi FI.
-#
-# A interface roda no NAVEGADOR (app web local) — nada de Tkinter. Este script:
-#   - cria um venv em tools/.venv-bancada
-#   - instala pyserial + requests
-#   - garante arduino-cli e avrdude no PATH (Homebrew)
-#   - sobe o servidor local e abre o navegador (tools/bancada.py)
-#
-# Uso:  ./tools/bancada.sh
+# bancada.sh — Abre o Assistente de Bancada em modo DEV e libera o console via log externo.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 VENV="$HERE/.venv-bancada"
 SYS_PY="${SYS_PY:-/usr/bin/python3}"
 
-# arduino-cli / avrdude do Homebrew no PATH
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 if [[ ! -d "$VENV" ]]; then
-    echo ">> Criando venv de bancada (primeira vez)..."
+    echo ">> Criando venv de bancada..."
     "$SYS_PY" -m venv "$VENV"
 fi
 
-# dependências python (BLE + cabo + backend)
 if ! "$VENV/bin/python" -c "import serial, requests, bleak" 2>/dev/null; then
-    echo ">> Instalando dependências no venv (pyserial, requests, bleak)..."
+    echo ">> Instalando dependências no venv..."
     "$VENV/bin/pip" install --quiet --disable-pip-version-check pyserial requests bleak
 fi
 
-for t in arduino-cli avrdude; do
-    command -v "$t" >/dev/null || echo "!! aviso: '$t' não está no PATH (gravação indisponível)"
-done
+# Variáveis de ambiente para Modo Dev
+export FLASK_ENV=development
+export FLASK_DEBUG=1
+export PYTHONUNBUFFERED=1
 
-echo ">> Subindo o assistente (abre no navegador)..."
-exec "$VENV/bin/python" "$HERE/bancada.py"
+echo ">> Forçando abertura da interface no Google Chrome..."
+open -a "Google Chrome" "http://localhost:5000" 2>/dev/null || open "http://localhost:5000"
+
+echo ">> 🚀 Subindo o servidor em MODO DEV..."
+echo ">> 💡 DICA: Se o console travar, abra o arquivo 'bancada_dev.log' no VS Code para copiar livremente!"
+
+# ⭐ MÁGICA: Executa o python, joga tudo em tempo real para o arquivo bancada_dev.log e mantem a tela viva
+"$VENV/bin/python" "$HERE/bancada.py" 2>&1 | tee "$HERE/bancada_dev.log"
