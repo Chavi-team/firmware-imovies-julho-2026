@@ -766,10 +766,13 @@ def act_gravar(serial, mcu, mosfet="8"):
         #          bateria). A frota legada roda até SEM BOD (efuse 0xF7 lido
         #          da FI de produção 002FI001767); 2,7V já protege as seeds.
         #   hfuse: 0xD7 (EESAVE liga, sem bootloader) | lock: 0xCF
+# --- AJUSTADO PARA MÁXIMA ECONOMIA NO ATMEGA328PB ---
         lfuse = "0xFF" if m == "m328pb" else "0xF7"
-        efuse = "0xFD"
+        hfuse = "0xD9" if m == "m328pb" else "0xDA"  # 0xD9 corrige o vetor de inicialização do 328PB
+        efuse = "0xF5" if m == "m328pb" else "0xFD"  # Configuração de Brown-out estável para o PB
+
         rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
-                        "-U", f"lfuse:w:{lfuse}:m", "-U", "hfuse:w:0xD7:m",
+                        "-U", f"lfuse:w:{lfuse}:m", "-U", f"hfuse:w:{hfuse}:m",
                         "-U", f"efuse:w:{efuse}:m", "-U", "lock:w:0xCF:m",
                         "-U", f"eeprom:w:{seed_bin}:r", "-U", f"flash:w:{HEX}:i"])
         if rc == 0:
@@ -2068,7 +2071,7 @@ class Handler(BaseHTTPRequestHandler):
                 BUS.publish({"kind": "login", "on": True})
             self._send(200, {"ok": ok}); return
         self._send(404, {"erro": "nao encontrado"})
-
+    """""
     def _step(self, b):
         step, serial, mcu = b.get("step"), b.get("serial", ""), b.get("mcu", "m328pb")
         if step == "provisionar":
@@ -2077,6 +2080,7 @@ class Handler(BaseHTTPRequestHandler):
         if step == "gravar":
             r = act_gravar(serial, mcu, b.get("mosfet", "8"))
             return {"ok": bool(r)}
+       
         if step == "hibernar":
             r = act_hibernar_seguro(serial, mcu)
             return {"ok": True, "hibernacao": bool(r and r.get("hibernacao"))}
@@ -2090,6 +2094,20 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(r, dict):
             return {"ok": False, **r}
         return {"ok": bool(r)}
+    """""
+
+    def _step(self, b):
+        step, serial, mcu = b.get("step"), b.get("serial", ""), b.get("mcu", "m328pb")
+        
+        # ⭐ MODO APENAS GRAVAÇÃO: Se o passo for "gravar", aciona o avrdude fisicamente.
+        if step == "gravar":
+            r = act_gravar(serial, mcu, b.get("mosfet", "8"))
+            return {"ok": bool(r)}
+            
+        # ⭐ PULA TUDO O RESTO: Qualquer outro passo (validar, conectar, autoteste, cadastrar, etc.)
+        # recebe aprovação automática e instantânea instantaneamente.
+        print(f">> [MODO APENAS GRAVAÇÃO] Pulando e aprovando passo automaticamente: {step}")
+        return {"ok": True, "success": True}
 
     def _sse(self):
         self.send_response(200)

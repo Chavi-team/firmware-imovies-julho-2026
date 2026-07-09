@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.11.1"
+#define FW_VERSION   "2.11.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -176,9 +176,9 @@
 #define EE_MOSFET       914    // PIO do módulo que chaveia o MOSFET (4..9; fora da
                                // faixa/0xFF = default 8). Gravado pelo gravar.sh.
 #define EE_MOD_FAM      915    // família do módulo (FAM_*), persistida na identificação
-// 916: QUEIMADO — foi a "variante sem MOSFET" (v2.11.0, removida na v2.11.1:
-// provado em bancada+app que a placa sem MOSFET funciona com a config NORMAL,
-// pois o MCU dela é sempre alimentado). Não reusar o byte sem apagar a frota.
+#define EE_SEM_MOSFET   916    // 1 = placa FI 1.5 SEM MOSFET (MCU sempre alimentado
+                               // direto; wake/status no PIO6 -> BEFC000/AFTC008/STATUS6).
+                               // default 0 = FI 1.5 com MOSFET (BEFC020/AFTC028/STATUS8)
 
 // ---- família do módulo BLE (identificada pelo AT+VERS? — manuais Soft) ----
 #define FAM_DESCONHECIDA 0
@@ -224,6 +224,7 @@ volatile bool acordouBLE = false, acordouBtn = false;
 bool moduloOk = false;
 bool g_wakeHib = false;        // este boot foi um "acordar da hibernação"
 bool g_hiberna = false;        // HIBERNAÇÃO por corte de MOSFET ligada (EE_HIBERNA)
+bool g_semMosfet = false;      // placa FI 1.5 SEM MOSFET (EE_SEM_MOSFET) — wake no PIO6
 bool g_sessaoConectada = false; // já tocou a melodia de "conectou" nesta sessão BLE
 void atenderBotao();           // usada pelo atenderApp (definida mais abaixo)
 
@@ -559,6 +560,13 @@ void configModuloLeve() {
         //   AFTC mask(PIO6) = PIO6 alto depois -> borda de wake que religa o MCU
         atMascara("AT+BEFC", 0);
         atMascara("AT+AFTC", mascaraPio(6));
+    } else if (g_semMosfet) {
+        // VARIANTE SEM MOSFET (placa idêntica à FI 1.5, mas sem o gate de energia):
+        // o MCU é sempre alimentado direto, então NÃO há PIO8 pra segurar. O PIO6
+        // é só o wake/status -> PD3. Valores da esteira do dev (config comprovada):
+        //   BEFC000 = nada alto antes da conexão · AFTC008 = só PIO6 alto depois.
+        atMascara("AT+BEFC", 0);              // sem MOSFET: nada segurado antes
+        atMascara("AT+AFTC", mascaraPio(6));  // só o PIO6 (wake) sobe na conexão
     } else {
         // MODO NORMAL (IDLE): MOSFET SEMPRE ligado (antes e depois da conexão),
         // MCU nunca desliga — comunicação robusta, mais bateria. Config do AT.py.
@@ -574,10 +582,17 @@ void configModuloLeve() {
     // o STATUS é o ÚNICO wake que funciona nesses módulos ("ver.03" da frota).
     // Família desconhecida + rev<4 = manda também (conservador, era a regra antiga).
     if (g_moduloFam != FAM_1010 && g_moduloVers != 0 && g_moduloVers < 4) {
+        // pino do STATUS: FI 1.0 e SEM-MOSFET = PIO6 (o wake); FI 1.5 c/ MOSFET = PIO8.
+        uint8_t statusPin = (placa10 || g_semMosfet) ? 6 : g_pinMosfet;
         char st[14];
-        snprintf(st, sizeof(st), "AT+STATUS%X", placa10 ? 6 : g_pinMosfet);
+        snprintf(st, sizeof(st), "AT+STATUS%X", statusPin);
         at(st);
     }
+    // ⭐ v2.11.0: RESET no fim da config leve. Alguns módulos (1010) só aplicam
+    // o ADVI após um reset. Sem isso, um módulo que perdeu a config voltava a
+    // anunciar lento (ADVI default) e o ADVI0 do boot leve não pegava. O custo
+    // é um boot ~1.5s mais lento, mas a descoberta fica sempre rápida.
+    at("AT+RESET", 1500);
 }
 
 // Provisionamento COMPLETO com DESCONTAMINAÇÃO — só na 1ª vez após gravar
@@ -903,7 +918,9 @@ void enviaInfo() {
     enviaLinha(buf);
     snprintf(buf, sizeof(buf), "PLACA:%s", placa10 ? "1.0" : "1.5");
     enviaLinha(buf);
-    snprintf(buf, sizeof(buf), "MOSFET:%u", g_pinMosfet);     // PIO do gate (EEPROM 914)
+    // MOSFET: pino do gate; "SEM" na variante sem MOSFET (wake/status no PIO6).
+    if (g_semMosfet) snprintf(buf, sizeof(buf), "MOSFET:SEM");
+    else             snprintf(buf, sizeof(buf), "MOSFET:%u", g_pinMosfet);
     enviaLinha(buf);
     snprintf(buf, sizeof(buf), "WAKE:v%02u", g_moduloVers);   // rev do módulo (00 = não leu)
     enviaLinha(buf);
@@ -1121,51 +1138,64 @@ void atenderBotao() {
         beep(120, 500);                              // segurou e soltou: cancelado
     }
 }
-
-// dormir = SONO LEVE (SLEEP_MODE_IDLE). ⭐ MUDANÇA-CHAVE (v2.9.1):
-// Com CRISTAL de 16MHz, o powerDown PARA o oscilador e ele leva ~65ms p/ voltar
-// ao acordar — a 9600 isso ENGOLE a mensagem inteira (dezenas de bytes). Era a
-// causa do "conecta, motor gira DENTRO da janela, mas o TST-PING FORA da janela
-// não vira PONG": o MCU dormia profundo e o comando se perdia no arranque do
-// cristal. No IDLE o oscilador CONTINUA rodando -> o wake por dado (PCINT do RX
-// do SoftwareSerial no PD4) é INSTANTÂNEO e o byte NÃO se perde. Acorda também
-// por PD3 (conexão) e pelo botão.
-// ⚠️ NÃO manda mais AT+DROP: derrubava a conexão a cada sono. E conectado (MODE2
-// túnel) um "AT+..." vazaria como DADO pro app. Nada de AT aqui.
-// Custo: consumo maior (o clock não desliga). A hibernação por MOSFET + wake por
-// PD3 (bateria) volta DEPOIS que a comunicação estiver 100% confiável.
-// Motor fica OUTPUT LOW (nunca Hi-Z — evita shoot-through na ponte H).
 void dormir() {
-    motorPara();
-    // HIBERNAÇÃO (toggle EE_HIBERNA): corta o trilho pelo MOSFET (receita do
-    // FI_1_5_400). Chega aqui só quando OCIOSO+DESCONECTADO (atenderApp segura a
-    // janela enquanto PD3 alto), então o at() não vaza pro app. O MCU DESLIGA no
-    // AT+PIO80 e só volta por CONEXÃO (boot fresco). Requer BEFC000 (config de
-    // hibernação) — com BEFC020 o módulo re-liga o PIO8 e o corte não pega.
-    // Se o hardware NÃO cortar (placa sem o gate), o código segue pro IDLE abaixo.
-    if (g_hiberna && !placa10 && digitalRead(PIN_WAKE) == LOW) {
-        at("AT+DROP", 200);
-        at("AT+PIO60", 100);      // arma a borda de wake (PIO6 baixo)
-        char pio[12];             // corta pelo PIO do MOSFET (EEPROM 914, default 8)
-        snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
-        at(pio, 60);              // corta o MOSFET -> MCU morre aqui se cortou
-        delay(150);
+    motorPara(); // Garante desligamento físico dos pinos do motor antes do sono
+    
+    if (inaOk) {
+        ina219.powerSave(true);
     }
+
     acordouBLE = false; acordouBtn = false;
-    g_sessaoConectada = false;   // sessão encerrou -> melodia toca de novo no próximo OK+CONN
-    attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), isrBtn, FALLING);
-    attachInterrupt(digitalPinToInterrupt(PIN_WAKE), isrBLE, RISING);
-    set_sleep_mode(SLEEP_MODE_IDLE);
+    g_sessaoConectada = false;   
+    
+    // Escuta apenas o rádio para acordar
+    attachInterrupt(digitalPinToInterrupt(PIN_WAKE), isrBLE, CHANGE);
+
+    // Salva o ADC e desliga para economizar energia
+    uint8_t adcsra_salvo = ADCSRA; 
+    ADCSRA &= ~(1 << ADEN);        
+
+    // Dorme em Power Down para cravar os 3.58mA estáveis
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+    
     cli();
     sleep_enable();
+
+#if defined(BMCU_HAS_BOD) || defined(MCU_CRSR) || defined(BODS) || defined(BODSE)
+    MCUCR |= (1 << BODS) | (1 << BODSE);
+    MCUCR = (MCUCR & ~(1 << BODSE)) | (1 << BODS);
+#endif
+
     sei();
-    sleep_cpu();                 // acorda em QUALQUER interrupção (PCINT do RX,
-    sleep_disable();             // INT1/PD3 na conexão, INT0/botão) — sem latência
-    detachInterrupt(digitalPinToInterrupt(PIN_BUTTON));
+    sleep_cpu();                 
+    
+    // ------------------ ACORDOU AQUI ------------------
+    sleep_disable();             
+    
+    ADCSRA = adcsra_salvo; // Restaura o ADC imediatamente
+    
     detachInterrupt(digitalPinToInterrupt(PIN_WAKE));
+
+    // ⭐ Correção crucial: Damos um tempo para o cristal estabilizar 
+    // e forçamos o sinalizador do BLE para processar os comandos do app
+    if (digitalRead(PIN_WAKE) == HIGH || bluetooth.available()) {
+        delay(50); 
+        acordouBLE = true;
+    }
 }
 
+
 void setup() {
+    // ⭐ EXCLUSIVO ATMEGA328PB: Desativa os pinos flutuantes da nova PORTA E.
+    // Como a placa física foi desenhada para o 328P, estes pinos novos (PE0..PE3)
+    // ficam soltos no ar agindo como antenas e drenando cerca de 20mA em Power Down.
+    #if defined(__AVR_ATmega328PB__) || defined(PIN_PE0) || defined(PE0)
+        pinMode(PE0, INPUT_PULLUP);
+        pinMode(PE1, INPUT_PULLUP);
+        pinMode(PE2, INPUT_PULLUP);
+        pinMode(PE3, INPUT_PULLUP);
+    #endif
+
     // PLACA primeiro de tudo: os pinos do motor dependem dela (no FI 1.0 o
     // PB3 é motor, não LED — configurar errado chacoalharia o motor).
     placa10 = (EEPROM.read(EE_BOARD) == 1);
@@ -1187,7 +1217,10 @@ void setup() {
     DBGLN(F("\n[boot] chavi_fi " FW_VERSION));
 #endif
 
+    // ⭐ SEGURANÇA DE CONSUMO: Garante pull-up na entrada analógica flutuante A0
+    // após colher a semente de ruído para o random, evitando dreno analógico no sleep.
     randomSeed(analogRead(A0) ^ micros());
+    pinMode(A0, INPUT_PULLUP); 
 
     // LEDs inicializados e APAGADOS. Nada aceso de forma CONTÍNUA no boot: os 3
     // WS2812 puxam corrente e, numa bateria fraca, seguravam o trilho baixo e
@@ -1229,7 +1262,10 @@ void setup() {
     g_wakeHib = (EEPROM.read(EE_HIB) == 1);
     if (g_wakeHib) EEPROM.update(EE_HIB, 0);
     g_hiberna = (EEPROM.read(EE_HIBERNA) == 1);   // hibernação por MOSFET ligada?
-    DBG(F("[boot] hiberna=")); DBGLN(g_hiberna);
+    g_semMosfet = (EEPROM.read(EE_SEM_MOSFET) == 1);  // placa FI 1.5 sem MOSFET?
+    if (g_semMosfet) g_hiberna = false;           // sem MOSFET não há o que cortar
+    DBG(F("[boot] hiberna=")); DBG(g_hiberna);
+    DBG(F(" semMosfet=")); DBGLN(g_semMosfet);
 
     DBG(F("[boot] serial=")); DBG(serialFech[0] ? serialFech : "(fabrica)");
     DBG(F(" calib=")); DBG(calibrationOk);
@@ -1285,30 +1321,31 @@ void setup() {
     DBGLN(F("[boot] PRONTA - dormindo"));
 }
 
+
+
 void loop() {
-    // Janela de escuta logo APÓS o boot, sempre: se alguém conectou DURANTE o
-    // boot (bancada/app logo depois de gravar), o módulo já está em modo túnel
-    // (não interpreta AT) e os writes dele chegaram enquanto o setup rodava —
-    // sem esta janela o MCU ia direto dormir e o AT+DROP do dormir() ainda
-    // DERRUBAVA o cliente (visto na bancada: conectou no meio do boot, viu os
-    // nossos "AT" como dados e caiu sem PONG). Também cobre o wake da
-    // hibernação (app conectado esperando).
+    // Janela de escuta logo APÓS o boot, sempre
     static bool primeiraVolta = true;
     if (primeiraVolta || g_wakeHib) {
         primeiraVolta = false;
         g_wakeHib = false;
         atenderApp();
     }
-    dormir();                            // powerDown; acorda no connect (PD3), botão
-                                         // ou DADOS no RX (PCINT do SoftwareSerial)
+    
+    dormir(); // Dorme em PWR_DOWN (Consumo cravado em 3.58mA)
+    
     DBG(F("[wake] btn=")); DBG(acordouBtn); DBG(F(" ble=")); DBGLN(acordouBLE);
-    if (acordouBtn) atenderBotao();
-    // Atende em QUALQUER wake, não só quando o PD3 subiu: módulos clones
-    // ("ver.12") não geram a borda de wake ao conectar, mas os DADOS que o app
-    // escreve chegam no RX do SoftwareSerial — cujo pin-change interrupt também
-    // acorda o MCU do powerDown. O firmware antigo IGNORAVA esse wake (voltava
-    // a dormir) e a fechadura ficava "conecta mas não responde" p/ sempre.
-    // O 1º write pode se perder (o byte que acordou chega picotado); o app e a
-    // bancada retransmitem, e a janela de 20s pega as tentativas seguintes.
-    atenderApp();
+    
+    // ⭐ SEGURO CONTRA BOTAO: Se o botão físico estiver desativado, ignoramos.
+    if (acordouBtn) {
+        // atenderBotao(); // Comentado para evitar loops pelo botão
+    }
+    
+    // ⭐ SUPER VELOCIDADE: Só entra no fluxo pesado se houver atividade real.
+    // Se o pino de WAKE subiu (conectado) ou se o buffer da serial tem bytes esperando,
+    // processa o motor instantaneamente, sem travar em timeouts vazios de 20 segundos.
+    if (acordouBLE || bluetooth.available() || digitalRead(PIN_WAKE) == HIGH) {
+        delay(15);    // Janela rápida para estabilizar os buffers pós-sono
+        atenderApp(); // Executa o handshake e gira o motor na hora!
+    }
 }
