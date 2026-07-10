@@ -1093,3 +1093,47 @@ MCU sai da conta). Com os WS2812 removidos fisicamente (decisão já tomada),
 ~1,5-2mA. Compila 85% flash / 538B RAM livres. **PENDENTE: validar em bancada**
 (gravar → PONG → abrir/fechar 2× na MESMA conexão → botão → TST-HIB abortar
 limpo) e medir consumo em série antes de qualquer lote.
+
+## v2.12.1 (09/07/2026) — Anti-duplicação POR COMANDO (fix do "sucesso sem girar")
+
+Diagnóstico do teste do Leonardo (6 placas na bancada, app demorando 4-5 tentativas
++ "sucesso" com motor parado). Investigação via BLE do Mac provou:
+- Power-down da v2.12 INOCENTADO: as 6 placas acordaram com PONG na 1ª tentativa
+  em ~210ms (nada de "sono profundo demora acordar").
+- CAUSA-RAIZ: `acionamentoDuplicado()` não distinguia ABRIR de FECHAR e a janela
+  (6s) conta do FIM do giro. Medido na 002FI001888: ABRIR real = confirma na hora
+  e gira ~14s (CAL:0, sem batente → teto); ABRIR/FECHAR dentro da janela = PONG em
+  115ms = reconfirma SEM girar → app mostra "porta aberta" com motor parado. Em
+  CAMPO (giro ~1,5s), o fechar-logo-após-abrir também caía na janela → ENGOLIDO.
+
+**Fix:** `acionamentoDuplicado(cmd)` guarda o último comando (`g_ultimoCmd`) —
+reenvio do MESMO cmd segue engolido+reconfirmado (proteção original contra a
+tempestade de retry do app, que chega em 1-3s); comando DIFERENTE sempre gira.
+Janela 6s→4s: retry HUMANO (fechadura emperrada → fechar de novo: reação +
+cooldown 4,5s do app + reconexão ≈ 6,5s) passa com folga. Comando engolido não
+renova a janela (já era assim). Aplica aos DOIS caminhos (acionar/acionarVerbo).
+
+Notas do diagnóstico: as 6 placas do teste anunciam serial == EEPROM (sem troca
+de identidade); todas CAL:0 (sentido do ABRIR invertido + giro até o teto — pra
+teste realista, calibrar ou montar em batente); House regravada com 2.12.0 mas
+cadastro antigo diz 2.11.1. Ferramentas: scratchpad diag_bancada.py /
+prova_antidup.py (sonda TST-PING mede se o MCU está girando: PONG lento = giro).
+Compila 86% flash / 534B RAM. **PENDENTE: regravar 1 placa e validar:**
+abrir→fechar ~3s (ambos giram) · abrir→abrir ~3s (2º engolido) · teste do app.
+
+## PLANO v2.13 (aprovado 09/07/2026, sem pressa) — sentido EXPLÍCITO no comando
+
+Hoje o sentido da porta (lock_direction, banco) é aplicado pelo APP via XOR do
+verbo (porta antihorária: tocar "abrir" manda "FECHAR"). Funciona, mas esconde a
+semântica no fio e depende do invariante CAL:0 na frota inteira.
+- **Firmware v2.13**: aceitar os DOIS formatos — `ABRIR`/`FECHAR` puros
+  (mapeamento fixo, compat com app atual) E `ABRIR-H`/`ABRIR-A`/`FECHAR-H`/
+  `FECHAR-A` (sentido explícito, IGNORANDO calibrationOk). Ignorar também os
+  verbos legados de calibração (PORTA-ABERTA/FECHADA) → invariante CAL vira
+  garantia. Sufixo NÃO-numérico de propósito (parser legado numérico).
+- **App**: cachear a versão do firmware por fechadura (TST-INFO VER:, no mesmo
+  SharedPreferences do deviceId; 1 leitura por fechadura) → fw ≥2.13 usa o
+  formato explícito; anterior → XOR atual como fallback PERMANENTE.
+- ⚠️ NUNCA soltar o app com formato novo antes do firmware que o entende: o
+  parser em campo é startsWith("ABRIR") → "ABRIR+1" viraria ABRIR fixo e
+  portas ANTIHORÁRIAS girariam ao contrário, em silêncio.

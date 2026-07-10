@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.12.0"
+#define FW_VERSION   "2.12.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
 // Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
@@ -724,18 +724,26 @@ void enviaStatus(bool sentidoA) {
     enviaLinha(num);
 }
 
-// ANTI-DUPLICATA: se um comando de acionamento chega logo após outro, é uma
-// REEXECUÇÃO espúria (o app reenvia quando o AT+DROP do dormir() derruba a
-// conexão antes de ele confirmar o status; ou o loop() reentra no atenderApp).
-// Dentro da janela, o firmware NÃO gira de novo — só reconfirma o status
-// (o app precisa dele p/ parar de tentar). 6s cobre o giro+recuo mais lento;
-// o app tem cooldown de 4,5s entre comandos legítimos, então não atrapalha.
-#define ANTIDUP_MS 6000UL
+// ANTI-DUPLICATA (⭐ v2.12.1: POR COMANDO): reenvio do MESMO comando logo após
+// outro é REEXECUÇÃO espúria (o app reenvia quando a confirmação se perde; ou
+// o loop() reentra no atenderApp) — dentro da janela o firmware NÃO gira de
+// novo, só reconfirma o status (o app precisa dele p/ parar de tentar).
+// Comando DIFERENTE (FECHAR logo após ABRIR) SEMPRE executa: a versão antiga
+// não distinguia e ENGOLIA o fechar-após-abrir — provado em bancada 09/07
+// (FECHAR na janela = reconfirma sem girar; o app mostrava "porta aberta" com
+// o motor parado). Janela 6s→4s: a tempestade de retry automático chega em
+// 1-3s (mesma sessão); o retry HUMANO (reação + cooldown 4,5s do app +
+// reconexão) chega em ~6,5s — 4s separa os dois com folga pros dois lados
+// (caso real: fechadura emperrou -> fechar de novo tem que girar).
+// A janela conta do FIM do giro e um comando engolido NÃO a renova.
+#define ANTIDUP_MS 4000UL
 unsigned long g_ultimoAcionamentoMs = 0;
+unsigned long g_ultimoCmd = 0;          // CMD_ABRIR/CMD_FECHAR do último giro
 
-bool acionamentoDuplicado() {
+bool acionamentoDuplicado(unsigned long cmd) {
     unsigned long agora = millis();
-    if (g_ultimoAcionamentoMs && agora - g_ultimoAcionamentoMs < ANTIDUP_MS) return true;
+    if (g_ultimoAcionamentoMs && cmd == g_ultimoCmd &&
+        agora - g_ultimoAcionamentoMs < ANTIDUP_MS) return true;
     return false;
 }
 
@@ -745,8 +753,9 @@ bool acionamentoDuplicado() {
 void acionar(unsigned long cmd) {
     bool sentidoA = (cmd == CMD_ABRIR) ? (calibrationOk == 1) : (calibrationOk == 0);
     enviaStatus(sentidoA);
-    if (acionamentoDuplicado()) return;   // reenvio: já confirmou, não gira 2x
+    if (acionamentoDuplicado(cmd)) return;   // MESMO cmd: já confirmou, não gira 2x
     g_ultimoAcionamentoMs = millis();
+    g_ultimoCmd = cmd;
     motorGira(sentidoA);
     g_ultimoAcionamentoMs = millis();     // o giro consumiu tempo; re-marca
 }
@@ -757,11 +766,12 @@ void acionar(unsigned long cmd) {
 // é o "avisar quando parar". O app espera esta notificação com timeout longo.
 void acionarVerbo(unsigned long cmd) {
     bool sentidoA = (cmd == CMD_ABRIR) ? (calibrationOk == 1) : (calibrationOk == 0);
-    if (acionamentoDuplicado()) {         // reenvio dentro da janela: NÃO gira,
+    if (acionamentoDuplicado(cmd)) {      // reenvio do MESMO cmd: NÃO gira,
         enviaStatus(sentidoA);            // só reconfirma p/ o app parar de tentar
         return;
     }
     g_ultimoAcionamentoMs = millis();
+    g_ultimoCmd = cmd;
     // ⭐ CONFIRMA ANTES DO MOTOR (fix do "abriu 3x + loading infinito"): o motor
     // puxa corrente e pode DERRUBAR o BLE; se a confirmação saísse só DEPOIS do
     // giro, ela se perdia -> o app dava timeout e reenviava (abrindo de novo a

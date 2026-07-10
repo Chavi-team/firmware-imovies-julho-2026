@@ -80,12 +80,12 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.12.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.12.1"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.12.0"
+FIRMWARE_VERSION = "2.12.1"
 VERSION_DATE = "2026-07-09"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Firmware v2.12.0: POWER-DOWN real quando DESCONECTADA (MCU em µA; conectada segue IDLE — o 2º comando na MESMA conexão funciona) + periféricos ociosos sem clock + pullup nos pinos PE do 328PB · MODO DEV opcional (rodar com BANCADA_DEV=1: executa só Gravar/Validar; demais passos PULADOS com aviso; cadastro BLOQUEADO) · tools/advi_test.py p/ experimento de advertising (ADVI) medido · mensagens de erro mais claras"
+VERSION_NOTES = "Firmware v2.12.1: anti-duplicação POR COMANDO (FECHAR logo após ABRIR agora sempre gira — antes era engolido e o app mostrava sucesso sem motor; provado em bancada 09/07) + janela 6s→4s (retry humano de fechadura emperrada passa; tempestade de retry do app segue bloqueada) · inclui tudo da v2.12.0 (power-down desconectado, modo DEV, advi_test)"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -667,6 +667,17 @@ class Backend:
         if r.status_code in (200, 201):
             return "ok"
         if r.status_code == 409:
+            # Já cadastrada = REGRAVAÇÃO: atualiza o firmware_version do
+            # registro existente (a rota aceita o SERIAL no lugar do id).
+            r2 = self._req("PATCH", f"/admin/devices/{serial}/firmware",
+                           json={"firmware_version": FIRMWARE_VERSION},
+                           headers={"Accept": "application/json",
+                                    "Authorization": f"Bearer {self.token}"})
+            LOG(f"admin/devices/{serial}/firmware → {r2.status_code}: {r2.text[:120]}")
+            if r2.status_code == 200:
+                return "atualizado"
+            LOG(f"⚠️ não consegui atualizar o firmware_version ({r2.status_code}) — "
+                "cadastro segue válido com a versão antiga", "warn")
             return "existe"
         if r.status_code in (401, 403):
             return "auth"
@@ -1114,8 +1125,10 @@ def act_cadastrar(serial, mcu):
         BACKEND.token = None
         LOG("Sessão expirada — faça login de novo.", "warn")
         STATUS("cadastrar", "fail"); return {"need_login": True}
-    if r in ("ok", "existe"):
-        LOG(f"✓ {serial} " + ("cadastrada." if r == "ok" else "já estava cadastrada."), "ok")
+    if r in ("ok", "existe", "atualizado"):
+        LOG(f"✓ {serial} " + {"ok": "cadastrada.",
+                              "existe": "já estava cadastrada.",
+                              "atualizado": f"já cadastrada — firmware atualizado p/ v{FIRMWARE_VERSION}."}[r], "ok")
         STATUS("cadastrar", "ok"); return True
     LOG("✗ Falha ao cadastrar.", "err"); STATUS("cadastrar", "fail"); return False
 
@@ -1525,6 +1538,7 @@ PAGE = r"""<!DOCTYPE html>
   <img class="brand-logo" alt="Chavi" src="data:image/png;base64,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">
   <span class="brand-sub">Bancada de Fechaduras FI</span>
   <div class="brand-right">
+    <button id="dev-toggle" class="ghost small" style="margin-right:10px">…</button>
     <span class="toplink" id="login-state">não conectado</span>
     <div class="brand-ver" id="brand-ver" title="Controle de versão da bancada">
       <div class="bv-top">Bancada <b id="bv-cur">v—</b> <span class="bv-dot">·</span> <span id="bv-date">—</span></div>
@@ -1580,7 +1594,10 @@ PAGE = r"""<!DOCTYPE html>
     <div class="comp" id="comp"></div>
     <button class="big green" style="margin-top:12px" onclick="finalizar()">✔ FINALIZAR e iniciar a próxima</button>
 
-    <!-- RECUPERAÇÃO: só quando algo dá errado. No fluxo normal, ignore. -->
+    <!-- RECUPERAÇÃO: OCULTA a pedido do Leonardo (09/07/2026). Para reativar,
+         descomente este bloco INTEIRO e a fiação JS dos botões (procurar por
+         "RECUPERAÇÃO (botões estáticos"). O backend (/api/renomear,
+         /api/consertar, steps hibernar/hib-off) continua funcionando.
     <div class="recovery">
       <div class="rec-title">⚠️ Recuperação — só se algo der errado</div>
       <div class="rec-sub">No fluxo NORMAL você <b>não precisa</b> destes botões — basta seguir os passos numerados acima. Use um destes só quando o problema abaixo acontecer:</div>
@@ -1602,6 +1619,7 @@ PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
     </div>
+    FIM DA RECUPERAÇÃO OCULTA -->
   </div>
 
   </div><!-- /col-left -->
@@ -1740,15 +1758,13 @@ function renderSteps(){
   const comp=$("#comp"); comp.innerHTML="";
   for(const t of TESTES){ const b=document.createElement("button");
     b.textContent=t.label; b.onclick=(e)=>teste1(t, e.currentTarget); comp.appendChild(b); }
-  // RECUPERAÇÃO (botões estáticos na TELA 2) — só fiação, texto/ajuda vêm do HTML.
-  // (provisionar e hibernação viraram PASSOS 3 e 5 — fiados pelo loop de PASSOS.)
-  // diagnostica e conserta a UART do módulo pelo ar (baud errado etc.)
-  $("#btn-consertar").onclick=doConsertar;
-  // renomeia o módulo pelo ar (nome residual/corrompido de gravação antiga)
-  $("#btn-renomear").onclick=doRenomear;
-  // HIBERNAÇÃO (Avançado, sob demanda): testar+ativar (ciclo seguro) ou desligar.
-  $("#btn-hib-on").onclick=(e)=>runStep("hibernar", e.currentTarget);
-  $("#btn-hib-off").onclick=(e)=>runStep("hib-off", e.currentTarget);
+  // RECUPERAÇÃO (botões estáticos na TELA 2) — HTML OCULTO a pedido do
+  // Leonardo (09/07/2026); fiação guardada por existência p/ reativar fácil
+  // (basta descomentar o bloco <div class="recovery"> no HTML).
+  if($("#btn-consertar")) $("#btn-consertar").onclick=doConsertar;
+  if($("#btn-renomear"))  $("#btn-renomear").onclick=doRenomear;
+  if($("#btn-hib-on"))    $("#btn-hib-on").onclick=(e)=>runStep("hibernar", e.currentTarget);
+  if($("#btn-hib-off"))   $("#btn-hib-off").onclick=(e)=>runStep("hib-off", e.currentTarget);
 }
 
 let STEP_STATE={};
@@ -1949,6 +1965,31 @@ fetch("/api/state").then(r=>r.json()).then(s=>atualizaLoginState(s.logged));
 
 /* aviso de atualização (não-bloqueante; falha de rede = silêncio) */
 function fmtData(iso){ const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(iso||""); return m?`${m[3]}/${m[2]}/${m[1]}`:(iso||"—"); }
+
+/* ⚡ TOGGLE do modo de gravação (header). RÁPIDO = só Gravar/Validar rodam de
+   verdade (demais passos pulados com aviso; cadastro BLOQUEADO) — para iterar
+   firmware na mesa. COMPLETO = fluxo normal de produção com todos os testes. */
+function setDevUI(on){
+  const b=$("#dev-toggle"); if(!b) return;
+  b.textContent = on ? "⚡ Modo de gravação: RÁPIDO (sem testes)"
+                     : "✅ Modo de gravação: COMPLETO (com testes)";
+  b.style.background = on ? "var(--amber)" : "";
+  b.style.color      = on ? "#000" : "";
+  b.style.fontWeight = on ? "700" : "";
+  b.title = on
+    ? "Só Gravar e Validar executam; os demais passos são PULADOS e o cadastro fica BLOQUEADO. Clique para voltar ao modo completo."
+    : "Fluxo completo de produção (todos os testes). Clique para o modo rápido (iteração de firmware na bancada).";
+}
+$("#dev-toggle").onclick = async ()=>{
+  const ligar = !$("#dev-toggle").textContent.includes("RÁPIDO");
+  try{
+    const r = await fetch("/api/dev-mode",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({on:ligar})}).then(r=>r.json());
+    if(r && r.ok) setDevUI(r.dev);
+  }catch(e){}
+};
+
 async function updateCheck(tent){
   let d;
   try{ d=await fetch("/api/update-check").then(r=>r.json()); }
@@ -1961,12 +2002,7 @@ async function updateCheck(tent){
   if($("#brand-ver")) $("#brand-ver").title =
     `Bancada v${d.current} (${fmtData(d.date)}) · firmware v${d.firmware}`+(d.notes?`\n${d.notes}`:"");
   const st=$("#bv-status");
-  if(d.dev){                                 // ⚡ MODO DEV: badge fixo, vence tudo
-    if(st){ st.className="bv-old";
-      st.textContent="⚡ MODO DEV — só grava/valida; passos pulados; cadastro bloqueado";
-      st.onclick=null; }
-    return;
-  }
+  setDevUI(!!d.dev);                         // ⚡ estado inicial do toggle de modo
   if(!d.checado){                            // checagem ainda rodando: re-tenta
     if(st){ st.className="bv-check"; st.textContent="verificando atualização…"; st.onclick=null; }
     if((tent||0)<5) setTimeout(()=>updateCheck((tent||0)+1), 2500);
@@ -2038,6 +2074,17 @@ class Handler(BaseHTTPRequestHandler):
             b = self._body()
         except Exception:
             b = {}
+        if self.path == "/api/dev-mode":
+            # ⚡ Toggle do modo de gravação pela UI (09/07, pedido do Leonardo):
+            # RÁPIDO (sem testes) = só Gravar/Validar executam, demais passos
+            # pulados com aviso, cadastro bloqueado · COMPLETO = fluxo normal.
+            # BANCADA_DEV=1 no ambiente continua valendo como estado inicial.
+            global DEV_MODE
+            DEV_MODE = bool(b.get("on"))
+            LOG("⚡ modo de gravação RÁPIDO (sem testes): passos pulados, "
+                "cadastro bloqueado" if DEV_MODE else
+                "✅ modo de gravação COMPLETO (com testes) ativo", "hi")
+            self._send(200, {"ok": True, "dev": DEV_MODE}); return
         if self.path == "/api/step":
             self._send(200, self._step(b)); return
         if self.path == "/api/test":
