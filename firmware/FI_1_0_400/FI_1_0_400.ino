@@ -95,7 +95,6 @@
 
 // To commands in the BLE1010
 // To receive BLE1010
-
 #define testBLE1010 "AT\r"  // Command AT to test
 #define desactDefPasBLE1010 "AT+TYPE0\r"
 #define modeRCBLE1010 "AT+MODE2\r"
@@ -107,13 +106,6 @@
 #define lostConnecBLE1010 "AT+DROP\r"
 // To ask BLE1010
 #define askMACBLE1010 "AT+ADDR?\r"  // Command AT to ask the MAC adress
-
-// adicionar 
-
-#define IMMEDIATEBLE1010 "AT+IMME1\r"  // Command AT to set the BLE1010 in immediate mode
-#define renew "AT+RENEW\r"  // Command AT to renew the BLE1010
-#define start "AT+START\r"  // Command AT to set the BLE1010 in factory mode
-
 
 #if (pinMosfetBle == 7)
 
@@ -624,15 +616,15 @@ char processCharInput(char* cmdBuffer, const char c) {
 
 void setupSerials() {
     Serial.begin(SERIAL_BAUD);  // Monitor Serial Arduino
-    bluetooth.begin(9600);      // Terminal BLE
+    bluetooth.begin(2400);      // Terminal BLE
     bluetooth.write("AT+UART1\r");
     delay(timeToWaitBLE1010);
     readBLE();
-    bluetooth.write("AT+BAUD2\r");
+    bluetooth.write("AT+BAUD0\r");
     delay(timeToWaitBLE1010);
     readBLE();
     bluetooth.end();
-    bluetooth.begin(9600);
+    bluetooth.begin(2400);
 }  // end setupSerials
 
 //*****************************************************************************************************************

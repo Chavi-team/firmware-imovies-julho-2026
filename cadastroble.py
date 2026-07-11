@@ -151,13 +151,13 @@ async def configurar_ble(uuid, device_name_ble, befc, aftc, modo_busca=False):
     prefixo = "🔍 Testando" if modo_busca else "--- 🔵 Conectando"
     print(f"{prefixo}: {uuid} ---")
     
-    # LISTA CORRIGIDA: Alinhada estritamente com o hardware da fechadura e firmware 1.5
     commands = [
-        "AT+BAUD2",     # Mantém compatível com a SoftwareSerial do Arduino
-        "AT+MODE2",     # Garante o modo de operação livre
+        "AT+BAUD0",     
+        "AT+PWRM1",
         f"AT+BEFC{befc}", 
         f"AT+AFTC{aftc}", 
-        f"AT+NAME{device_name_ble}"
+        f"AT+NAME{device_name_ble}",
+        "AT+SHIELD1"
     ]
     
     try:
@@ -165,12 +165,10 @@ async def configurar_ble(uuid, device_name_ble, befc, aftc, modo_busca=False):
         async with BleakClient(uuid, timeout=tm_out) as client:
             if not client.is_connected: return False
             
-            # Tempo necessário para o rádio estabilizar a conexão
             await asyncio.sleep(1.5)
             await client.start_notify(CHARACTERISTIC_UUID, notification_handler)
             await asyncio.sleep(0.5)
             
-            # Testa se o canal responde antes de mandar os parâmetros
             await client.write_gatt_char(CHARACTERISTIC_UUID, b"AT+VERS?\r\n", response=False)
             await asyncio.sleep(1.0)
             
@@ -181,29 +179,25 @@ async def configurar_ble(uuid, device_name_ble, befc, aftc, modo_busca=False):
             if modo_busca:
                 print("   ✅ Identificado! Enviando restante das configurações...")
 
-            # Envia a carga de parametrização
             for cmd in commands:
                 if modo_busca and cmd == "AT+VERS?": continue
                 print(f"      ⚡ Enviando para Hardware: {cmd}...")
                 cmd_bytes = f"{cmd}\r\n".encode('utf-8')
                 
-                # Força o sincronismo de envio para não estourar o buffer serial lento (2400bps)
                 try:
                     await client.write_gatt_char(CHARACTERISTIC_UUID, cmd_bytes, response=True)
                 except:
                     await client.write_gatt_char(CHARACTERISTIC_UUID, cmd_bytes, response=False)
                 
-                # Pausa estratégica para gravação estável na memória flash do chip
                 await asyncio.sleep(0.8) 
             
-            # Comando final que sela e grava tudo na partição permanente
             print("🔄 Invocando gravação permanente: AT+RESET...")
             try:
                 await client.write_gatt_char(CHARACTERISTIC_UUID, b"AT+RESET\r\n", response=False)
                 await asyncio.sleep(0.5)
                 await client.stop_notify(CHARACTERISTIC_UUID)
             except:
-                pass # Ignora erro de desconexão natural gerado pelo reboot do rádio
+                pass
                 
             return True
                 
@@ -240,9 +234,7 @@ async def busca_automatica(device_name_ble, befc, aftc):
     return False
 
 async def vincular_organizacao(client, device_id, headers):
-    """Executa o PATCH na rota limpa de assign conforme a documentação"""
     print(f"🔗 [Passo 2] Vinculando dispositivo ID {device_id} à Organização 7...")
-    
     URL_VINCULO = "https://api-imoveis.chavi.com.br/v2/api/admin/devices/assign"
     
     payload_vinculo = {
@@ -251,7 +243,6 @@ async def vincular_organizacao(client, device_id, headers):
     }
     
     res_vinculo = await client.patch(URL_VINCULO, json=payload_vinculo, headers=headers, timeout=10.0)
-    
     print(f"   📡 [DEBUG] Status do Servidor: {res_vinculo.status_code}")
     print(f"   📡 [DEBUG] Resposta: {res_vinculo.text}")
 
@@ -261,7 +252,6 @@ async def vincular_organizacao(client, device_id, headers):
     else:
         print(f"❌ Falha ao vincular à empresa. Status: {res_vinculo.status_code}")
         return False
-    
 
 async def cadastrar_fechadura_api(serial_number, name, mac_bluetooth):
     global mac_hardware_scaneado
@@ -302,7 +292,6 @@ async def cadastrar_fechadura_api(serial_number, name, mac_bluetooth):
                 
             elif response.status_code in [409, 422]:
                 print(f"⚠️ [API] Equipamento já existente no banco geral. Localizando ID para atualizar organização...")
-                
                 URL_BUSCA = f"https://api-imoveis.chavi.com.br/v2/api/admin/devices?serial_number={serial_number}"
                 res_busca = await client.get(URL_BUSCA, headers=headers, timeout=10.0)
                 
@@ -369,18 +358,33 @@ async def main():
         print("\n📋 Escolha o modo de operação para esta placa:")
         print("   [1] Fazer TUDO (Firmware + BLE + Cadastro API)")
         print("   [2] Apenas Firmware")
-        print("   [3] Apenas Bluetooth (BLE)")
+        print("   [3] Apenas Bluetooth (Manda Comandos AT)")
         print("   [4] Apenas Cadastrar na API")
         modo = input("Digite a opção desejada (Padrão = 1): ").strip()
         if modo not in ['1', '2', '3', '4']:
             modo = '1'
 
+        # CORREÇÃO: Opção 4 isolada no topo para evitar qualquer scan
         if modo == '4':
             await cadastrar_fechadura_api(serial_number=serial_api, name=nome_formatado_api, mac_bluetooth=None)
             input("\n--- PRÓXIMA PLACA? (Pressione Enter) ---")
             manter_dados = False
             continue
 
+        # CORREÇÃO: Opção 2 isolada aqui. Roda o firmware físico e encerra o ciclo imediatamente!
+        if modo == '2':
+            print(f"\n🚀 [2] Gravando Apenas Firmware...")
+            try:
+                subprocess.run(["./upload", device_id_upload, firmware_name, mosfet], check=True)
+                print("✅ Upload de Firmware concluído com sucesso!")
+            except Exception as e:
+                print(f"❌ Erro no upload físico: {e}")
+            
+            input("\n--- PRÓXIMA PLACA? (Pressione Enter) ---")
+            manter_dados = False
+            continue
+
+        # Fluxos das opções [1] e [3] que obrigatoriamente precisam de comunicação BLE
         target = await scan_and_select()
         if target == "voltar" or target is None:
             opcao = input("\n[Enter/s] Buscar Novamente / [n] Mudar dados do Firmware: ").lower()
@@ -389,28 +393,20 @@ async def main():
 
         manter_dados = False
 
-        if modo in ['1', '2']:
+        # Aqui cai apenas se for a opção [1], gravando o firmware antes de parametrizar o BLE
+        if modo == '1':
             print(f"\n🚀 [1] Gravando Firmware...")
             try:
                 subprocess.run(["./upload", device_id_upload, firmware_name, mosfet], check=True)
                 print("✅ Upload concluído.")
             except:
                 print("❌ Erro no upload físico.")
-                if modo == '1':
-                    if input("Tentar Bluetooth mesmo assim? (s/n): ").lower() != 's': continue
-                else:
-                    input("\n--- PRÓXIMA PLACA? (Pressione Enter) ---")
-                    continue
+                if input("Tentar Bluetooth mesmo assim? (s/n): ").lower() != 's': continue
 
             print("⏳ Aguardando rádio reiniciar...")
             await asyncio.sleep(3)
-            
-            # CRUCIAL: Se for APENAS firmware (opção 2), encerra aqui o fluxo e pula para a próxima placa.
-            if modo == '2':
-                input("\n--- PRÓXIMA PLACA? (Pressione Enter) ---")
-                manter_dados = False
-                continue
 
+        # Processamento BLE comum para as opções [1] e [3]
         if modo in ['1', '3']:
             while True:
                 sucesso = await configurar_ble(target.address, device_name_ble, befc_hex, aftc_hex)
@@ -419,7 +415,7 @@ async def main():
                     print(f"\n🎉 SUCESSO: {device_name_ble} configurado via BLE!")
                     print("\a")
                     
-                    if modo == '1' or (modo == '3' and input("Deseja enviar o cadastro para a API agora? (s/n): ").lower() == 's'):
+                    if modo == '1':
                         await cadastrar_fechadura_api(
                             serial_number=serial_api, 
                             name=nome_formatado_api, 
@@ -437,7 +433,7 @@ async def main():
                             print(f"\n🎉 SUCESSO via busca automática!")
                             print("\a")
                             
-                            if modo == '1' or (modo == '3' and input("Deseja enviar o cadastro para a API agora? (s/n): ").lower() == 's'):
+                            if modo == '1':
                                 await cadastrar_fechadura_api(
                                     serial_number=serial_api, 
                                     name=nome_formatado_api, 

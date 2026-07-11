@@ -1,2335 +1,1386 @@
 /*
-  Firmware nova produção FIs - FI 1.5
-
-  Atualizacao FI = 360 - Alteracoes SOFT para adequacao da FI com a comunicacao dos BLE v3 e v4, adicionado delay de 50ms no setupCalibration para compatibilizar com o app iOS
-                       - Alterado bluetooth.println para SendDataBLE
-
-*/
-
-//*****************************************************************************************************************
-// Library(ies)
-//*****************************************************************************************************************
-
-#include <Adafruit_INA219.h>  // Library to INA219
-#include <EEPROM.h>           // Library to read/write EEPROM
-#include <FastLED.h>
+ * chavi_fi.ino — Firmware BYPASS das fechaduras Chavi FI (setor imobiliário).
+ *
+ * Filosofia: confiabilidade > segurança (decisão do cliente). Não valida seed,
+ * não valida token, aceita tudo — mas fala o MESMO protocolo dos ~1000 apps em
+ * campo (desafio -> 2 saltos -> 3 writes -> comando), então nada muda no app.
+ *
+ * BAUD DO MÓDULO = 9600 (padrão de FÁBRICA — se o módulo resetar, volta pro
+ * baud do firmware = auto-cura). O provisionamento do 1º boot converge módulos
+ * em outros bauds via sweep às cegas (AT+BAUD2+AT+RESET em cada candidato — os
+ * clones não respondem "OK" a um "AT" pelado, detecção por resposta não é
+ * confiável). Boots seguintes = só config leve (sem reset).
+ *
+ * ⭐ IDENTIFICAÇÃO DO MÓDULO (v2.10, manuais oficiais Soft 1010 REV11 + 5.2 R05):
+ * a frota mistura DOIS chips que falam a mesma AT — o AT+VERS? diz qual é:
+ *   "Soft AT 5.2 ver.XX"           -> BLE 5.2 (EFR32BG22)
+ *   "Soft AT ver.XX"/"Soft ATm..." -> BLE-1010 (CSR-1010, BT 4.1)
+ * A FAMÍLIA+REV dirigem a config: AT+STATUS só existe no 5.2; no 5.2 rev<04 o
+ * BEFC/AFTC/PIO/COL são QUEBRADOS (respondem só 0x000 — corrigido na REV04,
+ * histórico do manual R05) e o STATUS é o único wake que funciona; no 1010 o
+ * wake é SEMPRE o AFTC. Família (EEPROM 915) e rev (768) ficam persistidas.
+ *
+ * PINO DO MOSFET parametrizado (EEPROM 914, default 8): a esteira legada usou
+ * PIO 4..9 conforme a placa — as máscaras BEFC/AFTC e o corte da hibernação
+ * (AT+PIOx0) são calculadas em runtime do byte gravado pelo gravar.sh/bancada.
+ *
+ * AUTO-CURA DO NOME (v2.10): após o AT+NAME o firmware LÊ DE VOLTA (AT+NAME?)
+ * e compara com o serial — UART marginal garble o último byte (caso real:
+ * "002FI00187<") e antes só a bancada consertava; agora todo boot conserta.
+ *
+ * FEEDBACK SONORO/VISUAL (o instalador entende o que está acontecendo):
+ *   ligar bateria: 1 bipe curto ......... "estou vivo" (se não tocar = energia)
+ *   fim do boot OK: MELODIA (fanfarra do Rocky) + 3 piscadas VERDES = PRONTA
+ *   fim do boot com módulo mudo: 4 bipes GRAVES + 2 piscadas VERMELHAS
+ *   conectou o celular: 1 bipe curto agudo (acordou por BLE; se conectar e NÃO
+ *     bipar, o pino de wake não subiu — módulo/solda)
+ *   comando executado (abrir/fechar): o giro do motor é o feedback
+ *   botão: bipe a cada marco (ver BOTÃO abaixo)
+ *
+ * BOTÃO FÍSICO (PD2):
+ *   toque CURTO (<0,8s) ........ aciona o motor em TOGGLE (alterna o sentido a
+ *                                cada toque) — destranca/tranca sem celular
+ *   segurar 3s+ ................ bipes de contagem (1 por segundo, subindo)
+ *   segurar 10s ................ RESET TOTAL: melodia descendente, apaga a
+ *                                config do módulo (re-provisiona o rádio no
+ *                                boot) e reinicia o MCU por watchdog — efeito
+ *                                de "tirar e recolocar a bateria". NÃO apaga
+ *                                serial/seeds/calibração.
+ *   soltar entre 0,8s e 10s .... cancela (1 bipe grave), não faz nada
+ *
+ * Comandos de BANCADA (texto via FFE1, usados pela GUI tools/bancada.py):
+ *   TST-PING  -> "PONG"                       (comunicação fim-a-fim ok)
+ *   TST-BUZ   -> toca o buzzer, "OK-BUZ"
+ *   TST-LED   -> acende os 3 WS2812 R/G/B/branco, "OK-LED"
+ *   TST-MOT1  -> gira o motor sentido A, "OK-MOT1".."FIM-MOT1"
+ *   TST-MOT2  -> gira o motor sentido B, "OK-MOT2".."FIM-MOT2"
+ *   TST-BAT   -> "BAT:x.xx" (ADC da bateria)
+ *   TST-INFO  -> SER/CAL/SEEDS/MOD/MODF/INA/PLACA/MOSFET/WAKE/VER, "FIM-INFO"
+ *   TST-UART  -> rajada-padrão "UARTn:0123456789ABCDEF" ×5 (a bancada confere a
+ *                integridade — diagnóstico de UART marginal SEM multímetro)
+ *   TST-ECO<x>-> "ECO:<x>" (eco do payload — testa RX+TX do MCU pelo túnel)
+ *   TST-ALL   -> roda tudo em sequência, "FIM-TST"
+ *
+ * TIMING DA CALIBRAÇÃO (pegadinha do app): depois de escrever (tokens+190720,
+ * ou CALIBRACAO-FI) o app espera 1000ms ANTES de armar o listener de
+ * notificação — e o stream não tem histórico. Resposta enviada cedo demais se
+ * PERDE e vira CALIBRACAOERROR. Por isso as respostas "11" da calibração são
+ * seguradas ~1,2-1,5s e enviadas EM DOBRO (o app espera 2 notificações).
+ *
+ * ATmega328/328PB @ 16MHz CRISTAL (MiniCore; a placa FI 1.5 tem StepUp 5V
+ * MT3608 -> MCU a 5V, dentro do SOA de 16MHz que exige VCC>=3,78V). Módulo BLE
+ * em SoftwareSerial (PD4/PD5 — nesses pinos NÃO existe UART de hardware em
+ * nenhum 328; o USART1 do 328PB fica em PB3/PB4 = candidato p/ revisão de
+ * placa). Com AT+DELI3: cada write BLE chega na UART terminado em '\n', e cada
+ * linha que enviamos vira UMA notificação (o '\n' é consumido).
+ */
+#include <EEPROM.h>
+#include <SoftwareSerial.h>
+#include <avr/wdt.h>
+#include <avr/sleep.h>
 #include <Wire.h>
-#include <avr/wdt.h>  // Library to watchdog timerDEBUG
-#include <stdlib.h>   // Library to calculate basics
-#include <string.h>
+#include <Adafruit_INA219.h>
+#include "LowPower.h"
+#include <FastLED.h>
 
-#include "LowPower.h"        // Library to low power device
-#include "SoftwareSerial.h"  // Library to communicate BLE1010 with ATMEGA328P
-#include "interface.h"
-#include "interrupt.h"
-#include "version.h"
-#include "utils.h"
-#include "SerialNumber.h"
+#define FW_VERSION   "2.12.1"
 
-//*****************************************************************************************************************
-// Contant(s)
-//*****************************************************************************************************************
+// ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
+// Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
+// gate é o PIO8 do módulo BLE (PIO8 ALTO = eletrônica LIGADA):
+//   AT+PIO80  -> corta o trilho NA HORA (o MCU DESLIGA; consumo ~zero)
+//   AT+AFTC028 -> ao CONECTAR o módulo religa o PIO8 -> o MCU dá boot e atende
+//   AT+BEFC020 -> ao DESCONECTAR religa também (o MCU boota, faz manutenção e
+//                 corta de novo) — é o ciclo do FI_1_0_400 de produção.
+// Vantagem extra: acorda por CONEXÃO sem depender do pino de wake PD3.
+// Custo: com o trilho cortado o BOTÃO FÍSICO não funciona (MCU desligado).
+// ✅ PROVADO em bancada (05/07 12:42, CH003FI003066 v2.2.2): TST-HIB cortou
+// (silêncio) e a reconexão religou o MCU com PONG imediato. LIGADO.
+#define FEATURE_HIBERNA_MOSFET  1
 
-// Hardware mapping
-#define pinRxBLE1010 PIN_PD4
-#define pinTxBLE1010 PIN_PD5
-#define pinBuzzer PIN_PD6
-#define pinLEDs PIN_PB3
+// ---- pinos ----
+// COMUNS às duas gerações (FI 1.0 e FI 1.5):
+#define PIN_BLE_RX   PIN_PD4
+#define PIN_BLE_TX   PIN_PD5
+#define PIN_BUZZER   PIN_PD6
+#define PIN_BUTTON   PIN_PD2
+#define PIN_WAKE     PIN_PD3
+#define PIN_BAT      A1        // PC1, divisor da bateria
+// DIFERENTES por geração (decidido em RUNTIME pelo byte de placa na EEPROM):
+//   FI 1.5: motor PB1/PB2 (pinos 9/10), 3× WS2812 no PB3 (pino 11)
+//   FI 1.0: motor PB2/PB3 (pinos 10/11), 3 LEDs discretos nos pinos 7/8/9
+#define PIN_LEDS     PIN_PB3   // WS2812 (só FI 1.5 — no 1.0 o PB3 é o motor!)
+#define PIN_LED10_1  PIN_PD7   // LEDs discretos do FI 1.0
+#define PIN_LED10_2  PIN_PB0
+#define PIN_LED10_3  PIN_PB1
 
-// To motor
-#define pinTurn01 PIN_PB1
-#define pinTurn02 PIN_PB2
+// BAUD do módulo BLE = 9600 (AT+BAUD2) = PADRÃO DE FÁBRICA do módulo (manual
+// pág.8/22). ⭐ PROVA (MS BLE Explorer na CH003FI002734): AT+BAUD? -> "OK+Get2"
+// = 9600. O módulo SAI DE FÁBRICA em 9600; forçá-lo a 2400 exige falar 9600 com
+// ele, e SoftwareSerial a 9600 no RC de 8MHz é marginal -> a conversão falhava e
+// o módulo ficava mudo p/ o MCU. Usar 9600 NATIVO elimina a briga: é a config de
+// referência do fabricante (Arduino a 16MHz + SoftwareSerial 9600, manual pág.12).
+// CLOCK: CRISTAL EXTERNO 16MHz (a placa TEM — schema1/2: X1 16MHz + 22pF). É
+// OBRIGATÓRIO p/ SoftwareSerial a 9600 ser confiável (o RC de 8MHz não dá conta).
+// Sem 2400-slow, o "wake por dado" some — mas com AT+PWRM0 (auto-sleep OFF) o
+// módulo não dorme, então não precisamos dele.
+#define BAUD_MODULO  9600
+#define AT_BAUD_CMD  "AT+BAUD2"    // -> 9600 (padrão de fábrica do módulo)
 
-// To battery level
-#define pinBattery01 PIN_PC1  // Bateria
-#define pinBattery02 PIN_PC0  // 5V
+// Motor REAL (abrir/fechar/calibração): igual ao FI_1_5 de produção — gira até
+// detectar o BATENTE pela corrente (INA219 no I2C 0x45) ou até o teto duro.
+// O pulso por tempo (MOTOR_MS) é só o FALLBACK quando o INA219 não responde.
+#define INA_ADDR          0x45
+#define MOTOR_STALL_MA    300      // corrente de batente (= stallMotor do FI_1_5)
+#define MOTOR_TIMEOUT_MS  10000    // teto duro de giro (= timeoutMotor do FI_1_5)
+#define MOTOR_ARRANQUE_MS 300      // ignora o pico de arranque (inrush > 300mA)
+#define MOTOR_MS     1000      // fallback por tempo (sem INA219)
+// RECUO ("line up" do FI_1_5): após bater no fim de curso, gira um pouco no
+// sentido CONTRÁRIO para ALIVIAR a pressão do batente (senão o came fica
+// forçando o fim de curso e a próxima abertura pode travar). O legado usa
+// timeToLineUP=1000ms; aqui é ajustável. 0 = sem recuo.
+#define MOTOR_RECUO_MS   900
+#define MOTOR_TST_MS 450       // pulso curto do motor no TESTE de bancada
+                               // (menos energia de stall -> menos brownout)
+#define JANELA_MS    20000     // ocioso E desconectado: dorme após isso
+#define JANELA_TST   60000     // janela estendida durante testes de bancada
+#define JANELA_MAX   600000UL  // teto absoluto acordada (10 min) — mesmo conectada
 
-// To wakeup uC
-#define pinPushButton PIN_PD2
-#define pinWakeuC PIN_PD3
+// Gap entre NOTIFICAÇÕES consecutivas. ⚠️ ESTE lote de módulo ("Soft BLE 5.2")
+// IGNORA o '\n' e fatia as notificações por TEMPO: writes a <~50ms colam numa
+// notificação só (o app espera 2 -> F05). Com 60ms já separava (v2.2.x);
+// 150ms dá folga e ainda fica bem dentro do timeout de 3s do app.
+#define GAP_NOTIF_MS 150
 
-// To LEDs
-#define NUM_LEDS 3
-#define MAX_BRIGHT 150
+#define BTN_CURTO_MS   800     // até aqui = toque curto (toggle do motor)
+#define BTN_RESET_MS   10000   // segurar até aqui = reset total
 
-// To serial
-#define BAUDSerial 9600  // SOFT - FI = 360 - Alterada a macro de SERIAL para BAUDSerial para nao conflitar com SERIAL de outra library que tinha valor 1
-#define CMDBUFFER_SIZE 32
+#define NUM_LEDS     3
+#define LED_BRIGHT   50        // brilho dos WS2812 (0-255) — baixo p/ poupar corrente
 
-// To time
-#define timeToWait 1
-#define timeToWaitBLE1010 500
-#define timeToRotation 6000
+// ---- EEPROM (compat com gerar_seed.py / seedGenerator.py legado) ----
+#define EE_CALIB        3      // calibrationOk (sentido de giro)
+#define EE_CALIB_VERIF  4      // verifierCalibration (calibração feita)
+#define EE_SEED01       5
+#define EE_SEED02       15
+#define EE_VERS_BLE     768    // REV do firmware do módulo (3, 5, 12... 0=não leu)
+#define EE_SERIAL       769    // 11 chars sem "CH"
+#define EE_MOD_CFG      910    // 0xC9 = módulo já provisionado (baud+config+nome)
+#define MOD_CFG_MAGIC   0xC9
+#define EE_HIB          911    // 1 = desligou hibernando (boot seguinte = wake)
+#define EE_BOARD        912    // 1 = placa FI 1.0; qualquer outro valor = FI 1.5
+#define EE_HIBERNA      913    // 1 = HIBERNAÇÃO por corte de MOSFET ligada (default
+                               // 0 = sono leve IDLE, seguro). Ativa via HIB-ON após
+                               // validar o ciclo corta->religa na bancada (TST-HIB).
+                               // (gravado pelo seed.bin/gerar_seed.py conforme a placa)
+#define EE_MOSFET       914    // PIO do módulo que chaveia o MOSFET (4..9; fora da
+                               // faixa/0xFF = default 8). Gravado pelo gravar.sh.
+#define EE_MOD_FAM      915    // família do módulo (FAM_*), persistida na identificação
+// 916: QUEIMADO — foi a "variante sem MOSFET" (v2.11.0, removida na v2.11.1:
+// provado em bancada+app que a placa sem MOSFET funciona com a config NORMAL,
+// pois o MCU dela é sempre alimentado). Não reusar o byte sem apagar a frota.
 
-#define timeToLineUP 1000
+// ---- família do módulo BLE (identificada pelo AT+VERS? — manuais Soft) ----
+#define FAM_DESCONHECIDA 0
+#define FAM_1010         1     // "Soft AT ver.XX" / "Soft ATm ver.XX" (CSR-1010)
+#define FAM_52           2     // "Soft AT 5.2 ver.XX" (EFR32BG22)
 
-#define timeOutGoToSleep 15000
-#define timeToSoftStart 1500
-#define timeoutMotorProduction 5000
+// ---- protocolo ----
+#define CMD_ABRIR   1
+#define CMD_FECHAR  2
+#define TOK_CALIB   190720UL   // token de calibração (mesmo do FI_1_5)
 
-// To commands in the BLE1010
-// To receive BLE1010
-#define DelimSerial "AT+UTIM0"  // SOFT - FI = 360 - Comando para alterar comportamento de rx dados na serial, 0 = Delimitador (\n ou \r), 1 = Timeout Serial
-#define testBLE1010 "AT"        // Command AT to test
-#define desactDefPasBLE1010 "AT+TYPE0"
-#define modeRCBLE1010 "AT+MODE2"
-#define roleSlaveBLE1010 "AT+ROLE0"
-#define delimitBLE1010 "AT+DELI3"
-#define baud9600BLE1010 "AT+BAUD2"
-#define actNotiBLE1010 "AT+NOTI1"
-#define preConnBLE1010 "AT+BEFC000"
-#define posConnBLE1010 "AT+AFTC008"
-#define toStatePIO60 "AT+PIO60"
-#define nameBLE1010producao "AT+NAMECHAVIFIPR"
-#define resetBLE1010 "AT+RESET"
-#define lostConnecBLE1010 "AT+DROP"
-#define ENDFrameVer03 '\n'  // SOFT - FI = 360 - Final de frame para BLE v03
-#define ENDFrameVer04 '\0'  // SOFT - FI = 360 - Final de frame para BLE v04
+// ---- debug serial (UART de HARDWARE, PD1=TX / PD0=RX — o módulo BLE usa a
+// PD4/PD5 do SoftwareSerial, não conflita). Ligue um USB-TTL:
+//   cabo PRETO (GND)  -> GND da placa       (sempre primeiro!)
+//   cabo BRANCO (RX)  -> pad TX da placa
+//   cabo VERMELHO     -> NÃO LIGA (a placa se alimenta da bateria)
+// Terminal a 9600: tools/.venv-bancada/bin/pyserial-miniterm <porta> 9600
+// Só imprime (não lê) — custo mínimo; pode ficar ligado em produção se quiser.
+#define FEATURE_SERIAL_DEBUG 0
+#define DBG_BAUD 9600
+#if FEATURE_SERIAL_DEBUG
+  #define DBG(...)   Serial.print(__VA_ARGS__)
+  #define DBGLN(...) Serial.println(__VA_ARGS__)
+#else
+  #define DBG(...)
+  #define DBGLN(...)
+#endif
 
-// Define os comandos BLE e as respostas esperadas para diferentes versões do BLE
-#define PFXVersaoBLE "Soft AT 5.2 ver."     // Prefixo da string de resposta da versao do BLE
-#define Versao03BLE "Soft AT 5.2 ver.03\n"  // Resposta da versao do BLE para Rev03
-#define Versao04BLE "Soft AT 5.2 ver.04\n"  // Resposta da versao do BLE para Rev04
-
-#define ENDWriteCommand '\0'  // SOFT - FI = 360 - Finalizador de string para comandos
-#define ENDWriteData '\r'     // SOFT - FI = 360 - Finalizador de string para dados
-
-#define SEEDDelimData '\n'   // SOFT - FI = 360 - Delimitador de dados para o envio das seeds durante o setup inicial no App, onde compatibiliza a v03 com v04 do BLE
-#define CALIBDelimData '\n'  // SOFT - FI = 360 - Delimitador de dados para o envio das respostas de calibracao para o App, onde compatibliza a v04 com a v04 do BLE
-
-#define setStatusPIO6_BLE1010 "AT+STATUS6"
-// To ask BLE1010
-#define askMACBLE1010 "AT+ADDR?"  // Command AT to ask the MAC adress
-#define versBLE1010 "AT+VERS?"
-#define SIZEPfxVersaoBLE 16  // SOFT - FI = 360 - Tamanho da string de prefixo da versao de BLE
-#define SIZEVersaoBLE 2      // SOFT - FI = 360 - Tamanho da versao do BLE
-#define SIZEAddrMAC 20       // SOFT - FI = 360 - Tamanho da resposta do MAC Address do BLE
-#define VersaoFW(V) (V)      // SOFT - FI = 360 - Macro para versao de FW do BLE
-
-// To EEPROM
-#define setupSeedOk 1
-#define generalSetupOk 2
-#define calibrationOk 3
-#define verifierCalibration 4
-#define address01Seed01 5
-#define address01Seed02 15
-#define address01Seed03 25
-#define address01Seed04 35
-#define address01MAC 45
-#define configurationDevice 100
-#define setupProductionOk 150
-
-// To PWM
-#define minValuePWM 0
-#define maxValuePWM MAX_BRIGHT
-
-// To sound brand
-#define maxNotes 3
-#define timeToTone 500
-#define toneDefault 1000
-
-// To battery level
-#define constBatteryLevel 5 / 1024
-#define constBatteryLevelAnalog 0.0047875855  // Novo Calculo
-#define maxValueBattery 4.08
-#define minValueBattery 3.40
-#define percBattery 100
-#define showTheBatteryLevel 1000
-#define voltageThresholdLow 3.40       // Adicione esta linha para definir o limite de tensão baixa
-#define voltageThresholdCritical 3.25  // Adicione esta linha para definir o limite de tensão crítica
-
-// To INA219
-#define INA_Address 0x45
-#define nSamples 100
-#define stallMotor 300
-#define timeoutMotor 10000
-#define turnOne3 -10
-
-// To setup deveice
-#define token03SetupDevice 150993
-#define tokenSetupSeed 140197
-#define tokenCalibration 190720
-#define testMotor 1509
-
-// To calibration
-#define commandToStartCali "CALIBRACAO-FI"
-#define commandToDoorOpen "PORTA-ABERTA"
-#define commandToDoorClose "PORTA-FECHADA"
-
-// To production
-#define commandToBLE1010 "CHAVI-PRODUCAO"
-#define commandToMotor "MOTOR-TESTE"
-#define commandToAuto "TESTE-AUTO"
-#define commandToBotao "TESTE-BOTAO"
-
-// To panic
-#define valueToPanic 5
-#define timeToPanicSegurite 5000
-
-// sleep
-
-unsigned long previousMillis = 0;
-const unsigned long interval = 60000;  // 60 segundos em milissegundos
-bool sleepCalled = true;
-volatile bool bleActivated = false;
-
-//*****************************************************************************************************************
-// Prototype of the function(s)
-//*****************************************************************************************************************
-
-// To setup
-void setupSerials();
-void setupPins();
-void setupInterrupts();
-void setupBLE01(bool prodOK = true);
-void setupADC();
-void setupEEPROM();
-void setupI2C();
-void seedSetup();
-void receiveSeed();
-void sendSeedOk();
-void changeName(bool lenta = true);
-void interruptSetup();
-void pushButtonInterrupt();
-void bluetoohInterrupt();
-void setupProduction();
-void operateProduction();
-char processCharInput(char *cmdBuffer, const char c);
-void setupCalibration();
-
-// To operate
-void turnOnLEDsDelay(CRGB crgb = CRGB(MAX_BRIGHT, MAX_BRIGHT, MAX_BRIGHT), int atraso = 0);
-void turnOnLEDs(CRGB crgb = CRGB(MAX_BRIGHT, MAX_BRIGHT, MAX_BRIGHT));
-void turnOffLEDs();
-void stopMotor();
-void rotateMotor01();
-void rotateMotor02();
-void functionPBOperate();
-void operateAllOk();
-void readBLE1010();
-void setupDeviceComplete();
-void readCalibration();
-void turnMotor();
-float readCurrentInmA();
-void goToSleep();
-void interfaceFI(Interface flagInterface);
-void readBatteryLevel();
-void disconnectBLE1010();
-void activeBLE1010Connect();
-unsigned long getpass_do_lolis(unsigned long difference, unsigned long seed);
-void readINA219();
-void turnTheMotor01();
-void turnTheMotor02();
-void soundBrand();
-void showBatteryLevel();
-void functionPanic();
-void functionDelta();
-unsigned long send_saltos(unsigned long random_input, unsigned long seed);
-void toneDefaultByTime(unsigned int duration, unsigned int frequency = toneDefault);
-String RespostaBLE(bool lenta = true);
-String rotinaWriteBluetooth(const char *str, bool lenta = true);
-void setupConfigurationDevice();
-void clearCMDBuffer();
-char CheckVersBLE(void);                                 // SOFT - FI = 360 - Funcao para identificar versao do BLE, para saber se precisa do \n ou nao, separa v03 de v04 do BLE
-void SendDataBLE(const char *TxData, char AddData = 0);  // SOFT - FI = 360 - Funcao para enviar os dados de transmissao para o BLE, compatibliza v03 e v04 do BLE
-
-//*****************************************************************************************************************
-// Object(s)
-//*****************************************************************************************************************
-
-// To BLE1010
-SoftwareSerial bluetooth(pinTxBLE1010, pinRxBLE1010);  // TX, RX (Bluetooth)
-
-// To INA219
-Adafruit_INA219 ina219(INA_Address);
-
-// To LEDs
+SoftwareSerial bluetooth(PIN_BLE_TX, PIN_BLE_RX);  // (TX, RX)
+Adafruit_INA219 ina219(INA_ADDR);
+bool inaOk = false;
+bool placa10 = false;                       // true = FI 1.0 (EE_BOARD==1)
+uint8_t g_pinMotorA = PIN_PB1;              // default FI 1.5
+uint8_t g_pinMotorB = PIN_PB2;
 CRGB leds[NUM_LEDS];
+unsigned long seed01 = 0, seed02 = 0;
+uint8_t calibrationOk = 0;
+uint8_t g_moduloVers = 0;      // REV do módulo (3, 5, 12...; 0 = não leu)
+uint8_t g_moduloFam = FAM_DESCONHECIDA;   // família (AT+VERS? — 1010 × 5.2)
+uint8_t g_pinMosfet = 8;       // PIO do MOSFET (EEPROM 914; default 8 = frota)
+char serialFech[12] = {0};
+volatile bool acordouBLE = false, acordouBtn = false;
+bool moduloOk = false;
+bool g_wakeHib = false;        // este boot foi um "acordar da hibernação"
+bool g_hiberna = false;        // HIBERNAÇÃO por corte de MOSFET ligada (EE_HIBERNA)
+bool g_sessaoConectada = false; // já tocou a melodia de "conectou" nesta sessão BLE
+void atenderBotao();           // usada pelo atenderApp (definida mais abaixo)
 
-CRGB corOK(0, MAX_BRIGHT, 0);
-CRGB corNOTOK(MAX_BRIGHT, 0, 0);
+// Canal de RESPOSTA (sempre BLE neste build; Stream* mantido p/ um futuro
+// modo cabo em placa com pads acessíveis).
+Stream* io = &bluetooth;
 
-//*****************************************************************************************************************
-// Global variable(s)
-//*****************************************************************************************************************
+// Após um reset por watchdog o WDT continua ARMADO em 15ms — sem isto o MCU
+// entra em loop infinito de reset. Roda antes do main() (seção .init3).
+void wdt_init(void) __attribute__((naked, used, section(".init3")));
+void wdt_init(void) { MCUSR = 0; wdt_disable(); }
 
-// Variables to setup BLE1010
-char VersBLE = 0;  // SOFT - FI = 360 - Variavel que armazena a versao do BLE, para durante o codigo tomar decisoes baseado nesse valor
-String command = "";
-String numberMacAddress = "";
+// Reset REAL do MCU (periféricos e registradores voltam ao estado de power-on,
+// como tirar a bateria) — nada de salto-para-zero do firmware antigo.
+void resetMCU() { wdt_enable(WDTO_15MS); while (1) {} }
 
-char b1;
+// ---- feedback sonoro/visual --------------------------------------------------
+void beep(uint16_t ms, uint16_t freq) { tone(PIN_BUZZER, freq, ms); delay(ms); noTone(PIN_BUZZER); }
 
-// To seed
-unsigned long inputBLE1010;
-unsigned long inputSeed01;
-unsigned long inputSeed02;
-unsigned long inputSeed03;
-unsigned long inputSeed04;
-unsigned long inputTimeStamp;
-unsigned long verifierSeed;
-int contadorSeed = 0;
-int counterToken = 0;
-int flagSeedOk = 0;
-char flagSetupSeed = 0x00;
-char flagReadBLE1010 = 0x00;
-char flagSeedSetup = 0x00;
-unsigned long numberToken01;
-unsigned long numberToken02;
-unsigned long numberToken03;
-unsigned long numberToken04;
-unsigned long timeOutReceiveiSeed = 0;
-unsigned long timeOutSeed = 30000;
-char flagTimeoutSeed = 0x00;
-
-// To token
-unsigned long token01 = 0;
-unsigned long token02 = 0;
-unsigned long token03 = 0;
-unsigned long token04 = 0;
-unsigned long receiveToken = 0;
-unsigned long receiveRandom = 0;
-unsigned long randNumber = 0;
-unsigned long saltos_1 = 0;
-unsigned long saltos_2 = 0;
-
-// To sound brand
-int sBrandOpen[] = {262, 392, 330};
-int sBrandClose[] = {349, 330, 262};
-char flagSoundBrand = 0x00;
-int timeToToneSeedSetup = 3000;
-int timeToToneDefault = 300;
-
-// To Interrupt
-volatile InterruptSource flagInterrupt = NONE;
-char flagSelectInterrupt = 0x00;
-
-// To motor
-int flagStateMotor = 0;
-
-// To battery
-float batteryLevelFloat = 0;
-float percBatteryLevel = 0;
-float oldPercBatteryLevel = 100;
-float batteryLevel = 0;
-float batteryLevelAnalog = 0;
-float batteryLevelAnalogddp = 0;
-
-#define statusDoorOpen 1000
-#define statusDoorClose 2000
-
-char flagShowBatteryLevel = 0x00;
-const float maxScaleBattery = maxValueBattery - minValueBattery;
-
-// To time
-unsigned long timeOutDKCount = 0;
-volatile char flagPressButton = 0x00;
-
-// To INA219
-float currentInmA = 0;
-float deltaD = 0;
-unsigned long timeoutStallMotor = 0;
-unsigned long timeoutStallMotor02 = 0;
-unsigned long timeoutStallMotor03 = 0;
-char flagStallMotor = 0x00;
-
-// To reset
-volatile int counterResetDance = 0;
-
-// To setup device complete
-char flagProximityOpening = 0x00;
-char flagWarningSound = 0x00;
-char flagLightWarning = 0x00;
-char flagLockTurns = 0x00;
-char flagLockTurnsError01 = 0x00;
-char flagLockTurnsError02 = 0x00;
-char flagButton = 0x00;
-char flagAutomaticClosing = 0x00;
-char flagDoorUnloockingWarning = 0x00;
-char flagOpenDoorWarning = 0x00;
-
-// To production
-int countMotorProduction = 0;
-char flagOperateProduction = 0x00;
-
-// To panic
-char flagToPanic = 0x00;
-
-// To close only
-unsigned long timeToCloseTheDoor;
-unsigned long timeToClose = 0;
-
-// To calibration
-char flagCalibrationFI01 = 0x00;
-char flagCalibrationFI02 = 0x00;
-char flagCalibrationFI03 = 0x00;
-char flagTurnMotor = 0x00;
-char flagStatusDoor = 0x00;
-char flagStatusDoor02 = 0x00;
-char flagVerifierCalibration = 0x00;
-char flagLineUpMotor = 0x00;
-int counterLockTurns01 = 0;
-int counterLockTurns02 = 0;
-static char cmdBuffer[CMDBUFFER_SIZE] = "";
-
-//*****************************************************************************************************************
-// To reset device
-//*****************************************************************************************************************
-
-void (*funcReset)() = 0;
-
-void interruptSetup() {
-    flagPressButton = 0x01;
+// LEDs de status. FI 1.5 = WS2812 (FastLED); FI 1.0 = 3 LEDs discretos ligam/
+// desligam juntos (sem cor — o firmware antigo também os trata em bloco).
+// Só usados em janelas com a UART ociosa (boot e testes) — FastLED.show
+// desliga IRQ e corromperia um RX BLE em andamento.
+void ledCor(const CRGB& c) {
+    if (placa10) {
+        bool on = (c.r || c.g || c.b);
+        digitalWrite(PIN_LED10_1, on);
+        digitalWrite(PIN_LED10_2, on);
+        digitalWrite(PIN_LED10_3, on);
+        return;
+    }
+    fill_solid(leds, NUM_LEDS, c);
+    FastLED.show();
+}
+void piscar(const CRGB& c, uint8_t vezes, uint16_t ms = 120) {
+    for (uint8_t i = 0; i < vezes; i++) {
+        ledCor(c); delay(ms);
+        ledCor(CRGB::Black); delay(80);
+    }
 }
 
-//*****************************************************************************************************************
-// Function reset dance
-//*****************************************************************************************************************
+// Fanfarra do Rocky (Gonna Fly Now) — a melodia de "INICIALIZAÇÃO 100% OK".
+// Curta (~1,8s) p/ não segurar o boot nem drenar bateria.
+void melodiaRocky() {
+    static const uint16_t f[]  = {392, 523, 659, 0, 392, 523, 698, 0, 659, 698, 784};
+    static const uint16_t ms[] = {140, 140, 320, 70, 140, 140, 320, 70, 130, 130, 520};
+    for (uint8_t i = 0; i < sizeof(f) / sizeof(f[0]); i++) {
+        if (f[i]) tone(PIN_BUZZER, f[i], ms[i]);
+        delay(ms[i] + 20);
+    }
+    noTone(PIN_BUZZER);
+}
 
-void resetDance() {
-#ifdef DEBUG
-    Serial.println(F("Reset Dance!"));
-#endif
+// ERRO de BLE / módulo mudo: 4 bipes GRAVES + 2 piscadas VERMELHAS.
+void sinalModuloMudo() {
+    for (uint8_t i = 0; i < 4; i++) beep(160, 400);
+    piscar(CRGB::Red, 2, 200);
+}
 
-    counterResetDance = 0;
+// CONECTOU por BLE: aviso CURTO de sucesso (2 notas ascendentes "ta-dá") + verde.
+// ⚠️ NÃO usa a melodia Rocky: o app RECONECTA a cada abrir/fechar, então o
+// OK+CONN dispara a cada comando — a fanfarra tocaria toda vez (pesado). Duas
+// notas subindo (sol5→dó6) remetem a "conectou!" em ~200ms. A Rocky completa
+// fica só sob demanda (TST-ROCKY).
+void sinalConectado() { beep(70, 784); beep(130, 1047); piscar(CRGB::Green, 2, 90); }
 
-    while (!digitalRead(pinPushButton)) {
-        interfaceFI(ON);
-        counterResetDance++;
+// ABRIR/FECHAR com SUCESSO: fanfarra do Rocky + 3 piscadas VERDES = "conseguiu!".
+// A melodia toca 1× por acionamento concluído (não pesa como pesaria na conexão,
+// que repete a cada reconexão do app — por isso a CONEXÃO fica com o aviso curto
+// de 2 notas e o ACIONAMENTO ganha a fanfarra completa).
+void fbComandoOk() {
+    melodiaRocky();
+    piscar(CRGB::Green, 3);
+}
 
-#ifdef DEBUG
-        Serial.print(counterResetDance);
-#endif
+// DIAGNÓSTICO POR BIPES (sem cabo, sem BLE): quando o módulo não responde a
+// 2400, varre os bauds perguntando (AT/AT+VERS?) e BIPA AGUDO o índice de onde
+// ele respondeu, logo após os 4 graves:
+//   1 bipe = 2400 | 2 = 9600 | 3 = 19200 | 4 = 38400 | silêncio = mudo em todos
+// É a fechadura dizendo de viva voz em que baud a UART do módulo está.
+void diagBaudBipes() {
+    const long cand[] = {2400, 9600, 19200, 38400};
+    for (uint8_t i = 0; i < 4; i++) {
+        bluetooth.begin(cand[i]);
+        delay(30);
+        bool respondeu = bleResponde();
+        if (!respondeu) respondeu = (bleIdentificar() != 0);
+        if (respondeu) {
+            delay(500);
+            for (uint8_t k = 0; k <= i; k++) { beep(140, 2600); delay(180); }
+            if (i == 0) {
+                // Vivo a 2400 AGORA (estava grogue no teste do boot): reaplica
+                // a config na hora — inclusive os PIOs do trilho da placa 1.0.
+                configModuloLeve();
+                delay(200);
+                beep(90, 3200);   // bipe extra super-agudo = config reaplicada
+            }
+            break;
+        }
+    }
+    bluetooth.begin(BAUD_MODULO);
+}
 
-        if (counterResetDance == RESET_INTERVAL) {
-#ifdef DEBUG
-            Serial.println(F("Reset Completo"));
-#endif
-            counterResetDance = 0;
+// Reset total pelo botão: melodia DESCENDENTE (o contrário da de pronta).
+void melodiaReset() {
+    static const uint16_t f[] = {784, 659, 523, 392};
+    for (uint8_t i = 0; i < 4; i++) beep(120, f[i]);
+}
 
-            interfaceFI(ON_TONESEED_OFF);  // 0x07
+// ---- motor ----
+void motorPara() { digitalWrite(g_pinMotorA, LOW); digitalWrite(g_pinMotorB, LOW); }
+void motorLiga(bool sentidoA) {
+    if (sentidoA) { digitalWrite(g_pinMotorA, HIGH); digitalWrite(g_pinMotorB, LOW); }
+    else          { digitalWrite(g_pinMotorA, LOW);  digitalWrite(g_pinMotorB, HIGH); }
+}
+// Pulso por tempo — testes de bancada e fallback sem INA219.
+void motorGiraMs(bool sentidoA, uint16_t ms) {
+    motorLiga(sentidoA);
+    delay(ms);
+    motorPara();
+}
+// Giro REAL (abrir/fechar/calibração), padrão do FI_1_5 de produção:
+//  1. gira no sentido do comando até o BATENTE (corrente média > MOTOR_STALL_MA
+//     no INA219) ou o teto de 10s. O pico de arranque é ignorado
+//     (MOTOR_ARRANQUE_MS) p/ não virar falso batente. Sem INA219 -> pulso fixo.
+//  2. RECUO ("line up"): gira um pouco no sentido CONTRÁRIO (MOTOR_RECUO_MS) p/
+//     aliviar a pressão do fim de curso — igual ao FI_1_5. O recuo é curto e
+//     NÃO desfaz a abertura (o came já passou o ponto); só solta o batente.
+// O motor NUNCA fica ligado: para no batente, no teto ou no fim de cada etapa.
+void motorGira(bool sentidoA) {
+    if (!inaOk) {
+        motorGiraMs(sentidoA, MOTOR_MS);       // 1. giro (fallback por tempo)
+    } else {
+        ina219.powerSave(false);
+        motorLiga(sentidoA);
+        unsigned long t0 = millis();
+        while (millis() - t0 < MOTOR_TIMEOUT_MS) {   // 1. giro até o batente
+            float mA = 0;
+            for (uint8_t i = 0; i < 25; i++) mA += ina219.getCurrent_mA();
+            mA /= 25.0f;
+            if (millis() - t0 > MOTOR_ARRANQUE_MS && fabs(mA) > MOTOR_STALL_MA) break;
+        }
+        motorPara();
+        ina219.powerSave(true);
+    }
+    // 2. recuo/line-up (alivia o batente). Pausa curta antes p/ o motor parar
+    //    de fato (inércia) e não dar shoot-through na inversão de sentido.
+    if (MOTOR_RECUO_MS > 0) {
+        delay(80);
+        motorGiraMs(!sentidoA, MOTOR_RECUO_MS);
+    }
+}
 
-            delay(3000);
+// ---- módulo BLE (sempre a 2400) ----------------------------------------------
 
-            EEPROM.update(setupSeedOk, 0x00);
+// Manda um comando AT e descarta a resposta (não dependemos dela — os clones
+// nem sempre respondem). O delay dá tempo do módulo processar.
+// Terminado em '\r' como o FI_1_0/FI_1_0_400 de produção: o lote de módulos
+// ANTIGO (ver.03/04 das FI 1.0) exige o CR; o lote novo (ver.05) tolera —
+// o FI_1_0_400 sempre mandou com '\r' nos mesmos módulos "Soft AT 5.2".
+void at(const char* c, uint16_t w = 150) {
+    // ⛔ TRAVA CRÍTICA: se o app está CONECTADO (PD3 alto), o módulo está em
+    // MODE2 túnel e NÃO interpreta AT — ele REPASSA o "AT+..." como DADO pro app
+    // (visto na bancada: "⟵ AT", "⟵ AT+NAME003FI002734" + lixo). AT é só p/
+    // config, que só roda DESCONECTADO. Conectado, não manda nada.
+    if (digitalRead(PIN_WAKE) == HIGH) return;
+    bluetooth.print(c);
+    bluetooth.print('\r');
+    delay(w);
+    while (bluetooth.available()) bluetooth.read();
+}
 
-            funcReset();
+// Testa se o módulo responde AT no baud atual. Manda 4× — em módulos com
+// economia de energia o 1º AT só ACORDA (não responde); os seguintes respondem.
+// Alguns clones não respondem nada a um "AT" pelado: é só triagem, um "mudo"
+// aqui NÃO reprova a fechadura (a conexão BLE real é a prova final).
+bool bleResponde() {
+    for (uint8_t t = 0; t < 4; t++) {
+        while (bluetooth.available()) bluetooth.read();
+        bluetooth.print("AT\r");
+        unsigned long t0 = millis();
+        while (millis() - t0 < 250) {
+            if (bluetooth.available()) return true;
+        }
+    }
+    return false;
+}
+
+// "Vivo" de verdade: alguns clones não respondem NADA a um "AT" pelado, mas
+// respondem a uma consulta. Testa AT e depois AT+VERS? — qualquer byte = vivo.
+bool bleVivo() {
+    if (digitalRead(PIN_WAKE) == HIGH) return true;  // conectado = vivo (e AT seria tunelado)
+    if (bleResponde()) return true;
+    while (bluetooth.available()) bluetooth.read();
+    bluetooth.print("AT+VERS?\r");
+    unsigned long t0 = millis();
+    while (millis() - t0 < 450) {
+        if (bluetooth.available()) return true;
+    }
+    return false;
+}
+
+// ⭐ IDENTIFICA o módulo pelo AT+VERS? — a string inteira diz a FAMÍLIA
+// (manuais oficiais: 1010 responde "Soft AT ver.XX"/"Soft ATm ver.XX"; o 5.2
+// responde "Soft AT 5.2 ver.XX") e o número diz a REV do firmware dele.
+// Preenche g_moduloFam + g_moduloVers e PERSISTE na EEPROM (telemetria/boots
+// futuros). Devolve a rev (0 = não respondeu = módulo mudo p/ consulta).
+// Regras derivadas (ver cabeçalho): 5.2 rev<04 = BEFC/AFTC quebrados -> wake
+// por STATUS; 1010 = sem STATUS, wake por AFTC. "ver.00..02" viram rev 1..2
+// via atoi; resposta com "ver." mas número ilegível vira rev=1 (conta como
+// vivo e cai no caminho conservador rev<4).
+uint8_t bleIdentificar() {
+    for (uint8_t t = 0; t < 3; t++) {
+        while (bluetooth.available()) bluetooth.read();
+        bluetooth.print("AT+VERS?\r");
+        char resp[48] = {0};
+        uint8_t n = 0;
+        unsigned long tt = millis();
+        while (millis() - tt < 450) {
+            if (bluetooth.available() && n < sizeof(resp) - 1) resp[n++] = bluetooth.read();
+        }
+        char* v = strstr(resp, "ver.");
+        if (!v) continue;
+        g_moduloFam = strstr(resp, "5.2") ? FAM_52 : FAM_1010;
+        uint8_t rev = (uint8_t)atoi(v + 4);
+        if (rev == 0) rev = 1;                 // respondeu mas rev ilegível/00
+        g_moduloVers = rev;
+        EEPROM.update(EE_VERS_BLE, g_moduloVers);
+        EEPROM.update(EE_MOD_FAM, g_moduloFam);
+        return rev;
+    }
+    return 0;                                  // não leu (NÃO zera o que já sabíamos)
+}
+
+// Máscara dos comandos BEFC/AFTC (3 dígitos hex; bit = PIO−3, manual dos dois
+// módulos). Calculada em runtime do pino do MOSFET (EEPROM 914) — a esteira
+// legada usou PIO 4..9 conforme a placa; 90% da frota = 8 (BEFC020/AFTC028).
+uint16_t mascaraPio(uint8_t pio) { return (pio >= 3 && pio <= 12) ? (uint16_t)(1u << (pio - 3)) : 0; }
+void atMascara(const char* cmd, uint16_t mask) {
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%s%03X", cmd, mask);
+    at(buf);
+}
+
+// AUTO-CURA DO NOME: lê AT+NAME? e confere se o anúncio é EXATAMENTE o serial.
+// true = confere OU o módulo não respondeu à consulta (inconclusivo — clones
+// mudos p/ consulta seguem o fluxo às cegas de sempre, sem reprovar).
+// false = respondeu um nome DIFERENTE (ex.: garble "002FI00187<") -> reescrever.
+bool bleNomeConfere() {
+    if (digitalRead(PIN_WAKE) == HIGH) return true;   // conectado: AT tunelaria
+    while (bluetooth.available()) bluetooth.read();
+    bluetooth.print("AT+NAME?\r");
+    char resp[40] = {0};
+    uint8_t n = 0;
+    unsigned long t0 = millis();
+    while (millis() - t0 < 400) {
+        if (bluetooth.available() && n < sizeof(resp) - 1) resp[n++] = bluetooth.read();
+    }
+    if (n == 0) return true;                          // mudo p/ consulta: inconclusivo
+    char* g = strstr(resp, "Get:");
+    if (!g) return strstr(resp, serialFech) != NULL;  // resposta fora do padrão
+    g += 4;
+    uint8_t i = 0;
+    while (serialFech[i] && g[i] == serialFech[i]) i++;
+    return serialFech[i] == 0 &&
+           (g[i] == 0 || g[i] == '\r' || g[i] == '\n');  // match EXATO até o fim
+}
+
+// Config LEVE — roda em TODO boot (auto-cura de drift), SEM reset, SEM nome,
+// SEM mexer no baud: rápida e não derruba conexão nenhuma.
+// BEFC020/AFTC028 = valores da esteira de produção p/ ESTA placa (MOSFET no
+// PIO8 do módulo + wake no PIO6): PIO8 alto sempre (alimenta os periféricos),
+// PIO6 baixo antes / alto depois da conexão (borda que acorda o MCU no PD3).
+void configModuloLeve() {
+    // Com um cliente CONECTADO o módulo está em modo túnel: não interpreta AT
+    // e ainda REPASSA cada comando como notificação — o app receberia
+    // "AT+..." no meio do handshake e extrairia números-lixo.
+    // ⚠️ EXCEÇÃO placa 1.0: NÃO pular — nela esta função também SEGURA O TRILHO
+    // DE ENERGIA (gate do mosfet num PIO do módulo). Pular com PD3 alto era um
+    // dos motivos das 1.0 mortas (relatório FI10_ANALISE §2).
+    if (!placa10 && digitalRead(PIN_WAKE) == HIGH) {
+        DBGLN(F("[cfg] conectado - pula config")); return;
+    }
+    // ⭐ AT+PWRM0 = auto-sleep do módulo DESLIGADO (manual pág.39). O firmware
+    // ANTIGO mandava PWRM1 achando que DESLIGAVA o sleep — mas PWRM1 LIGA. Com o
+    // sleep ligado o módulo cochilava e o 1º byte de cada troca só o acordava e
+    // se PERDIA: no boot o AT sumia (4 bipes graves = "mudo") e na operação o
+    // "P" do "PONG" sumia (app recebia "ONG" != "PONG" -> sem PONG p/ sempre).
+    // PWRM0 mantém o módulo sempre acordado e responsivo. O MCU continua dormindo
+    // (powerDown) — a economia real de bateria está nele, não no módulo.
+    at("AT+PWRM0");
+    at("AT+TYPE0");    // sem pareamento (TYPE1 residual = pede PIN em toda conexão)
+    // NOME reafirmado a CADA boot (como o changeName do FI_1_5), ANTES do MODE2.
+    // ⭐ v2.10 AUTO-CURA: escreve, LÊ DE VOLTA (AT+NAME?) e compara — se a UART
+    // marginal garblou o fim (caso real "002FI00187<"), REESCREVE (até 3×).
+    // Módulo mudo p/ consulta (clone): bleNomeConfere devolve true na 1ª e o
+    // fluxo fica idêntico ao antigo (1 write às cegas). Serial tem 11 chars —
+    // cabe no limite dos DOIS módulos (1010 = 12; 5.2 rev05+ = 18).
+    if (serialFech[0]) {
+        char nm[24];
+        snprintf(nm, sizeof(nm), "AT+NAME%s", serialFech);
+        for (uint8_t t = 0; t < 3; t++) {
+            at(nm, 200);
+            if (bleNomeConfere()) break;
+            DBGLN(F("[cfg] nome nao confere - reescrevendo"));
+        }
+    }
+    // AT+MODE2 = modo controle remoto / túnel de dados (é o PADRÃO DE FÁBRICA,
+    // manual pág.8). ORDEM DA v2.7.6 (provada em bancada com PONG): MODE2 logo
+    // após o NAME. Aqui o módulo está DESCONECTADO (a função dá early-return se
+    // conectado), então ele interpreta AT em qualquer posição — a ordem relativa
+    // ao MODE2 não muda nada. Reafirmá-lo é redundante (já é fábrica) mas inócuo.
+    at("AT+MODE2");
+    at("AT+ROLE0");    // slave (executa advertising)
+    at("AT+DELI3");    // delimitador da resposta AT = 0x0A 0x0D (manual pág.23)
+    at("AT+NOTI1");    // módulo emite OK+CONN/OK+LOST na UART no connect/disconnect
+                       // (manual pág.38). NÃO afeta o notify de dados do app (esse
+                       // é o CCCD 0x2902 que o próprio app habilita no FFE1).
+    if (placa10) {
+        // GATE DO MOSFET que alimenta o MCU. O pino NÃO é fixo: a esteira at.js
+        // suporta PIO 4/5/6/7 (default 4) e o upload antigo usava 7/8/9.
+        // Erguemos TODOS os candidatos — imediato (PIOx1 religa o trilho JÁ) e
+        // persistente na NVM (BEFCFF7 = todos os PIOs altos ANTES da conexão,
+        // menos o bit3=PIO6 p/ o wake; AFTCFFF = todos altos DEPOIS).
+        at("AT+PIO41"); at("AT+PIO51"); at("AT+PIO71");
+        at("AT+PIO81"); at("AT+PIO91");
+        at("AT+BEFCFF7");
+        at("AT+AFTCFFF");
+    } else if (g_hiberna) {
+        // HIBERNAÇÃO (receita do FI_1_5_400 de produção): o PIO do MOSFET NÃO é
+        // forçado alto -> o AT+PIOx0 do dormir() consegue CORTAR o trilho.
+        //   BEFC 000        = tudo baixo antes da conexão (MCU desligado no repouso)
+        //   AFTC mask(PIO6) = PIO6 alto depois -> borda de wake que religa o MCU
+        atMascara("AT+BEFC", 0);
+        atMascara("AT+AFTC", mascaraPio(6));
+    } else {
+        // MODO NORMAL (IDLE): MOSFET SEMPRE ligado (antes e depois da conexão),
+        // MCU nunca desliga — comunicação robusta, mais bateria. Config do AT.py.
+        // Pino do MOSFET vem da EEPROM 914 (default 8 -> BEFC020/AFTC028, os
+        // valores históricos da esteira; placas com gate no 6/7 gravam o byte).
+        atMascara("AT+BEFC", mascaraPio(g_pinMosfet));                  // MOSFET=1 antes
+        atMascara("AT+AFTC", mascaraPio(g_pinMosfet) | mascaraPio(6)); // +wake depois
+    }
+    at("AT+PIO60");    // repouso arma a próxima borda de wake
+    // Wake por FAMÍLIA/REV (manuais oficiais): AT+STATUS só existe no 5.2 — no
+    // 1010 é no-op e o wake é o AFTC (que existe e funciona nos dois). No 5.2
+    // rev<04 o BEFC/AFTC é QUEBRADO (respondia só 0x000; corrigido na REV04) ->
+    // o STATUS é o ÚNICO wake que funciona nesses módulos ("ver.03" da frota).
+    // Família desconhecida + rev<4 = manda também (conservador, era a regra antiga).
+    if (g_moduloFam != FAM_1010 && g_moduloVers != 0 && g_moduloVers < 4) {
+        char st[14];
+        snprintf(st, sizeof(st), "AT+STATUS%X", placa10 ? 6 : g_pinMosfet);
+        at(st);
+    }
+}
+
+// Provisionamento COMPLETO com DESCONTAMINAÇÃO — só na 1ª vez após gravar
+// (flag EE_MOD_CFG; o seed.bin zera o byte, então toda regravação re-provisiona
+// do zero). Três passos, todos ÀS CEGAS (clones não respondem "OK" a "AT"
+// pelado — detecção por resposta dá falso-positivo/negativo; determinístico é
+// mandar em todos os bauds e deixar o baud certo obedecer):
+//
+//  PASSO 0 — RESET DE FÁBRICA do módulo (AT+RENEW / AT+DEFAULT) em TODOS os
+//    bauds. Limpa QUALQUER resíduo de provisionamentos/experimentos antigos
+//    que persiste na NVM do módulo e pode até IMPEDIR O ANÚNCIO: ROLE1
+//    (módulo virou central), IMME1 (só anuncia após AT+START), ADTY errado
+//    (anúncio não-conectável), PWRM, baud e nome tortos. Volta ao default.
+//  PASSO 1 — ACORDA (PWRM0) e CONVERGE para 9600: em cada baud candidato,
+//    AT+PWRM0 (v2.10.1: auto-sleep OFF primeiro — pega a janela acordada de
+//    módulos com herança legada PWRM1) + AT+BAUD2 + AT+RESET.
+//  PASSO 2 — CONFIG COMPLETA a 9600: SHIELD1/BAUD2/PWRM0 + anti-resíduo
+//    (ROLE0/IMME0/ADTY0/START) + a config de dados/wake (configModuloLeve)
+//    + NAME + RESET final. Flag 0xC9 SÓ se o módulo deu sinal de vida.
+//
+// Custo: ~20s, uma vez por gravação (na bancada). A melodia de "pronta" só
+// toca no fim — o operador já espera por ela.
+void bleProvisionar() {
+    DBGLN(F("[prov] provisionamento completo do modulo (1o boot)"));
+    beep(50, 1200); beep(50, 1200);            // "configurando o rádio, aguarde"
+
+    // Só os bauds ALCANÇÁVEIS pelo SoftwareSerial a 16MHz (9600 primeiro = o mais
+    // comum). Tirei 57600/115200/1200: SoftwareSerial não os faz confiável, e
+    // varrê-los só alongava o boot (colidia com a conexão da bancada).
+    static const long TODOS[] = {9600, 2400, 4800, 19200, 38400};
+    const uint8_t N = sizeof(TODOS) / sizeof(long);
+
+    // PASSO 0 — SEM RENEW. ⚠️ O AT+RENEW/DEFAULT era veneno em DUAS frentes:
+    //  (1.0) apagava o AT+BEFC da NVM que segura o gate do MOSFET de energia ->
+    //        o módulo cortava a alimentação do MCU (0718/0629 mortas, §1);
+    //  (1.5) interferia na tabela de baud do clone -> o módulo NÃO ficava em
+    //        9600 -> 4 bipes graves + sem PONG (visto na CH003FI002734).
+    // O firmware FI_1_5 de PRODUÇÃO (9600, ~centenas em campo) NUNCA usa RENEW:
+    // só reafirma AT+BAUD2 + config. É o que fazemos no PASSO 1/2.
+    if (placa10) {
+        // 1.0: religa o TRILHO de energia (mosfet) em todos os bauds, primeiro.
+        for (uint8_t i = 0; i < N; i++) {
+            bluetooth.begin(TODOS[i]);
+            delay(30);
+            for (uint8_t k = 0; k < 6; k++) at("AT", 40);   // acorda o módulo
+            at("AT+PWRM0", 120);   // auto-sleep OFF (sempre acordado)
+            at("AT+PIO41", 60); at("AT+PIO51", 60); at("AT+PIO71", 60);
+            at("AT+PIO81", 60); at("AT+PIO91", 60);
+            at("AT+BEFCFF7", 80); at("AT+AFTCFFF", 80);
+        }
+    }
+
+    // PASSO 1 — CONVERGE p/ BAUD_MODULO (9600): em cada baud candidato manda
+    // AT+BAUD2 (=9600) + AT+RESET. Como o módulo já vem de fábrica em 9600, na
+    // prática isto REAFIRMA 9600; se algum módulo veio de outro baud, o comando
+    // pega no baud atual dele e ele passa a 9600 (nos demais é lixo inócuo).
+    for (uint8_t i = 0; i < N; i++) {
+        bluetooth.begin(TODOS[i]);
+        delay(30);
+        for (uint8_t k = 0; k < 3; k++) at("AT", 40);   // acorda o módulo
+        // ⭐ v2.10.1: PWRM0 (auto-sleep OFF) PRIMEIRO, no baud REAL do módulo.
+        // Módulo com herança legada (esteira mandava PWRM1 = auto-sleep LIGADO)
+        // fica com a UART DORMINDO — em baud != 2400-slow, dado serial NÃO o
+        // acorda (manuais 5.2 §57 / 1010 §54: só GND no pino 24 ou conexão BLE).
+        // A única brecha por UART é a JANELA ACORDADA logo após o power-on do
+        // módulo (bateria recém-ligada) — e ela fechava antes do PWRM0 antigo,
+        // que só vinha no PASSO 2 (~10s depois). Caso real: CH003FI002584,
+        // surda p/ SEMPRE até o PWRM0 entrar pelo ar (bancada). Aqui é a
+        // primeira coisa dita em CADA baud: se a janela existir, destrava já.
+        at("AT+PWRM0", 120);
+        at(AT_BAUD_CMD, 250);                  // -> 9600
+        at("AT+RESET", 150);
+        delay(600);                            // módulo reinicia no baud novo
+    }
+    bluetooth.begin(BAUD_MODULO);
+    delay(1500);                               // módulo termina de reiniciar
+    while (bluetooth.available()) bluetooth.read();
+
+    // PASSO 2 — config completa no baud alvo.
+    at("AT+SHIELD1");
+    at(AT_BAUD_CMD);                           // reafirma (só vale após reset)
+    at("AT+PWRM0");                            // auto-sleep OFF (sempre acordado)
+    at("AT+ROLE0");                            // slave (ROLE1 residual = não anuncia)
+    at("AT+IMME0");                            // anuncia sozinho ao ligar
+    at("AT+ADTY0");                            // anúncio conectável
+    // ⭐ ECONOMIA DE RÁDIO: advertising de 100ms (fábrica) -> 211,25ms (ADVI2).
+    // Corta o duty do rádio quase pela METADE com custo médio de ~+55ms na
+    // descoberta (bem dentro dos intervalos recomendados p/ iOS, teto 1285ms).
+    // No 1010 o ADVI exige RESET p/ valer — o RESET final deste provisionamento
+    // cobre. Reverter: AT+ADVI0 pela bancada.
+    at("AT+ADVI2");
+    bleIdentificar();                          // família+rev (persiste na EEPROM)
+    DBG(F("[prov] AT+VERS? -> fam ")); DBG(g_moduloFam);
+    DBG(F(" rev ")); DBGLN(g_moduloVers);
+    // O AT+NAME é enviado DENTRO do configModuloLeve, ANTES do AT+MODE2 (em
+    // MODE2 o clone ignora o NAME) — e é reafirmado em todo boot. Reforço extra
+    // aqui em VÁRIOS BAUDS às cegas: se a convergência de baud não fechou, o
+    // nome pega no baud certo mesmo assim (nos outros bauds é lixo inócuo).
+    if (serialFech[0]) {
+        char nm[24];
+        snprintf(nm, sizeof(nm), "AT+NAME%s", serialFech);
+        const long bd[] = {2400, 9600, 38400, 19200, 57600, 4800};
+        for (uint8_t i = 0; i < sizeof(bd) / sizeof(long); i++) {
+            bluetooth.begin(bd[i]); delay(30);
+            at("AT", 50); at("AT+PWRM0", 100); at(nm, 180);   // v2.10.1: acorda antes do nome
+        }
+        bluetooth.begin(BAUD_MODULO); delay(100);
+    }
+    configModuloLeve();
+    at("AT+START", 150);                       // se IMME1 residual, inicia o anúncio
+    // ⭐ v2.10.1: a flag SÓ é gravada se o módulo deu SINAL DE VIDA. Módulo mudo
+    // (herança PWRM1 dormindo, UART com problema) fica SEM a flag -> todo boot
+    // re-tenta o provisionamento completo (cada ciclo de bateria = nova janela
+    // acordada do módulo). Se vivo, marca ANTES do reset (bateria afundando no
+    // reset não re-roda o pesado à toa — motivo original da flag).
+    if (bleVivo()) EEPROM.update(EE_MOD_CFG, MOD_CFG_MAGIC);
+    else DBGLN(F("[prov] modulo MUDO - flag nao marcada (re-tenta no proximo boot)"));
+    at("AT+RESET", 150);
+    delay(1500);                               // BAUD/NAME valem após o reset
+    while (bluetooth.available()) bluetooth.read();
+    // REAPLICA a config pós-reset (sem novo reset): o módulo recém-reiniciado
+    // pode ter comido comandos do lote acima — em especial os PIO71/81/91 e
+    // BEFC/AFTC que seguram o TRILHO DE ENERGIA da placa 1.0 (_400). Foi
+    // exatamente isso que deixou a 0629 morta na bateria: config cedo demais,
+    // módulo grogue, PIO do mosfet nunca subiu.
+    configModuloLeve();
+}
+
+void isrBtn() { acordouBtn = true; }
+void isrBLE() { acordouBLE = true; }
+
+// Cada linha vira UMA notificação no app (o módulo DELI3 fatia pelo '\n').
+void enviaLinha(const char* s) { io->print(s); io->print('\n'); io->flush(); delay(12); }
+
+// "11" em dobro: o app espera 2 notificações — com 2 linhas o completer fecha
+// na hora. (Uma linha só também passa, mas só depois do timeout de 5s.)
+void envia11Duplo() { enviaLinha("11"); delay(GAP_NOTIF_MS); enviaLinha("11"); }
+
+// status "1004.09" = 1000/2000 (sentido) + bateria (float 2 casas), igual produção.
+void enviaStatus(bool sentidoA) {
+    float vb = analogRead(PIN_BAT) * (5.0f / 1024.0f);
+    char num[16];
+    dtostrf((sentidoA ? 1000.0f : 2000.0f) + vb, 0, 2, num);
+    enviaLinha(num);
+}
+
+// ANTI-DUPLICATA (⭐ v2.12.1: POR COMANDO): reenvio do MESMO comando logo após
+// outro é REEXECUÇÃO espúria (o app reenvia quando a confirmação se perde; ou
+// o loop() reentra no atenderApp) — dentro da janela o firmware NÃO gira de
+// novo, só reconfirma o status (o app precisa dele p/ parar de tentar).
+// Comando DIFERENTE (FECHAR logo após ABRIR) SEMPRE executa: a versão antiga
+// não distinguia e ENGOLIA o fechar-após-abrir — provado em bancada 09/07
+// (FECHAR na janela = reconfirma sem girar; o app mostrava "porta aberta" com
+// o motor parado). Janela 6s→4s: a tempestade de retry automático chega em
+// 1-3s (mesma sessão); o retry HUMANO (reação + cooldown 4,5s do app +
+// reconexão) chega em ~6,5s — 4s separa os dois com folga pros dois lados
+// (caso real: fechadura emperrou -> fechar de novo tem que girar).
+// A janela conta do FIM do giro e um comando engolido NÃO a renova.
+#define ANTIDUP_MS 4000UL
+unsigned long g_ultimoAcionamentoMs = 0;
+unsigned long g_ultimoCmd = 0;          // CMD_ABRIR/CMD_FECHAR do último giro
+
+bool acionamentoDuplicado(unsigned long cmd) {
+    unsigned long agora = millis();
+    if (g_ultimoAcionamentoMs && cmd == g_ultimoCmd &&
+        agora - g_ultimoAcionamentoMs < ANTIDUP_MS) return true;
+    return false;
+}
+
+// HANDSHAKE COM SALTOS (app legado/cascata): manda o status ANTES de girar —
+// o app legado usa o status como confirmação rápida (timeout curto) e desconecta;
+// ele não espera o fim do giro. Mantido p/ não quebrar a base instalada.
+void acionar(unsigned long cmd) {
+    bool sentidoA = (cmd == CMD_ABRIR) ? (calibrationOk == 1) : (calibrationOk == 0);
+    enviaStatus(sentidoA);
+    if (acionamentoDuplicado(cmd)) return;   // MESMO cmd: já confirmou, não gira 2x
+    g_ultimoAcionamentoMs = millis();
+    g_ultimoCmd = cmd;
+    motorGira(sentidoA);
+    g_ultimoAcionamentoMs = millis();     // o giro consumiu tempo; re-marca
+}
+
+// PROTOCOLO DIRETO (verbos ABRIR/FECHAR do app novo): gira PRIMEIRO (até o
+// batente + recuo) e manda o status SÓ QUANDO O MOTOR PARA. Assim o app
+// confirma "concluído" no momento exato em que a fechadura terminou de girar —
+// é o "avisar quando parar". O app espera esta notificação com timeout longo.
+void acionarVerbo(unsigned long cmd) {
+    bool sentidoA = (cmd == CMD_ABRIR) ? (calibrationOk == 1) : (calibrationOk == 0);
+    if (acionamentoDuplicado(cmd)) {      // reenvio do MESMO cmd: NÃO gira,
+        enviaStatus(sentidoA);            // só reconfirma p/ o app parar de tentar
+        return;
+    }
+    g_ultimoAcionamentoMs = millis();
+    g_ultimoCmd = cmd;
+    // ⭐ CONFIRMA ANTES DO MOTOR (fix do "abriu 3x + loading infinito"): o motor
+    // puxa corrente e pode DERRUBAR o BLE; se a confirmação saísse só DEPOIS do
+    // giro, ela se perdia -> o app dava timeout e reenviava (abrindo de novo a
+    // cada rodada). Mandando o status JÁ (conexão ainda saudável), o app recebe
+    // na hora e para de tentar. Mesmo padrão do "11" da calibração.
+    enviaStatus(sentidoA);
+    delay(60);
+    motorGira(sentidoA);      // gira até o fim de curso + recuo (motor PARA aqui)
+    g_ultimoAcionamentoMs = millis();     // re-marca no FIM (o giro levou tempo)
+    delay(120);               // garante o pacote do status transmitido...
+    enviaStatus(sentidoA);    // reconfirma no FIM se a conexão sobreviveu ("parou")
+    fbComandoOk();            // fanfarra do Rocky + verde = "abriu/fechou!"
+}
+
+// ---- calibração (espelha FI_1_5, com o timing que o app precisa) ----
+
+// Recebeu o token 190720 (fim do handshake de calibração).
+void calibAceitar() {
+    beep(60, 2200); beep(60, 2600);
+    delay(1150);           // resposta cai DEPOIS do app armar o listener (delay
+    envia11Duplo();        // de 1000ms do calibrarpt1 antes de escutar)
+}
+
+// Recebeu "CALIBRACAO-FI": confirma e gira EXATAMENTE como uma abertura real —
+// motorGira faz o giro até o fim de curso (corrente) + recuo. O "11" sai ANTES
+// do giro (o app já recebe a confirmação e não estoura o timeout enquanto o
+// motor gira). Numa fechadura sem carga na bancada o giro vai até o teto de
+// tempo; instalada, para no batente — idêntico ao abrir/fechar.
+void calibGirar() {
+    beep(60, 2200);
+    delay(1150);           // o app arma o listener ~1s após escrever
+    envia11Duplo();
+    motorGira(true);       // giro REAL (batente + recuo), não mais pulso fixo
+}
+
+// Recebeu "CALIB-DEMO" (PROTOCOLO DIRETO, app novo): gira REAL e responde "11"
+// SÓ QUANDO O MOTOR PARA — assim o app confirma no fim do giro (sincronizado),
+// igual ao abrir/fechar. Resolve o "app fica pensando até o timeout": o "11"
+// chega no momento exato em que a fechadura terminou. O app espera com timeout
+// longo (15s). NÃO usar no handshake legado (que tem timeout curto e exige o
+// "11" antes) — por isso é um verbo separado do "CALIBRACAO-FI".
+void calibDemoDireto() {
+    beep(60, 2200);
+    motorGira(true);       // giro real (batente + recuo) — motor PARA aqui
+    delay(120);            // garante o pacote antes de qualquer AT+DROP
+    envia11Duplo();        // "11" = terminei de girar
+}
+
+// Recebeu "PORTA-ABERTA"(1) / "PORTA-FECHADA"(0): salva o sentido e faz o giro
+// de retorno como o FI_1_5 (FECHADA: volta; ABERTA: volta e vai de novo).
+void calibSalvar(uint8_t aberto) {
+    calibrationOk = aberto;
+    EEPROM.update(EE_CALIB, aberto);
+    EEPROM.update(EE_CALIB_VERIF, 1);
+    beep(60, 2600);
+    delay(1000);
+    enviaLinha("11");
+    delay(GAP_NOTIF_MS);
+    enviaLinha(aberto ? "2" : "1");
+    motorGira(false);
+    if (aberto) { delay(300); motorGira(true); }
+    beep(80, 2000); beep(80, 2400);   // calibração concluída
+}
+
+// ---- testes de bancada (GUI tools/bancada.py) ----
+void testeLeds() {
+    if (placa10) {                      // FI 1.0: acende cada LED discreto e os 3
+        const uint8_t pins[3] = {PIN_LED10_1, PIN_LED10_2, PIN_LED10_3};
+        for (uint8_t i = 0; i < 3; i++) {
+            digitalWrite(pins[i], HIGH); delay(350); digitalWrite(pins[i], LOW);
+        }
+        for (uint8_t i = 0; i < 3; i++) digitalWrite(pins[i], HIGH);
+        delay(350);
+        for (uint8_t i = 0; i < 3; i++) digitalWrite(pins[i], LOW);
+        return;
+    }
+    const CRGB cores[4] = {CRGB::Red, CRGB::Green, CRGB::Blue, CRGB::White};
+    for (uint8_t c = 0; c < 4; c++) {
+        fill_solid(leds, NUM_LEDS, cores[c]);
+        FastLED.show();                 // IRQs off durante o show — só na bancada,
+        delay(350);                     // com a UART ociosa (GUI espera a resposta)
+    }
+    fill_solid(leds, NUM_LEDS, CRGB::Black);
+    FastLED.show();
+}
+
+// Teste de motor com LAUDO ELÉTRICO: gira o pulso de bancada medindo a
+// corrente no INA219 e reporta a média. Interpretação (p/ o laudo do
+// fornecedor): ~0-15mA = circuito ABERTO (fio/motor desconectado — a ponte
+// acionou e nada fluiu); ~30-300mA = motor girando; >300mA = travado.
+void motorTesteCorrente(bool sentidoA, const char* fim) {
+    char buf[20];
+    if (inaOk) {
+        ina219.powerSave(false);
+        motorLiga(sentidoA);
+        delay(120);                          // ignora o pico de arranque
+        float soma = 0; uint16_t n = 0;
+        unsigned long t0 = millis();
+        while (millis() - t0 < (MOTOR_TST_MS - 120)) {
+            soma += fabs(ina219.getCurrent_mA()); n++;
+        }
+        motorPara();
+        ina219.powerSave(true);
+        char num[10];
+        dtostrf(n ? soma / n : 0, 0, 0, num);
+        snprintf(buf, sizeof(buf), "CORRENTE:%smA", num);
+        enviaLinha(buf);
+    } else {
+        motorGiraMs(sentidoA, MOTOR_TST_MS);
+        enviaLinha("CORRENTE:SEM-INA");
+    }
+    enviaLinha(fim);
+}
+
+void enviaBateria() {
+    float v = analogRead(PIN_BAT) * (5.0f / 1024.0f);
+    char buf[16], num[8];
+    dtostrf(v, 0, 2, num);
+    snprintf(buf, sizeof(buf), "BAT:%s", num);
+    enviaLinha(buf);
+}
+
+void enviaInfo() {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "SER:%s", serialFech[0] ? serialFech : "(fabrica)");
+    enviaLinha(buf);
+    snprintf(buf, sizeof(buf), "CAL:%u", calibrationOk);
+    enviaLinha(buf);
+    snprintf(buf, sizeof(buf), "SEEDS:%s", (seed01 && seed02) ? "OK" : "VAZIAS");
+    enviaLinha(buf);
+    snprintf(buf, sizeof(buf), "MOD:%s", moduloOk ? "OK" : "SEM-AT");
+    enviaLinha(buf);
+    // Família do módulo identificada pelo AT+VERS? (5.2 = EFR32BG22; 1010 =
+    // CSR-1010; ? = nunca respondeu à consulta — clone ou UART marginal).
+    snprintf(buf, sizeof(buf), "MODF:%s",
+             g_moduloFam == FAM_52 ? "5.2" : g_moduloFam == FAM_1010 ? "1010" : "?");
+    enviaLinha(buf);
+    snprintf(buf, sizeof(buf), "INA:%s", inaOk ? "OK" : "SEM");  // batente por corrente
+    enviaLinha(buf);
+    snprintf(buf, sizeof(buf), "PLACA:%s", placa10 ? "1.0" : "1.5");
+    enviaLinha(buf);
+    snprintf(buf, sizeof(buf), "MOSFET:%u", g_pinMosfet);     // PIO do gate (EEPROM 914)
+    enviaLinha(buf);
+    snprintf(buf, sizeof(buf), "WAKE:v%02u", g_moduloVers);   // rev do módulo (00 = não leu)
+    enviaLinha(buf);
+    enviaLinha("VER:" FW_VERSION);
+    enviaLinha("FIM-INFO");
+}
+
+void testeBancada(const String& t) {
+    if (t.startsWith("TST-PING")) {
+        // PONG em DOBRO com gap: este lote de módulo às vezes engole o 1º byte
+        // (mesma razão do "11 duplo" da calibragem). Se o 1º PONG for comido, o
+        // 2º chega limpo. O app casa no primeiro que vier íntegro.
+        enviaLinha("PONG"); delay(GAP_NOTIF_MS); enviaLinha("PONG");
+        return;
+    }
+    if (t.startsWith("TST-BUZ"))  {
+        beep(120, 1500); beep(120, 2000); beep(180, 2500);
+        enviaLinha("OK-BUZ"); return;
+    }
+    if (t.startsWith("TST-LED"))  { testeLeds(); enviaLinha("OK-LED"); return; }
+    if (t.startsWith("TST-MOT1")) { enviaLinha("OK-MOT1"); delay(20); motorTesteCorrente(true,  "FIM-MOT1"); return; }
+    if (t.startsWith("TST-MOT2")) { enviaLinha("OK-MOT2"); delay(20); motorTesteCorrente(false, "FIM-MOT2"); return; }
+    if (t.startsWith("TST-BAT"))  { enviaBateria(); return; }
+    if (t.startsWith("TST-INFO")) { enviaInfo(); return; }
+    if (t.startsWith("TST-ROCKY")) { melodiaRocky(); enviaLinha("OK-ROCKY"); return; }
+    // DIAGNÓSTICO DE UART SEM MULTÍMETRO: conectado, cada byte MCU<->app passa
+    // pela MESMA UART MCU<->módulo — então dá pra medir a saúde dela por
+    // software. TST-UART manda 5 linhas-padrão conhecidas; a bancada confere a
+    // integridade (garble = nível/solda marginal — a causa física do nome
+    // corrompido). TST-ECO<x> devolve "ECO:<x>" = prova o caminho RX+TX.
+    if (t.startsWith("TST-UART")) {
+        for (uint8_t i = 0; i < 5; i++) {
+            char buf[28];
+            snprintf(buf, sizeof(buf), "UART%u:0123456789ABCDEF", i);
+            enviaLinha(buf);
+            delay(GAP_NOTIF_MS);
+        }
+        enviaLinha("FIM-UART");
+        return;
+    }
+    if (t.startsWith("TST-ECO")) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "ECO:%s", t.c_str() + 7);
+        enviaLinha(buf);
+        return;
+    }
+    // Prova do mecanismo de hibernação. LIÇÃO da bancada (12:37): com um
+    // cliente CONECTADO o módulo está em modo túnel e NÃO interpreta AT do
+    // MCU (o "AT+PIO80" apareceu como texto no cliente). Por isso a ordem de
+    // produção é DROP primeiro (derruba a conexão -> módulo volta ao modo
+    // comando) e SÓ ENTÃO o corte. Resultado audível para o operador:
+    //   silêncio após a queda      = CORTOU (reconecte: bipe de boot + PONG)
+    //   3 bipes graves após ~4s    = módulo não obedeceu o PIO80
+    //   "HIB-FALHOU-DROP" na tela  = nem o DROP derrubou (segue conectado)
+    // Liga/desliga a HIBERNAÇÃO permanente (toggle EE_HIBERNA). Só depois de
+    // validar o ciclo com TST-HIB! (checados ANTES de "TST-HIB" — prefixo maior)
+    if (t.startsWith("TST-HIB-ON")) {
+        EEPROM.update(EE_HIBERNA, 1); g_hiberna = true;
+        enviaLinha("OK-HIB-ON");             // vale no próximo boot (config BEFC000)
+        return;
+    }
+    if (t.startsWith("TST-HIB-OFF")) {
+        EEPROM.update(EE_HIBERNA, 0); g_hiberna = false;
+        enviaLinha("OK-HIB-OFF");
+        return;
+    }
+    // VALIDAÇÃO do ciclo corta->religa (não muda o toggle; testa o hardware).
+    //   silêncio + boot(Rocky) na reconexão = CORTOU e RELIGOU -> hibernação OK
+    //   3 bipes graves após ~3s              = MCU vivo = módulo NÃO cortou
+    //   "HIB-FALHOU-DROP" na tela            = nem o DROP derrubou (segue conectado)
+    if (t.startsWith("TST-HIB")) {
+        enviaLinha("OK-HIB");
+        delay(400);                          // a resposta sai antes do DROP
+        at("AT+DROP", 500);                  // derruba a conexão -> módulo sai do túnel
+        delay(500);
+        if (digitalRead(PIN_WAKE) == HIGH) { // ainda conectado -> não dá p/ cortar
+            enviaLinha("HIB-FALHOU-DROP");
+            return;
+        }
+        atMascara("AT+BEFC", 0);             // ⭐ libera o gate (senão o BEFC re-liga)
+        at("AT+PIO60", 200);                 // arma a borda de wake (PIO6 baixo)
+        EEPROM.update(EE_HIB, 1);            // marca "desligou hibernando" p/ o wake
+        { char pio[12];                      // corta pelo PIO do MOSFET (EEPROM 914)
+          snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
+          at(pio, 60); }                     // CORTA o MOSFET -> MCU morre se cortou
+        delay(3000);                         // se cortou, nunca passa daqui
+        EEPROM.update(EE_HIB, 0);
+        beep(160, 400); beep(160, 400); beep(160, 400);   // 3 graves = NÃO cortou
+        return;
+    }
+    if (t.startsWith("TST-ALL"))  {
+        enviaLinha("OK-BUZ-INI"); beep(120, 1500); beep(120, 2000); beep(180, 2500); enviaLinha("OK-BUZ");
+        testeLeds(); enviaLinha("OK-LED");
+        enviaLinha("OK-MOT1-INI"); motorGiraMs(true,  MOTOR_TST_MS); enviaLinha("OK-MOT1");
+        delay(400);
+        enviaLinha("OK-MOT2-INI"); motorGiraMs(false, MOTOR_TST_MS); enviaLinha("OK-MOT2");
+        enviaBateria();
+        enviaLinha("FIM-TST");
+        return;
+    }
+    enviaLinha("ERR-CMD");
+}
+
+// ---- atende o app: desafio -> saltos -> tokens (ignorados) -> comando ----
+void atenderApp() {
+    io = &bluetooth;
+    // ⚠️ SEM bipe de wake aqui. Com o sono leve (IDLE) o MCU acorda a CADA byte —
+    // bipar na acordada dava o "beep agudo de tempos em tempos" (mesmo com o app
+    // fechado, o módulo acorda o MCU com OK+LOST/ruído). O feedback sonoro agora é
+    // por EVENTO: a MELODIA toca quando chega "OK+CONN" (conectou de verdade); nada
+    // em wakes espúrios.
+    DBGLN(F("[app] acordou - ouvindo (20s)"));
+    bluetooth.setTimeout(150);
+    unsigned long t0 = millis();
+    unsigned long tAbs = millis();
+    unsigned long janela = JANELA_MS;
+    uint8_t step = 0;
+    while (millis() - t0 < janela && millis() - tAbs < JANELA_MAX) {
+        // Botão físico funciona SEMPRE que o MCU está acordado (com a
+        // hibernação, esta janela é o único momento em que ele está ligado).
+        if (digitalRead(PIN_BUTTON) == LOW) { atenderBotao(); t0 = millis(); }
+        // Cliente CONECTADO (PD3 alto) mantém a janela viva: o INSTALL do app
+        // fica conectado por bem mais de 20s (QR codes, telas) e o timeout
+        // antigo derrubava a sessão no meio (AT+DROP) -> F05 no calibrar.
+        // Desconectou -> zera o handshake (rodada nova do app começa do zero)
+        // e aí sim os 20s ociosos contam até dormir/hibernar.
+        if (digitalRead(PIN_WAKE) == HIGH) t0 = millis();
+        else if (step != 0) step = 0;
+        if (bluetooth.available() <= 0) continue;
+        int pk = bluetooth.peek();
+        if (pk == '\n' || pk == '\r' || pk == ' ' || pk == '\t') { bluetooth.read(); continue; }
+
+        // comando de TEXTO (bancada / calibração)
+        if ((pk >= 'A' && pk <= 'Z') || (pk >= 'a' && pk <= 'z')) {
+            String txt = bluetooth.readString(); txt.trim(); txt.toUpperCase();
+            DBG(F("[app] txt: ")); DBGLN(txt);
+            // Notificações do módulo (AT+NOTI1): conectou / desconectou. É AQUI que
+            // toca a MELODIA de conexão — evento real, não wake espúrio.
+            if (txt.startsWith("OK+CONN")) {
+                if (!g_sessaoConectada) { g_sessaoConectada = true; sinalConectado(); }
+                continue;
+            }
+            if (txt.startsWith("OK+LOST")) { g_sessaoConectada = false; continue; }
+            if (txt.startsWith("TST-"))        { t0 = millis(); janela = JANELA_TST; testeBancada(txt); continue; }
+            // PROTOCOLO DIRETO (app novo, sem handshake): o app sonda com
+            // TST-PING ao conectar (o firmware LEGADO ignora texto — parseInt
+            // dá 0); se veio PONG, ele fala estes verbos. Confirmação idêntica
+            // à do handshake ("1004.09" = status+bateria).
+            if (txt.startsWith("ABRIR"))       { acionarVerbo(CMD_ABRIR);  return; }
+            if (txt.startsWith("FECHAR"))      { acionarVerbo(CMD_FECHAR); return; }
+            if (txt.indexOf("PORTA-ABERTA")  >= 0) { calibSalvar(1); return; }
+            if (txt.indexOf("PORTA-FECHADA") >= 0) { calibSalvar(0); return; }
+            if (txt.indexOf("CALIB-DEMO")    >= 0) { t0 = millis(); calibDemoDireto(); continue; }
+            if (txt.indexOf("CALIBRACAO-FI") >= 0) { t0 = millis(); calibGirar(); continue; }
+            continue;
         }
 
-        delayInterrupt(1000);
+        // número (handshake)
+        unsigned long v = (unsigned long)bluetooth.parseInt();
+        if (v == 0) continue;
+        DBG(F("[app] num: ")); DBGLN(v);
+        // Comandos primeiro (1/2/190720)...
+        if (v == CMD_ABRIR || v == CMD_FECHAR) { acionar(v); return; }
+        if (v == TOK_CALIB) { t0 = millis(); calibAceitar(); step = 1; continue; }
+        // ...e QUALQUER número na faixa de desafio (0..2,1M) vale como NOVO
+        // desafio, mesmo com handshake em andamento: o app faz retry/rodadas
+        // (reconecta e manda desafio novo) e o firmware antigo ficava PRESO
+        // esperando tokens — o desafio da rodada nova era ignorado e o app
+        // "pensava" para sempre. Tokens de verdade são 32 bits (quase nunca
+        // caem nessa faixa) e, se caírem, saltos extras são inócuos.
+        if (v <= 2100000UL) {
+            t0 = millis();
+            unsigned long rA = random(1, 9999), rB = random(1, 9999);
+            // O QUE O APP ESPERA: 2 notificações, cada uma com UM salto.
+            // Neste lote de módulo a separação é por TEMPO (GAP_NOTIF_MS) —
+            // 20ms colava os dois numa notificação só (F05); par-numa-linha
+            // duplicado fazia o app ler respA 2x e congelar no LFSR.
+            char buf[16];
+            snprintf(buf, sizeof(buf), (g_moduloVers == 3) ? "%lu\n" : "%lu", rA + v + seed01);
+            enviaLinha(buf);
+            delay(GAP_NOTIF_MS);
+            snprintf(buf, sizeof(buf), (g_moduloVers == 3) ? "%lu\n" : "%lu", rB + v + seed02);
+            enviaLinha(buf);
+            step = 1; continue;
+        }
+        // fora da faixa = token (bypass: ignorado)
     }
-
-    counterResetDance = 0;
-    flagPressButton = 0x00;
 }
 
-//*****************************************************************************************************************
-// Interrupt 00
-//*****************************************************************************************************************
-
-void pushButtonInterrupt() {
-    restorePinState();
-    flagInterrupt = PUSH_BUTTON;
-}
-
-//*****************************************************************************************************************
-// Interrupt 01
-//*****************************************************************************************************************
-
-void bluetoohInterrupt() {
-    restorePinState();
-    flagInterrupt = BLUETOOTH;
-}
-
-// SOFT - FI = 360 -
-// CheckVers BLE
-// params - none
-// return char = Aux, estado compaacao prefixo e resposta
-char CheckVersBLE(void) {
-    if (VersBLE != 0) {
-        return VersBLE;
-    }                      // Sai se a versão já é conhecida
-    char Aux;              // SOFT - FI = 360 - Variavel Auxiliar
-    char TmpStr[3] = "";   // SOFT - FI = 360 - Str temporaria
-    String RespVers = "";  // SOFT - FI = 360 - Resposta Versao
-
-    RespVers = rotinaWriteBluetooth(versBLE1010, true);                       // SOFT - FI = 360 - Requisita a versao do BLE
-    Aux = strncmp(RespVers.c_str(), PFXVersaoBLE, SIZEPfxVersaoBLE);          // SOFT - FI = 360 - Compara resposta do BLE se tem o prefixo da versao
-    if (!Aux) {                                                               // SOFT - FI = 360 - Aux = 0 -> Prefixo = Resposta, Aux != 0 -> Prefixo != Resposta
-        strncpy(TmpStr, &RespVers.c_str()[SIZEPfxVersaoBLE], SIZEVersaoBLE);  // SOFT - FI = 360 -
-        VersBLE = (TmpStr[0] - '0') * 10 + TmpStr[1] - '0';                   // SOFT - FI = 360 -
+// ---- botão físico: toggle curto / reset total em 10s -------------------------
+void atenderBotao() {
+    delay(30);                                       // debounce
+    if (digitalRead(PIN_BUTTON) != LOW) return;      // ruído
+    unsigned long t0 = millis();
+    unsigned long seg = 0;
+    while (digitalRead(PIN_BUTTON) == LOW) {
+        unsigned long dur = millis() - t0;
+        if (dur >= BTN_RESET_MS) {                   // 10s: reset total
+            melodiaReset();
+            piscar(CRGB::Red, 3);
+            EEPROM.update(EE_MOD_CFG, 0);            // re-provisiona o rádio no boot
+            resetMCU();                              // = tirar e recolocar a bateria
+        }
+        // a partir de 3s: 1 bipe por segundo, subindo (contagem p/ o reset)
+        unsigned long s = dur / 1000;
+        if (s >= 3 && s != seg) { seg = s; beep(40, (uint16_t)(1200 + s * 150)); }
+        delay(10);
+    }
+    unsigned long dur = millis() - t0;
+    if (dur < BTN_CURTO_MS) {                        // toque curto: motor em toggle
+        static bool s = false; s = !s;
+        beep(50, s ? 2400 : 1800);                   // agudo=vai, grave=volta
+        motorGira(s);
     } else {
-        asm("nop");  // SOFT - FI = 360 - Deu erro na leitura da versao, nao faz nada
+        beep(120, 500);                              // segurou e soltou: cancelado
     }
-#ifdef DEBUG
-    Serial.print(F("Vers BLE - >"));  // SOFT - FI = 360 - DEBUG Versao BLE
-    Serial.println(VersBLE);          // SOFT - FI = 360 - DEBUG Versao BLE
-#endif
-    return Aux;  // SOFT - FI = 360 - Retorna Aux
 }
 
-//*****************************************************************************************************************
-// Initial settings
-//*****************************************************************************************************************
+// dormir = SONO EM DOIS NÍVEIS (⭐ v2.12, base da economia de bateria):
+//
+//  · DESCONECTADO (PD3 LOW — 99,9% do tempo) -> SLEEP_MODE_PWR_DOWN (MCU ~µA).
+//    Em power-down, interrupt por BORDA (INT0/INT1) NÃO dispara (a detecção de
+//    borda precisa do clkIO, que para) — por isso o wake da CONEXÃO usa o
+//    PCINT19 (PD3), habilitado no MESMO grupo PCINT2 que o SoftwareSerial já
+//    usa pro RX (PD4): o ISR dele atende o evento à toa, mas o wake acontece.
+//    Botão = INT0 por NÍVEL LOW (nível funciona em power-down). O cristal de
+//    16MHz demora a religar no acordar — SEM problema aqui: quem acorda é a
+//    CONEXÃO (PD3), e o app ainda leva centenas de ms até o 1º write. Módulo
+//    clone sem borda no PIO6 ("ver.12"): os DADOS no RX (PCINT20) acordam; o
+//    1º write pode se perder no arranque do cristal e o app/bancada retransmite
+//    (comportamento antigo documentado — só vale pros clones).
+//
+//  · CONECTADO (PD3 HIGH) -> SLEEP_MODE_IDLE (lição da v2.9.1): o oscilador
+//    continua rodando, wake por dado é INSTANTÂNEO e nenhum byte se perde ->
+//    o 2º/3º/N-ésimo comando NA MESMA conexão funcionam. Power-down aqui era
+//    o bug "2º comando não acontece; fechar o app e reabrir funciona" (o
+//    OK+CONN da reconexão acordava o MCU antes do comando; na mesma conexão o
+//    próprio comando era o despertador e morria no arranque do cristal).
+//
+// ADC desligado durante o power-down (restaurado ao acordar) + BOD desligado
+// durante o sono (sleep_bod_disable; religa sozinho no wake).
+// ⚠️ NÃO manda AT aqui: conectado (MODE2 túnel) vazaria como DADO pro app.
+// Motor fica OUTPUT LOW (nunca Hi-Z — evita shoot-through na ponte H).
+void dormir() {
+    motorPara();
+    // HIBERNAÇÃO (toggle EE_HIBERNA): corta o trilho pelo MOSFET (receita do
+    // FI_1_5_400). Chega aqui só quando OCIOSO+DESCONECTADO (atenderApp segura a
+    // janela enquanto PD3 alto), então o at() não vaza pro app. O MCU DESLIGA no
+    // AT+PIO80 e só volta por CONEXÃO (boot fresco). Requer BEFC000 (config de
+    // hibernação) — com BEFC020 o módulo re-liga o PIO8 e o corte não pega.
+    // Se o hardware NÃO cortar (placa sem o gate), o código segue pro IDLE abaixo.
+    if (g_hiberna && !placa10 && digitalRead(PIN_WAKE) == LOW) {
+        at("AT+DROP", 200);
+        at("AT+PIO60", 100);      // arma a borda de wake (PIO6 baixo)
+        char pio[12];             // corta pelo PIO do MOSFET (EEPROM 914, default 8)
+        snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
+        at(pio, 60);              // corta o MOSFET -> MCU morre aqui se cortou
+        delay(150);
+    }
+    acordouBLE = false; acordouBtn = false;
+    g_sessaoConectada = false;   // sessão encerrou -> melodia toca de novo no próximo OK+CONN
+
+    if (digitalRead(PIN_WAKE) == LOW) {
+        // ---- DESCONECTADO: PWR_DOWN profundo ----
+        attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), isrBtn, LOW);
+        PCICR  |= _BV(PCIE2);          // grupo PCINT2 ligado (o SoftwareSerial já liga,
+        PCMSK2 |= _BV(PCINT19);        // garantia barata) + PD3 acorda na conexão
+        uint8_t adcsraSalvo = ADCSRA;
+        ADCSRA &= ~_BV(ADEN);          // ADC off no sono profundo
+        set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+        cli();
+        // Re-checa JÁ SEM interrupts: se a conexão/botão/dado chegou entre o
+        // digitalRead lá de cima e este cli(), NÃO dorme (senão o evento que
+        // já foi atendido pelo ISR se perderia e o MCU dormiria conectado).
+        // sei()+sleep_cpu() consecutivos são atômicos (a instrução seguinte ao
+        // SEI executa antes de qualquer interrupt pendente — garantia do AVR).
+        if (digitalRead(PIN_WAKE) == LOW && !acordouBtn && !bluetooth.available()) {
+            sleep_enable();
+            sleep_bod_disable();       // BOD off SÓ durante o sono
+            sei();
+            sleep_cpu();
+            sleep_disable();
+        }
+        sei();
+        ADCSRA = adcsraSalvo;
+        PCMSK2 &= ~_BV(PCINT19);
+        detachInterrupt(digitalPinToInterrupt(PIN_BUTTON));
+        if (digitalRead(PIN_WAKE) == HIGH) acordouBLE = true;
+    } else {
+        // ---- CONECTADO: IDLE (wake instantâneo, byte nenhum se perde) ----
+        attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), isrBtn, FALLING);
+        attachInterrupt(digitalPinToInterrupt(PIN_WAKE), isrBLE, RISING);
+        set_sleep_mode(SLEEP_MODE_IDLE);
+        cli();
+        sleep_enable();
+        sei();
+        sleep_cpu();
+        sleep_disable();
+        detachInterrupt(digitalPinToInterrupt(PIN_BUTTON));
+        detachInterrupt(digitalPinToInterrupt(PIN_WAKE));
+    }
+}
 
 void setup() {
-    // Inicializações necessárias
-    Serial.begin(9600);
-    // Outras inicializações, se houver
+    // PLACA primeiro de tudo: os pinos do motor dependem dela (no FI 1.0 o
+    // PB3 é motor, não LED — configurar errado chacoalharia o motor).
+    placa10 = (EEPROM.read(EE_BOARD) == 1);
+    if (placa10) { g_pinMotorA = PIN_PB2; g_pinMotorB = PIN_PB3; }
 
-    // Verificação da versão do BLE
-#ifdef DEBUG
-    Serial.println(F("Verifica vers do BLE..."));
-    Serial.print(F("Envia comando: "));
-    Serial.println(versBLE1010);
+    pinMode(PIN_BUZZER, OUTPUT);
+    pinMode(g_pinMotorA, OUTPUT);
+    pinMode(g_pinMotorB, OUTPUT);
+    pinMode(PIN_BUTTON, INPUT_PULLUP);
+    pinMode(PIN_WAKE, INPUT);
+    motorPara();
+
+    // ⭐ v2.12 — ECONOMIA ESTÁTICA (vale no ativo, no IDLE e no power-down).
+    // NÃO desligar: TWI (INA219), TIM0 (millis), TIM1/TIM2 (tone/core),
+    // USART0 (debug), ADC (bateria — desligado só durante o power-down).
+    PRR  |= _BV(PRSPI);          // SPI nunca é usado (WS2812 é bit-bang)
+    ACSR |= _BV(ACD);            // comparador analógico nunca é usado
+    // Extras do 328PB (FI 1.5). O hex universal é compilado p/ 328P, então os
+    // registradores novos do PB não têm NOME aqui — endereços conforme
+    // iom328pb.h/DS40001906. No 328/328P real (FI 1.0) são reservados, por
+    // isso o gate por placa.
+    if (!placa10) {
+        *(volatile uint8_t *)0x2D &= (uint8_t)~0x0F;  // DDRE : PE0..PE3 entrada
+        *(volatile uint8_t *)0x2E |= 0x0F;   // PORTE: pullup — PE0..3 não têm
+                                             // trilha na placa; flutuando drenam
+        *(volatile uint8_t *)0x64 |= 0x10;   // PRR0.PRUSART1 (UART1 ociosa)
+        *(volatile uint8_t *)0x65 |= 0x3D;   // PRR1: TIM3|SPI1|TIM4|PTC|TWI1
+    }
+
+    // ESTOU VIVO — a PRIMEIRA coisa, antes de tudo. Beep curto e AGUDO ao energizar.
+    // Se não tocar = hardware/energia.
+    beep(70, 2600);
+
+#if FEATURE_SERIAL_DEBUG
+    Serial.begin(DBG_BAUD);
+    DBGLN(F("\n[boot] chavi_fi " FW_VERSION));
 #endif
-    bluetooth.print(versBLE1010);
-    delay(100);  // Tempo para resposta
 
-#ifdef DEBUG
-    // Verificação da versão do BLE esperada
-    String resposta = RespostaBLE(false);  // Aguarda a resposta
-    if (resposta.startsWith(PFXVersaoBLE)) {
-        if (resposta == Versao03BLE) {
-            // Código para a versão do BLE Rev03
-            Serial.println(F("BLE na vers Rev03."));
-            // Executa as ações específicas para a versão Rev03
-        } else if (resposta == Versao04BLE) {
-            // Código para a versão do BLE Rev04
-            Serial.println(F("BLE na vers Rev04."));
-            // Executa as ações específicas para a versão Rev04
-        } else {
-            // Resposta inesperada
-            Serial.println(F("Vers do BLE desconhecida."));
-            // Lidar com a versão desconhecida
-        }
+    randomSeed(analogRead(A0) ^ micros());
+    pinMode(A0, INPUT_PULLUP);   // v2.12: A0 só serve pra semente (flutuando de
+                                 // propósito na leitura acima); depois dela, pullup
+                                 // pra não ficar flutuando o resto do tempo
+
+    // LEDs inicializados e APAGADOS. Nada aceso de forma CONTÍNUA no boot: os 3
+    // WS2812 puxam corrente e, numa bateria fraca, seguravam o trilho baixo e
+    // reiniciavam a fechadura em loop. Feedback visual = só PISCADAS curtas.
+    // FI 1.0: LEDs discretos (7/8/9); o FastLED NUNCA é inicializado (o PB3 é
+    // o motor B nessa placa — bit-bang de WS2812 ali chacoalharia o motor).
+    if (placa10) {
+        pinMode(PIN_LED10_1, OUTPUT); digitalWrite(PIN_LED10_1, LOW);
+        pinMode(PIN_LED10_2, OUTPUT); digitalWrite(PIN_LED10_2, LOW);
+        pinMode(PIN_LED10_3, OUTPUT); digitalWrite(PIN_LED10_3, LOW);
     } else {
-        // Resposta não corresponde ao padrão esperado
-        Serial.println(F("Erro ao verificar a vers do BLE."));
-        // Lidar com o erro de verificação da versão
-    }
-#endif
-    setupSerials();
-    setupPins();
-
-    if (EEPROM.read(setupProductionOk) != 0x01) {  // Entra aqui se nunca entrou na produção
-        for (uint16_t i = 0; i < EEPROM.length(); i++) {
-            EEPROM.update(i, 0x00);  // apaga toda a EEPROM
-        }
-
-        setupI2C();
-        setupADC();
-
-        EEPROM.update(configurationDevice + 1, 0x01);
-        EEPROM.update(configurationDevice + 2, 0x01);
-        EEPROM.update(configurationDevice + 4, 0x01);
-        flagWarningSound = EEPROM.read(configurationDevice + 1);
-        flagLightWarning = EEPROM.read(configurationDevice + 2);
-        flagButton = EEPROM.read(configurationDevice + 4);
-        CheckVersBLE();  // SOFT - FI = 360 - Confere a versao do BLE antes de executar comandos e enviar dados
-        setupBLE01(false);
-
-        flagOperateProduction = 0x01;
-        setupProduction();
-
-#ifdef DEBUG
-        Serial.println(F("Setup Prod Complete"));
-#endif
-        EEPROM.write(setupProductionOk, 0x01);
-#ifdef DEBUG
-        Serial.println(F("Reset em 0.5s"));
-#endif
-        delay(500);
-        funcReset();
+        FastLED.addLeds<WS2812B, PIN_LEDS, GRB>(leds, NUM_LEDS);
+        FastLED.setBrightness(LED_BRIGHT);
+        fill_solid(leds, NUM_LEDS, CRGB::Black); FastLED.show();
     }
 
-    if (EEPROM.read(setupSeedOk) != 0x01) {  // entra aqui se não está configurado
-#ifdef DEBUG
-        Serial.println(F("Prod OK, Seeds não"));
-#endif
-        setupEEPROM();
-        interfaceFI(ON_TONESEED_OFF);  // 0x07
-        CheckVersBLE();                // SOFT - FI = 360 - Confere a versao do BLE antes de executar comandos e enviar dados
-        setupBLE01(true);
-        setupI2C();
-        interfaceFI(ON_TONESEED);  // 0x08
-        seedSetup();
-
-        EEPROM.update(calibrationOk, 0x00);
-        EEPROM.update(verifierCalibration, 0x00);
-        EEPROM.update(configurationDevice + 1, 0x01);
-        EEPROM.update(configurationDevice + 2, 0x01);
-        EEPROM.update(configurationDevice + 3, 0x00);
-        EEPROM.update(configurationDevice + 4, 0x01);
-        EEPROM.update(configurationDevice + 5, 0x01);
-        flagVerifierCalibration = EEPROM.read(calibrationOk);
-        flagStatusDoor = EEPROM.read(verifierCalibration);
-        flagWarningSound = EEPROM.read(configurationDevice + 1);
-        flagLightWarning = EEPROM.read(configurationDevice + 2);
-        flagButton = EEPROM.read(configurationDevice + 4);
-
-        interfaceFI(OFF);  // 0x05
-#ifdef DEBUG
-        Serial.println(F("Terminando Setup Config"));
-#endif
-        delay(500 * timeToWait);
-        funcReset();
+    // serial (nome BLE) + estado da EEPROM
+    for (uint8_t i = 0; i < 11; i++) {
+        uint8_t c = EEPROM.read(EE_SERIAL + i);
+        if (c == 0 || c == 0xFF) { serialFech[i] = 0; break; }
+        serialFech[i] = c; serialFech[i + 1] = 0;
     }
+    calibrationOk = EEPROM.read(EE_CALIB);
+    if (calibrationOk > 1) calibrationOk = 0;
+    EEPROM.get(EE_SEED01, seed01);
+    EEPROM.get(EE_SEED02, seed02);
 
-    if ((EEPROM.read(setupProductionOk) == 0x01) && (EEPROM.read(setupSeedOk) == 0x01)) {
-#ifdef DEBUG
-        Serial.println(F("Prod ok, seeds ok"));
-#endif
+    // INA219 (detecção de batente do motor). Se não responder no I2C, o giro
+    // cai no fallback por tempo — nunca trava o boot.
+    inaOk = ina219.begin();
+    if (inaOk) ina219.powerSave(true);
+    g_moduloVers = EEPROM.read(EE_VERS_BLE);
+    if (g_moduloVers == 0xFF || g_moduloVers > 40) g_moduloVers = 0;  // vazio/lixo
+    g_moduloFam = EEPROM.read(EE_MOD_FAM);
+    if (g_moduloFam > FAM_52) g_moduloFam = FAM_DESCONHECIDA;
+    // Pino do MOSFET (gravado pelo gravar.sh/bancada; 90% da frota = 8).
+    g_pinMosfet = EEPROM.read(EE_MOSFET);
+    if (g_pinMosfet < 4 || g_pinMosfet > 9) g_pinMosfet = 8;
+    g_wakeHib = (EEPROM.read(EE_HIB) == 1);
+    if (g_wakeHib) EEPROM.update(EE_HIB, 0);
+    g_hiberna = (EEPROM.read(EE_HIBERNA) == 1);   // hibernação por MOSFET ligada?
+    DBG(F("[boot] hiberna=")); DBGLN(g_hiberna);
 
-        setupEEPROM();
+    DBG(F("[boot] serial=")); DBG(serialFech[0] ? serialFech : "(fabrica)");
+    DBG(F(" calib=")); DBG(calibrationOk);
+    DBG(F(" seeds=")); DBG((seed01 && seed02) ? F("ok") : F("VAZIAS"));
+    DBG(F(" versBLE=")); DBGLN(g_moduloVers);
 
-        CheckVersBLE();                     // SOFT - FI = 360 - Confere a versao do BLE antes de executar comandos e enviar dados
-        interfaceFI(ON_SOUND_TONEDEFAULT);  // 0x03
-
-        flagSelectInterrupt = 0x01;  // Habilita função de reset do botão
-        setupInterrupts();
-
-        setupADC();
-        setupI2C();
-
-        for (int i = 0; i < 5; i++) {
-            interfaceFI(FADEIN_FADEOUT);
-
-            if (flagPressButton == 0x01) {
-                resetDance();
-            }
-        }
-
-        flagSelectInterrupt = 0x02;  // Desabilita função de reset do botão
-        setupInterrupts();
-        interfaceFI(ON_SOUND_TONEDEFAULT);  // 0x03
-#ifdef DEBUG
-        Serial.println(F("Fim Prod ok, seeds ok"));
-#endif
+    // Rádio: 9600 fixo (BAUD_MODULO). 1º boot após gravar = provisionamento completo
+    // (converge baud + config + nome + reset); boots seguintes = config leve.
+    // Boot de WAKE da hibernação = caminho RÁPIDO: o módulo já está configurado
+    // e tem um app conectado ESPERANDO — nada de config/melodia, só atender.
+    bluetooth.begin(BAUD_MODULO);
+    if (g_wakeHib) {
+        DBGLN(F("[boot] wake da hibernacao - atendendo direto"));
+        return;                              // loop() atende já no 1º giro
     }
-}
-
-//*****************************************************************************************************************
-// Function to setup production and operate - START
-//*****************************************************************************************************************
-
-void setupProduction() {
-    while (flagOperateProduction == 0x01) {
-        char c;
-
-        if (bluetooth.available() > 0) {
-            while (bluetooth.available()) {
-                c = processCharInput(cmdBuffer, bluetooth.read());
-
-                if (c == '\n') {
-                    operateProduction();
-                    clearCMDBuffer();
-                }
-            }
-        }
-    }
-}
-
-void funcCounterMotorProduction() {
-    timeoutStallMotor = millis();
-    while (millis() - timeoutStallMotor < timeoutMotorProduction) {
-        currentInmA = readCurrentInmA();
-        if ((abs(currentInmA)) > 10) {
-            countMotorProduction++;
-        }
-        currentInmA = 0;
-    }
-    stopMotor();
-}
-
-void operateProduction() {
-    //*******************************
-    // To test BLE1010
-    //*******************************
-    if (strcmp(commandToBLE1010, cmdBuffer) == 0) {
-        interfaceFI(ON_SOUND_TONEDEFAULT);  // 0x03
-
-        SendDataBLE("11");  // SOFT - FI = 360
-#ifdef DEBUG
-        Serial.println(F("operateProduction -> BLE OK"));
-#endif
-        delay(1000 * timeToWait);
-    } else if (strcmp(commandToMotor, cmdBuffer) == 0) {
-        //*******************************
-        // To test MOTOR
-        //*******************************
-#ifdef DEBUG
-        Serial.println(F("operateProduction -> commandToMotor"));
-#endif
-        rotateMotor02();
-        funcCounterMotorProduction();
-
-        delay(2000 * timeToWait);
-
-        rotateMotor01();
-        funcCounterMotorProduction();
-
-        if (countMotorProduction >= 15) {
-            countMotorProduction = 0;
-
-            SendDataBLE("11");  // SOFT - FI = 360
-        } else {
-            SendDataBLE("22");  // SOFT - FI = 360
-        }
-
-        interfaceFI(ON_SOUND_TONEDEFAULT);  // 0x03
-    } else if (strcmp(commandToAuto, cmdBuffer) == 0) {
-        //*******************************
-        // To test PERIPHERALS
-        //*******************************
-        // To test LEDs/SOUND BRAND/BUZZER
-        //*******************************
-
-#ifdef DEBUG
-        Serial.println(F("operateProduction -> commandToAuto"));
-#endif
-        turnOnLEDsDelay(CRGB(MAX_BRIGHT, MAX_BRIGHT, MAX_BRIGHT), 250 * timeToWait);          // Branco
-        turnOnLEDsDelay(CRGB(MAX_BRIGHT, 0, 0), 250 * timeToWait);                            // Vermelho
-        turnOnLEDsDelay(CRGB(0, MAX_BRIGHT, 0), 250 * timeToWait);                            // Verde
-        turnOnLEDsDelay(CRGB(0, 0, MAX_BRIGHT), 250 * timeToWait);                            // Azul
-        turnOnLEDsDelay(CRGB(MAX_BRIGHT, MAX_BRIGHT, 0), 250 * timeToWait);                   //
-        turnOnLEDsDelay(CRGB(MAX_BRIGHT, 0, MAX_BRIGHT), 250 * timeToWait);                   //
-        turnOnLEDsDelay(CRGB(0, MAX_BRIGHT, MAX_BRIGHT), 250 * timeToWait);                   //
-        turnOnLEDsDelay(CRGB(MAX_BRIGHT / 2, MAX_BRIGHT, MAX_BRIGHT), 250 * timeToWait);      //
-        turnOnLEDsDelay(CRGB(MAX_BRIGHT, MAX_BRIGHT / 2, MAX_BRIGHT), 250 * timeToWait);      //
-        turnOnLEDsDelay(CRGB(MAX_BRIGHT, MAX_BRIGHT, MAX_BRIGHT / 2), 250 * timeToWait);      //
-        turnOnLEDsDelay(CRGB(MAX_BRIGHT / 2, MAX_BRIGHT / 2, MAX_BRIGHT), 250 * timeToWait);  //
-        turnOnLEDsDelay(CRGB(MAX_BRIGHT, MAX_BRIGHT / 2, MAX_BRIGHT / 2), 250 * timeToWait);  //
-        turnOnLEDsDelay(CRGB(MAX_BRIGHT / 2, MAX_BRIGHT, MAX_BRIGHT / 2), 250 * timeToWait);  //
-
-        turnOffLEDs();
-
-        delay(2000 * timeToWait);
-
-        int i;
-        for (i = 0; i < maxNotes - 1; ++i) {
-            toneDefaultByTime(timeToTone, sBrandOpen[i]);
-        }
-        toneDefaultByTime(timeToTone * 2, sBrandOpen[i]);
-
-        delay(2000 * timeToWait);
-
-        for (i = 0; i < maxNotes - 1; ++i) {
-            toneDefaultByTime(timeToTone, sBrandClose[i]);
-        }
-        toneDefaultByTime(timeToTone * 2, sBrandClose[i]);
-
-        delay(2000 * timeToWait);
-
-        SendDataBLE("11");  // SOFT - FI = 360
-        delay(1000 * timeToWait);
-
-        interfaceFI(ON_SOUND_TONEDEFAULT);  // 0x03
-    } else if (strcmp(commandToBotao, cmdBuffer) == 0) {
-        //*******************************
-        // To test PUSH BUTTON
-        //*******************************
-
-#ifdef DEBUG
-        Serial.println(F("operateProduction -> commandToBotao"));
-#endif
-        while (digitalRead(pinPushButton)) {
-#ifdef DEBUG
-            Serial.println(F("operateProduction -> Aperte o botao"));
-#endif
-            interfaceFI(ON_SOUND_TONEDEFAULT);  // 0x03
-            delay(1000 * timeToWait);
-        }
-
-#ifdef DEBUG
-        Serial.println(F("operateProduction -> Botao pressionado. Finalizando"));
-#endif
-        interfaceFI(ON_SOUND_TONEDEFAULT);  // 0x03
-
-        flagOperateProduction = 0x00;
-
-        SendDataBLE("11");  // SOFT - FI = 360
-        delay(1000 * timeToWait);
-        disconnectBLE1010();
-        delay(500 * timeToWait);
-    }
-}
-
-//*****************************************************************************************************************
-// Process char input
-//*****************************************************************************************************************
-
-char processCharInput(char *cmdBuffer, const char c) {
-    // Store the character in the input buffer
-    // Ignore control characters and special ascii characters
-    if (c >= 32 && c <= 126) {
-        if (strlen(cmdBuffer) < CMDBUFFER_SIZE) {
-            strncat(cmdBuffer, &c, 1);  // Add it to the buffer
-        } else {
-            return '\n';
-        }
-    } else if ((c == 8 || c == 127) && cmdBuffer[0] != 0) {  // Backspace
-        cmdBuffer[strlen(cmdBuffer) - 1] = 0;
-    }
-
-    return c;
-}
-
-//*****************************************************************************************************************
-// Function to setup production - END
-//*****************************************************************************************************************
-
-//*****************************************************************************************************************
-// Function to setup serials
-//*****************************************************************************************************************
-
-void setupSerials() {
-    Serial.begin(BAUDSerial);     // Monitor Serial Arduino
-    bluetooth.begin(BAUDSerial);  // Terminal BLE
-}
-
-//*****************************************************************************************************************
-// Function to setup pins
-//*****************************************************************************************************************
-
-void setupPins() {
-    FastLED.addLeds<WS2812, pinLEDs, GRB>(leds, NUM_LEDS);
-    pinMode(pinBuzzer, OUTPUT);
-    pinMode(pinTurn01, OUTPUT);
-    pinMode(pinTurn02, OUTPUT);
-    pinMode(pinPushButton, INPUT_PULLUP);
-
-    turnOffLEDs();
-    digitalWrite(pinBuzzer, LOW);
-    stopMotor();
-}
-
-//*****************************************************************************************************************
-// Function to setup EEPROM
-//*****************************************************************************************************************
-
-void setupEEPROM() {
-    if (EEPROM.read(setupSeedOk) != 0x01) {
-        flagSetupSeed = 0x01;
+    // ⭐ PROVISIONAMENTO ADAPTATIVO (rápido no caso comum, sem storm):
+    // Se o app conectar no meio, os AT vazam pro túnel e a verificação falha
+    // (o módulo tunela o AT+VERS? em vez de responder). Antes o loop 3x + sweep
+    // levava 60-80s e COLIDIA com a conexão da bancada. Agora:
+    //  1) CAMINHO RÁPIDO (virgem/resetado JÁ está em 9600): config leve +
+    //     verifica. ~3s. É o caso do campo (reset -> módulo volta a 9600).
+    //  2) SÓ se falhar -> conversão pesada (sweep), no MÁXIMO 2 passadas.
+    // Se PD3 estiver alto (app já conectado), nem tenta (vazaria) — adia.
+    if (digitalRead(PIN_WAKE) == HIGH) {
+        DBGLN(F("[boot] conectado - provisionamento adiado"));
     } else {
-        flagSetupSeed = 0x00;
-
-        setupConfigurationDevice();
-
-        flagSeedSetup = EEPROM.read(setupSeedOk);
-        flagReadBLE1010 = EEPROM.read(generalSetupOk);
-        inputSeed01 = EEPROM.get(address01Seed01, inputSeed01);
-        inputSeed02 = EEPROM.get(address01Seed02, inputSeed02);
-        inputSeed03 = EEPROM.get(address01Seed03, inputSeed03);
-        inputSeed04 = EEPROM.get(address01Seed04, inputSeed04);
+        configModuloLeve();                        // caminho rápido: 9600 direto
+        moduloOk = (bleIdentificar() != 0);
+        for (uint8_t t = 0; !moduloOk && t < 2 && digitalRead(PIN_WAKE) == LOW; t++) {
+            DBG(F("[boot] 9600 falhou - sweep passada ")); DBGLN(t + 1);
+            bleProvisionar();                      // converte de qualquer baud -> 9600
+            moduloOk = (bleIdentificar() != 0);
+        }
     }
-}
+    // Verifica o módulo com RETRY p/ NÃO dar 4 beeps à toa: logo após o
+    // provisionamento (AT+RESET) o módulo fica grogue e não responde AT+VERS? na
+    // 1ª — era o falso "mudo" que tocava 4 graves mesmo com o BLE OK depois.
+    for (uint8_t t = 0; !moduloOk && t < 5; t++) { delay(250); moduloOk = (bleIdentificar() != 0); }
+    // v2.10.1: a flag de provisionado é HONESTA — só marca com o módulo vivo
+    // (mudo fica sem flag e o próximo boot re-tenta na janela acordada dele).
+    if (moduloOk) EEPROM.update(EE_MOD_CFG, MOD_CFG_MAGIC);
+    DBG(F("[boot] moduloOk=")); DBGLN(moduloOk);
 
-//*****************************************************************************************************************
-// Function to setup configuration device
-//*****************************************************************************************************************
-
-void setupConfigurationDevice() {
-    flagStatusDoor02 = EEPROM.read(calibrationOk);
-    flagVerifierCalibration = EEPROM.read(verifierCalibration);
-    flagProximityOpening = EEPROM.read(configurationDevice);
-    flagWarningSound = EEPROM.read(configurationDevice + 1);
-    flagLightWarning = EEPROM.read(configurationDevice + 2);
-    flagLockTurns = EEPROM.read(configurationDevice + 3);
-    flagButton = EEPROM.read(configurationDevice + 4);
-    flagAutomaticClosing = EEPROM.read(configurationDevice + 5);
-    flagDoorUnloockingWarning = EEPROM.read(configurationDevice + 6);
-    flagOpenDoorWarning = EEPROM.read(configurationDevice + 7);
-}
-
-//*****************************************************************************************************************
-// Function to setup serial BLE 01
-//*****************************************************************************************************************
-
-void setupBLE01(bool prodOK) {
-    //------------------------------------
-    // To test commands AT BLE1010
-    //------------------------------------
-
-    rotinaWriteBluetooth(testBLE1010);
-
-    // FIXME Remover quando for implementado a interrupção por timer em interfaceFI
-    interfaceFI(FADEIN_FADEOUT);
-
-    //------------------------------------
-    // To desactived password BLE1010
-    //------------------------------------
-
-    rotinaWriteBluetooth(desactDefPasBLE1010);
-
-    //------------------------------------
-    // To mode receive data BLE1010
-    //------------------------------------
-
-    rotinaWriteBluetooth(modeRCBLE1010);
-
-    // FIXME Remover quando for implementado a interrupção por timer em interfaceFI
-    interfaceFI(FADEIN_FADEOUT);
-
-    //------------------------------------
-    // To mode role slave BLE1010
-    //------------------------------------
-
-    rotinaWriteBluetooth(roleSlaveBLE1010);
-
-    //------------------------------------
-    // To baud rate 9600 BLE1010
-    //------------------------------------
-
-    rotinaWriteBluetooth(baud9600BLE1010);
-
-    // FIXME Remover quando for implementado a interrupção por timer em interfaceFI
-    interfaceFI(FADEIN_FADEOUT);
-
-    //------------------------------------
-    // To work? BLE1010
-    //------------------------------------
-    rotinaWriteBluetooth(delimitBLE1010);
-
-    //------------------------------------
-    // To active the notify BLE1010
-    //------------------------------------
-
-    rotinaWriteBluetooth(actNotiBLE1010);
-
-    // FIXME Remover quando for implementado a interrupção por timer em interfaceFI
-    interfaceFI(FADEIN_FADEOUT);
-
-    String auxiliarLocal = rotinaWriteBluetooth(versBLE1010);
-
-    if (strcmp(auxiliarLocal.c_str(), Versao03BLE) == 0) {
-        //------------------------------------
-        // To work in this 'Versao03BLE' version
-        //------------------------------------
-
-        rotinaWriteBluetooth(setStatusPIO6_BLE1010);
+    // Feedback do boot: o aviso curto de sucesso toca na CONEXÃO (OK+CONN), não aqui.
+    //   módulo OK  -> 2 piscadas VERDES (silencioso; "pronta")
+    //   módulo MUDO -> 4 bipes GRAVES + vermelho (erro real de BLE) + diag de baud
+    if (moduloOk) {
+        piscar(CRGB::Green, 2);
     } else {
-        //------------------------------------
-        // To pre connection BLE1010
-        //------------------------------------
-
-        rotinaWriteBluetooth(preConnBLE1010);
-
-        //------------------------------------
-        // To pos connection BLE1010
-        //------------------------------------
-
-        rotinaWriteBluetooth(posConnBLE1010);
+        sinalModuloMudo();
+        diagBaudBipes();
     }
-
-    // FIXME Remover quando for implementado a interrupção por timer em interfaceFI
-    interfaceFI(FADEIN_FADEOUT);
-    //------------------------------------
-    // To state after setup PIO6 connection BLE1010
-    //------------------------------------
-
-    rotinaWriteBluetooth(toStatePIO60);
-
-    //------------------------------------
-    // To set the name BLE1010
-    //------------------------------------
-
-    // FIXME Substituir por `rotinaWriteBluetooth(prodOK ? nameBLE1010 : nameBLE101producao)`
-    if (prodOK) {
-        rotinaWriteBluetooth("AT+NAMECHAVIFI");
-    } else {
-        rotinaWriteBluetooth(nameBLE1010producao);
-    }
-    // //------------------------------------
-    // // Ask the value of the MAC Address
-    // //------------------------------------
-
-    interfaceFI(FADEIN_FADEOUT);     // 0x01
-    bluetooth.write(askMACBLE1010);  // SOFT
-
-    delay(timeToWaitBLE1010);
-    if (bluetooth.available() > 0) {
-        while (bluetooth.available()) {
-            b1 = bluetooth.read();
-            command += b1;
-
-            if (b1 == '\n') {
-                numberMacAddress = command.substring(command.indexOf(':') + 1);
-
-                b1 = 0;
-                command = "";
-            }
-        }
-    }
-
-    //------------------------------------
-    // To reset BLE1010
-    //------------------------------------
-
-    rotinaWriteBluetooth(resetBLE1010);
-
-    //------------------------------------
-    // To drop BLE1010
-    //------------------------------------
-
-    rotinaWriteBluetooth(lostConnecBLE1010);
-
-    interfaceFI(ON);  // 0x04
+    DBGLN(F("[boot] PRONTA - dormindo"));
 }
-
-//*****************************************************************************************************************
-// Function to setup ADC
-//*****************************************************************************************************************
-
-void setupADC() {
-    pinMode(pinBattery01, INPUT);  // Setup pin to battery level of the battery
-    pinMode(pinBattery02, INPUT);  // Setup pin to battery level of the 5V
-}
-
-//*****************************************************************************************************************
-// Function to setup RTC
-//*****************************************************************************************************************
-
-void setupI2C() {
-    ina219.begin();
-}
-
-//*****************************************************************************************************************
-// Function to seed setup
-//*****************************************************************************************************************
-
-void seedSetup() {
-#ifdef DEBUG
-    Serial.println(F("seedSetup -> inicio"));
-#endif
-
-    while (flagSetupSeed == 0x01) {
-        timeOutReceiveiSeed = millis();
-
-        while (millis() - timeOutReceiveiSeed < timeOutSeed) {
-            receiveSeed();
-        }
-
-        if (flagTimeoutSeed == 0x01) {
-            disconnectBLE1010();
-            funcReset();
-        }
-
-        timeOutReceiveiSeed = 0;
-        sendSeedOk();
-    }
-
-    delay(1000 * timeToWait);
-    disconnectBLE1010();
-    delay(2000);
-    changeName();
-
-    EEPROM.update(setupSeedOk, 0x01);
-    EEPROM.update(generalSetupOk, 0x01);
-
-    delay(1000 * timeToWait);
-}
-
-//*****************************************************************************************************************
-// Receive seed
-//*****************************************************************************************************************
-
-void receiveSeed() {
-    if (bluetooth.available() > 0) {
-        inputBLE1010 = bluetooth.parseInt();
-
-#ifdef DEBUG
-        Serial.print(F("Seed Recebida: "));
-        Serial.println(inputBLE1010);
-#endif
-
-        if (inputBLE1010 != 0) {
-            contadorSeed++;
-
-#ifdef DEBUG
-            Serial.print(F("contSeed: "));
-            Serial.println(contadorSeed);
-#endif
-
-            if (inputBLE1010 == testMotor) {
-                // Turn01
-                flagStallMotor = 0x01;
-
-                rotateMotor01();
-                readINA219();
-                stopMotor();
-
-                functionPanic();
-                delay(10 * timeToWait);
-
-                rotateMotor02();
-                delay(timeToLineUP);
-                stopMotor();
-
-                functionPanic();
-                delay(2000 * timeToWait);
-
-                // Turn02
-                flagStallMotor = 0x01;
-
-                rotateMotor02();
-                readINA219();
-                stopMotor();
-
-                functionPanic();
-                delay(10 * timeToWait);
-
-                rotateMotor01();
-                delay(timeToLineUP);
-                stopMotor();
-
-                functionPanic();
-
-                contadorSeed = 0;
-
-                SendDataBLE("11");  // SOFT - FI = 360
-            }
-
-            if (contadorSeed == 1) {
-                inputSeed01 = inputBLE1010;
-                flagTimeoutSeed = 0x01;
-            } else if (contadorSeed == 2) {
-                inputSeed02 = inputBLE1010;
-                flagTimeoutSeed = 0x01;
-            } else if (contadorSeed == 3) {
-                inputSeed03 = inputBLE1010;
-                flagTimeoutSeed = 0x01;
-            } else if (contadorSeed == 4) {
-                inputSeed04 = inputBLE1010;
-                flagTimeoutSeed = 0x01;
-            } else if (contadorSeed == 5) {
-                inputTimeStamp = inputBLE1010;
-                timeOutSeed = 0;
-                flagTimeoutSeed = 0x00;
-                flagSeedOk = 0x01;
-            }
-        }
-    }
-}
-
-//*****************************************************************************************************************
-// Send seed
-//*****************************************************************************************************************
-
-void sendSeedOk() {
-    char TempStr[CMDBUFFER_SIZE] = "";
-    while (flagSeedOk == 0x01) {
-        EEPROM.put(address01Seed01, inputSeed01);
-        EEPROM.put(address01Seed02, inputSeed02);
-        EEPROM.put(address01Seed03, inputSeed03);
-        EEPROM.put(address01Seed04, inputSeed04);
-        EEPROM.put(address01MAC, address01MAC);
-
-        sprintf(TempStr, "%lu", inputSeed01);                  // SOFT - FI = 360
-        SendDataBLE(TempStr, SEEDDelimData);                   // SOFT - FI = 360  // inputSeed01
-        sprintf(TempStr, "%lu", inputSeed02);                  // SOFT - FI = 360
-        SendDataBLE(TempStr, SEEDDelimData);                   // SOFT - FI = 360  // inputSeed02
-        sprintf(TempStr, "%lu", inputSeed03);                  // SOFT - FI = 360
-        SendDataBLE(TempStr, SEEDDelimData);                   // SOFT - FI = 360  // inputSeed03
-        sprintf(TempStr, "%lu", inputSeed04);                  // SOFT - FI = 360
-        SendDataBLE(TempStr, SEEDDelimData);                   // SOFT - FI = 360  // inputSeed04
-        SendDataBLE(numberMacAddress.c_str(), SEEDDelimData);  // SOFT - FI = 360
-        sprintf(TempStr, "%d", FI_version);                    // SOFT - FI = 360
-        SendDataBLE(TempStr);                                  // SOFT - FI = 360// FI_version
-        delay(12);                                             // SOFT - FI = 360// Delay para garantir que o pacote de dados finalize
-
-        flagSetupSeed = 0x00;
-        flagSeedOk = 0x00;
-
-        contadorSeed = 0;
-    }
-}
-
-//*****************************************************************************************************************
-// Function to change name
-//*****************************************************************************************************************
-
-void changeName(bool lenta) {
-    //------------------------------------
-    // To set the name CHAVI
-    //------------------------------------
-    String resp = rotinaWriteBluetooth(String(nameBLE1010).substring(0, 18).c_str(), lenta);
-#ifdef DEBUG
-    Serial.println(resp);
-#endif
-}
-
-//*****************************************************************************************************************
-// Function to setup interrupts
-//*****************************************************************************************************************
-
-void setupInterrupts() {
-    if (flagSelectInterrupt == 0x01) {
-        delay(50);
-        attachInterrupt(digitalPinToInterrupt(pinPushButton), interruptSetup, FALLING);
-    }
-
-    if (flagSelectInterrupt == 0x02) {
-        rotinaWriteBluetooth(delimitBLE1010, false);
-        changeName(true);
-        flagInterrupt = NONE;
-        attachInterrupt(digitalPinToInterrupt(pinPushButton), pushButtonInterrupt, FALLING);
-    }
-}
-
-//*****************************************************************************************************************
-// End settings
-//*****************************************************************************************************************
 
 void loop() {
-    if (flagButton == 0x01) {
-        functionPBOperate();
+    // Janela de escuta logo APÓS o boot, sempre: se alguém conectou DURANTE o
+    // boot (bancada/app logo depois de gravar), o módulo já está em modo túnel
+    // (não interpreta AT) e os writes dele chegaram enquanto o setup rodava —
+    // sem esta janela o MCU ia direto dormir e o AT+DROP do dormir() ainda
+    // DERRUBAVA o cliente (visto na bancada: conectou no meio do boot, viu os
+    // nossos "AT" como dados e caiu sem PONG). Também cobre o wake da
+    // hibernação (app conectado esperando).
+    static bool primeiraVolta = true;
+    if (primeiraVolta || g_wakeHib) {
+        primeiraVolta = false;
+        g_wakeHib = false;
+        atenderApp();
     }
-
-    readBLE1010();
-
-    goToSleep();
-}
-
-//*****************************************************************************************************************
-// Function to push button operate
-//*****************************************************************************************************************
-
-void functionPBOperate() {
-    if (flagInterrupt == PUSH_BUTTON) {
-        readBatteryLevel();
-
-        while (!digitalRead(pinPushButton)) {
-#ifdef DEBUG
-            Serial.println(F("functionPBOperate -> Botao Pressionado"));
-#endif
-
-            counterResetDance++;
-#ifdef DEBUG
-            Serial.println(F("Espera reset"));
-#endif
-            delay(100 * timeToWait);
-
-            if (counterResetDance == 25 || counterResetDance == 50) {
-                interfaceFI(ON_SOUND_TONEDEFAULT);  // 0x03
-            }
-        }
-
-        if ((counterResetDance >= 25) && (counterResetDance < 50)) {
-            counterResetDance = 0;
-            timeToClose = millis();
-
-            // FIXME Substituir por switch case
-            if (flagAutomaticClosing == 0x00) {
-                timeToCloseTheDoor = 0;
-            }
-            if (flagAutomaticClosing == 0x01) {
-                timeToCloseTheDoor = 3000;
-            }
-            if (flagAutomaticClosing == 0x02) {
-                timeToCloseTheDoor = 5000;
-            }
-            if (flagAutomaticClosing == 0x03) {
-                timeToCloseTheDoor = 10000;
-            }
-            if (flagAutomaticClosing == 0x04) {
-                timeToCloseTheDoor = 15000;
-            }
-            if (flagAutomaticClosing == 0x05) {
-                timeToCloseTheDoor = 30000;
-            }
-
-            interfaceFI(ON_SOUND_TONEDEFAULT);  // 0x03
-
-            while (millis() - timeToClose < timeToCloseTheDoor) {
-                flagShowBatteryLevel = 0x00;
-            }
-        }
-
-        if (counterResetDance >= 50) {
-            flagShowBatteryLevel = 0x01;
-            flagInterrupt = NONE;
-            counterResetDance = 0;
-
-            if (flagLightWarning == 0x00) {
-                interfaceFI(ON_SOUND_TONEDEFAULT);  // 0x03
-                delay(300 * timeToWait);
-                interfaceFI(ON_SOUND_TONEDEFAULT);  // 0x03
-                delay(300 * timeToWait);
-            } else if (flagWarningSound == 0x01) {
-                toneDefaultByTime(timeToToneDefault);
-            }
-
-            readBatteryLevel();
-
-            if (flagLightWarning != 0x00) {
-                showBatteryLevel();
-            }
-        }
-
-        if (!flagShowBatteryLevel == 0x01) {
-            if (flagStateMotor) {
-                turnTheMotor01();
-            } else {
-                turnTheMotor02();
-            }
-            readBatteryLevel();
-            if (flagLightWarning != 0x00) {
-                showBatteryLevel();
-            }
-
-            flagShowBatteryLevel = 0x00;
-            flagInterrupt = NONE;
-        }
-
-        flagShowBatteryLevel = 0x00;
-        timeToClose = 0;
-        counterResetDance = 0;
-    }
-}
-
-//*****************************************************************************************************************
-// Function to read BLE1010
-//*****************************************************************************************************************
-
-void readBLE1010() {
-#ifdef DEBUG
-    Serial.println(F("Read BLE1010"));
-#endif
-    if (flagInterrupt == BLUETOOTH) {
-        timeOutDKCount = millis();
-
-        while (millis() - timeOutDKCount < timeOutGoToSleep) {
-            if (bluetooth.available() > 0) {
-                receiveRandom = bluetooth.parseInt();
-
-                if (receiveRandom != 0) {
-#ifdef DEBUG
-                    Serial.print(F("Received: "));
-                    Serial.println(receiveRandom);
-#endif
-
-                    timeOutDKCount = millis();
-                    if (counterToken == 0) {
-                        delay(20);
-                        saltos_1 = send_saltos(receiveRandom, inputSeed01);
-
-                        delay(20);
-                        saltos_2 = send_saltos(receiveRandom, inputSeed02);
-
-                        delay(20);
-
-                        numberToken01 = getpass_do_lolis(saltos_1, inputSeed01);
-                        numberToken02 = getpass_do_lolis(saltos_2, inputSeed02);
-                        numberToken03 = getpass_do_lolis(saltos_1, inputSeed03);
-                        numberToken04 = getpass_do_lolis(saltos_2, inputSeed04);
-
-                        counterToken++;
-                    } else if (counterToken == 1) {
-                        token01 = receiveRandom;
-
-                        counterToken++;
-                    } else if (counterToken == 2) {
-                        token02 = receiveRandom;
-
-                        counterToken++;
-                    } else if (counterToken == 3) {
-                        token03 = receiveRandom;
-
-                        counterToken++;
-                    } else {
-                        counterToken = 0;
-                    }
-                }
-
-                if ((token01 != 0) && (token02 != 0) && (token03 != 0)) {
-#ifdef DEBUG
-                    Serial.print(F("numberTokens: "));
-                    Serial.println(numberToken01);
-                    Serial.println(numberToken02);
-                    Serial.println(numberToken03);
-                    Serial.println(numberToken04);
-
-                    Serial.print(F("tokens: "));
-                    Serial.println(token01);
-                    Serial.println(token02);
-                    Serial.println(token03);
-#endif
-
-                    if ((token01 == numberToken01) && (token02 == numberToken02)) {
-                        operateAllOk();
-                        token01 = 0;
-                        token02 = 0;
-                        token03 = 0;
-                        token04 = 0;
-                        counterToken = 0;
-
-                        timeOutDKCount = millis() - timeOutGoToSleep - 100;
-                    }
-
-                    if ((token01 == numberToken03) && (token02 == numberToken04)) {
-                        if (token03 == token03SetupDevice) {
-                            setupDeviceComplete();
-                        } else if (token03 == tokenCalibration) {
-                            setupCalibration();
-                        } else if (token03 == tokenSetupSeed) {
-                            SendDataBLE("11");  // SOFT - FI = 360,
-                            delay(100);
-
-                            EEPROM.update(setupSeedOk, 0x00);
-
-                            funcReset();
-                        }
-
-                        timeOutDKCount = millis() - timeOutGoToSleep - 100;
-                    }
-                }
-            }
-        }
-
-        token01 = 0;
-        token02 = 0;
-        token03 = 0;
-        token04 = 0;
-        counterToken = 0;
-        timeOutDKCount = 0;
-    }
-}
-
-//*****************************************************************************************************************
-// Function to operate with all ok
-//*****************************************************************************************************************
-
-void operateAllOk() {
-    if (token03 == 1) {  // token03 é o comando abrir ou fechar
-        if (EEPROM.read(calibrationOk) == 0x00) {
-            flagStateMotor = 0;  // o calibrationOK = 0x00 é porta sentido horário
-        } else if (EEPROM.read(calibrationOk) == 0x01) {
-            flagStateMotor = 1;  // o calibrationOK = 0x01 é porta sentido anti horário
-        }
-    }
-
-    if (token03 == 2) {
-        if (EEPROM.read(calibrationOk) == 0x00) {
-            flagStateMotor = 1;
-        } else if (EEPROM.read(calibrationOk) == 0x01) {
-            flagStateMotor = 0;
-        }
-    }
-
-    readBatteryLevel();
-    if (flagStateMotor) {
-        bluetooth.println(statusDoorOpen + batteryLevel);  // atual (355)
-#ifdef DEBUG
-        Serial.println(F("Girando o motor 1"));
-#endif
-
-        turnTheMotor01();
-#ifdef DEBUG
-        Serial.println(F("Girou o motor 1"));
-#endif
-    } else {
-        bluetooth.println(statusDoorClose + batteryLevel);  // atual (355)
-#ifdef DEBUG
-        Serial.println(F("Girando o motor 2"));
-#endif
-        turnTheMotor02();
-#ifdef DEBUG
-        Serial.println(F("Girou o motor 2"));
-#endif
-        // Verifica se 120 segundos se passaram desde que goToSleep foi chamado
-    }
-
-    if (flagLightWarning != 0x00) {
-        showBatteryLevel();
-    }
-}
-
-//*****************************************************************************************************************
-// Function to setup device complete
-//*****************************************************************************************************************
-
-void setupDeviceComplete() {  // a parte de configurações da fechdaruda
-    char Preferences[32];
-
-    interfaceFI(ON_SOUND_TONEDEFAULT);  // 0x03
-
-    SendDataBLE("22");  // SOFT - FI = 360
-
-    if (bluetooth.available() > 0) {
-        while (bluetooth.available()) {
-            b1 = bluetooth.read();
-            command += b1;
-
-            if (b1 == '\n' && (command.substring(0, 6) == "chavi:" || command.substring(0, 6) == "CHAVI:")) {
-                command.toCharArray(Preferences, sizeof(Preferences));
-
-                EEPROM.update(configurationDevice, Preferences[6] - 0x30);
-                EEPROM.update(configurationDevice + 1, Preferences[7] - 0x30);
-                EEPROM.update(configurationDevice + 2, Preferences[8] - 0x30);
-                EEPROM.update(configurationDevice + 3, Preferences[9] - 0x30);
-                EEPROM.update(configurationDevice + 4, Preferences[10] - 0x30);
-                EEPROM.update(configurationDevice + 5, Preferences[11] - 0x30);
-                EEPROM.update(configurationDevice + 6, Preferences[12] - 0x30);
-                EEPROM.update(configurationDevice + 7, Preferences[13] - 0x30);
-
-                flagProximityOpening = EEPROM.read(configurationDevice);
-                flagWarningSound = EEPROM.read(configurationDevice + 1);
-                flagLightWarning = EEPROM.read(configurationDevice + 2);
-                flagLockTurns = EEPROM.read(configurationDevice + 3);
-                flagButton = EEPROM.read(configurationDevice + 4);
-                flagAutomaticClosing = EEPROM.read(configurationDevice + 5);
-                flagDoorUnloockingWarning = EEPROM.read(configurationDevice + 6);
-                flagOpenDoorWarning = EEPROM.read(configurationDevice + 7);
-
-                b1 = 0;
-                command = "";
-            } else if (b1 == '\n' || b1 == '\r') {
-                b1 = 0;
-                command = "";
-            }
-        }
-        /*
-        Abertura por proximidade  = 1 (sim)
-        Abertura por proximidade  = 0 (não) DEFAULT
-
-        Aviso sonoro        = 1 (sim) DEFAULT
-        Aviso sonoro        = 0 (não)
-
-        Aviso luminoso        = 0 (não)
-        Aviso luminoso        = 1 (3s)  DEFAULT
-        Aviso luminoso        = 2 (5s)
-        Aviso luminoso        = 3 (10s)
-
-        Trancar com 2 voltas    = 1 (sim) DEFAULT
-        Trancar com 2 voltas    = 0 (não)
-
-        Botão           = 1 (sim) DEFAULT
-        Botão           = 0 (não)
-
-        Fechamento automático   = 0 (não)   DEFAULT
-        Fechamento automático   = 1 (15s)
-        Fechamento automático   = 2 (30s)
-        Fechamento automático   = 3 (40s)
-        Fechamento automático   = 4 (50s)
-
-        Aviso de porta destrancada  = 0 (não) DEFAULT
-        Aviso de porta destrancada  = 1 (sim)
-
-        Aviso de porta aberta   = 0 (não) DEFAULT
-        Aviso de porta aberta   = 1 (sim)
-
-        Exemplo: CHAVI:0111 1000 = 0x78
-
-        */
-    }
-}
-
-//*****************************************************************************************************************
-// Function to go sleep ATMEGA328P
-//*****************************************************************************************************************
-
-void goToSleep() {
-    savePinState();
-    clearPinState();
-#ifdef DEBUG
-    Serial.println("Vou dormir");
-#endif
-    // timeOutGoToSleep = 15000;
-
-    disconnectBLE1010();
-    activeBLE1010Connect();
-    flagInterrupt = NONE;
-
-    attachInterrupt(digitalPinToInterrupt(pinPushButton), pushButtonInterrupt, FALLING);
-    attachInterrupt(digitalPinToInterrupt(pinWakeuC), bluetoohInterrupt, RISING);
-
-#ifdef DEBUG
-    Serial.println("Dormi");
-#endif
-    // Enter power down state with ADC and BOD module disabled. Wake up when wake up pin is low.
-    LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);
-
-#ifdef DEBUG
-    Serial.println("Acordei");
-#endif
-}
-
-//*****************************************************************************************************************
-// Function to battery level
-//*****************************************************************************************************************
-
-void readBatteryLevel() {
-    batteryLevelFloat = 0;
-    for (int j = 0; j < nSamples; j++) {
-        batteryLevelFloat += analogRead(pinBattery01);
-    }
-    batteryLevelFloat /= nSamples;
-    batteryLevel = (batteryLevelFloat * constBatteryLevel);
-    batteryLevelAnalog = (analogRead(pinBattery01) * constBatteryLevel);
-
-    // Adicione aqui o polinômio descoberto com regressão linear
-    // Exemplo: batteryLevelFloat = a * batteryLevelFloat + b;
-
-    float voltage = batteryLevelFloat * constBatteryLevel;
-
-    // Adapte a lógica de limite de tensão conforme necessário
-    if (voltage > maxValueBattery) {
-        voltage = maxValueBattery;
-    } else if (voltage < minValueBattery) {
-        voltage = minValueBattery;
-    }
-
-    percBatteryLevel = (((maxScaleBattery - (maxValueBattery - voltage)) * percBattery) / maxScaleBattery);
-
-    if (percBatteryLevel > oldPercBatteryLevel) {
-        percBatteryLevel = oldPercBatteryLevel;
-    } else {
-        oldPercBatteryLevel = percBatteryLevel;
-    }
-}
-
-//*****************************************************************************************************************
-// Function to disconnect BLE1010
-//*****************************************************************************************************************
-
-void disconnectBLE1010() {
-    bluetooth.write(lostConnecBLE1010);  // SOFT
-    RespostaBLE();
-}
-
-//*****************************************************************************************************************
-// Function to disconnect BLE1010
-//*****************************************************************************************************************
-
-void activeBLE1010Connect() {
-    bluetooth.write(toStatePIO60);  // SOFT
-    RespostaBLE();
-}
-
-//*****************************************************************************************************************
-// Function to token
-//*****************************************************************************************************************
-
-unsigned long getpass_do_lolis(unsigned long difference, unsigned long seed) {
-    unsigned long b[32] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    b[0] = 1;
-    unsigned int y[4];
-    
-    for (uint8_t index = 1; index < 32; index++) {  // Create the bit mask
-        b[index] = b[index - 1] << 1;
-    }
-
-    for (unsigned int j = 0; j < difference; j++) {
-        y[0] = (b[31] & seed) ? 1 : 0;
-        y[1] = (b[21] & seed) ? 1 : 0;
-        y[2] = (b[1] & seed) ? 1 : 0;
-        y[3] = (b[0] & seed) ? 1 : 0;
-        seed = seed << 1 | (y[0] ^ y[1] ^ y[2] ^ y[3]);
-    }
-
-    return seed;
-}
-
-//*****************************************************************************************************************
-// Function to turn the motor 01
-//*****************************************************************************************************************
-
-void turnTheMotor01() {
-    flagStateMotor = 0;
-    if (EEPROM.read(calibrationOk) == 0x00) {
-        flagSoundBrand = 0x01;
-    } else if (EEPROM.read(calibrationOk) == 0x01) {
-        flagSoundBrand = 0x02;
-    }
-    flagStallMotor = 0x01;
-
-    rotateMotor02();
-    if (flagLockTurns == 0x01) {
-        delay(timeToSoftStart);
-    }
-    readINA219();
-    stopMotor();
-
-    functionPanic();
-    delay(10 * timeToWait);
-
-    if (flagLineUpMotor == 0x01) {
-        rotateMotor01();
-        delay(timeToLineUP);
-        stopMotor();
-
-        flagLineUpMotor = 0x00;
-    }
-
-    functionPanic();
-    if (flagWarningSound == 0x01) {
-        soundBrand();
-    }
-}
-
-//*****************************************************************************************************************
-// Function to turn the motor 02
-//*****************************************************************************************************************
-
-void turnTheMotor02() {
-    flagStateMotor = 1;
-    if (EEPROM.read(calibrationOk) == 0x00) {
-        flagSoundBrand = 0x02;
-    } else if (EEPROM.read(calibrationOk) == 0x01) {
-        flagSoundBrand = 0x01;
-    }
-    flagStallMotor = 0x01;
-
-    rotateMotor01();
-    if (flagLockTurns == 0x01) {
-        delay(timeToSoftStart);
-    }
-    readINA219();
-    stopMotor();
-
-    functionPanic();
-    delay(10 * timeToWait);
-
-    if (flagLineUpMotor == 0x01) {
-        rotateMotor02();
-        delay(timeToLineUP);
-        stopMotor();
-
-        flagLineUpMotor = 0x00;
-    }
-
-    functionPanic();
-    if (flagWarningSound == 0x01) {
-        soundBrand();
-    }
-}
-
-//*****************************************************************************************************************
-// Function to read INA219
-//*****************************************************************************************************************
-
-void readINA219() {
-    ina219.powerSave(false);
-
-    timeoutStallMotor = millis();
-
-    while (flagStallMotor == 0x01) {
-        if ((flagLockTurns == 0x01) &&
-            (flagVerifierCalibration == 0x01) &&
-            (flagLockTurnsError01 == 0x00) &&
-            (flagLockTurnsError02 == 0x00)) {
-            if ((flagStateMotor == 0) && (flagStatusDoor02 == 1)) {
-                functionDelta();
-            } else if ((flagStateMotor == 1) && (flagStatusDoor02 == 0)) {
-                functionDelta();
-            } else {
-                currentInmA = readCurrentInmA();
-            }
-        } else {
-            currentInmA = readCurrentInmA();
-        }
-
-        if (counterLockTurns01 == 1) {
-            flagLockTurnsError01 = 0x01;
-        }
-        if (counterLockTurns02 == 1) {
-            flagLockTurnsError02 = 0x01;
-        }
-
-        if ((flagLockTurns == 0x01) &&
-            (flagVerifierCalibration == 0x01) &&
-            (flagLockTurnsError01 == 0x00) &&
-            (flagLockTurnsError02 == 0x00)) {
-            // To 1-1
-            if ((flagStateMotor == 0) && (flagStatusDoor02 == 1)) {
-                if (deltaD < turnOne3) {
-                    counterLockTurns01++;
-
-                    flagLineUpMotor = 0x00;
-                    flagStallMotor = 0x00;
-                    delay(1500 * timeToWait);
-                    stopMotor();
-                }
-
-                if (abs(currentInmA) > stallMotor) {
-                    flagStallMotor = 0x00;
-                }
-                if (millis() - timeoutStallMotor > timeoutMotor) {
-                    flagStallMotor = 0x00;
-                }
-            } else if ((flagStateMotor == 1) && (flagStatusDoor02 == 0)) {  // To 0-0
-                if (deltaD < turnOne3) {
-                    counterLockTurns02++;
-
-                    flagLineUpMotor = 0x00;
-                    flagStallMotor = 0x00;
-                    delay(1500 * timeToWait);
-                    stopMotor();
-                }
-
-                if (abs(currentInmA) > stallMotor) {
-                    flagStallMotor = 0x00;
-                }
-                if (millis() - timeoutStallMotor > timeoutMotor) {
-                    flagStallMotor = 0x00;
-                }
-            } else {
-                flagLineUpMotor = 0x01;
-
-                if (abs(currentInmA) > stallMotor) {
-                    flagStallMotor = 0x00;
-                }
-                if (millis() - timeoutStallMotor > timeoutMotor) {
-                    flagStallMotor = 0x00;
-                }
-            }
-        } else {  // To 0-1
-            if ((flagStateMotor == 1) && (flagStatusDoor02 == 1)) {
-                counterLockTurns01 = 0;
-                flagLockTurnsError01 = 0x00;
-            }
-
-            // To 1-0
-            if ((flagStateMotor == 0) && (flagStatusDoor02 == 0)) {
-                counterLockTurns02 = 0;
-                flagLockTurnsError02 = 0x00;
-            }
-
-            flagLineUpMotor = 0x01;
-
-            if (abs(currentInmA) > stallMotor) {
-                flagStallMotor = 0x00;
-            }
-
-            if (millis() - timeoutStallMotor > timeoutMotor) {
-                flagStallMotor = 0x00;
-            }
-        }
-    }
-
-    deltaD = 0;
-    currentInmA = 0;
-    timeoutStallMotor = 0;
-
-    ina219.powerSave(true);
-}
-
-//*****************************************************************************************************************
-// Function to panic
-//*****************************************************************************************************************
-
-void functionPanic() {
-    ina219.powerSave(false);
-
-    unsigned long timeToPanic = millis();
-
-    while (millis() - timeToPanic < timeToPanicSegurite) {
-        currentInmA = readCurrentInmA();
-
-        if (abs(currentInmA) >= valueToPanic) {
-            flagToPanic = 0x01;
-
-            stopMotor();
-        } else {
-            flagToPanic = 0x00;
-            timeToPanic = 0;
-        }
-    }
-
-    ina219.powerSave(true);
-
-    if (flagToPanic == 0x01) {
-        funcReset();
-    } else {
-        currentInmA = 0;
-        timeToPanic = 0;
-    }
-}
-
-//*****************************************************************************************************************
-// Function to calculate derivada
-//*****************************************************************************************************************
-
-void functionDelta() {
-    float currentInmAOld = currentInmA;
-    currentInmA = 0;
-    unsigned long timeTime = millis();
-
-    // TODO Por que 2*nSamples?
-    // TODO Usar função extraída `readCurrentInmA()`
-    for (int i = 0; i < (2 * nSamples); i++) {
-        currentInmA = ina219.getCurrent_mA() + currentInmA;
-    }
-    currentInmA /= nSamples;
-    unsigned long timeTime2 = millis();
-
-    deltaD = ((currentInmA - currentInmAOld) / (timeTime2 - timeTime)) * 100;
-}
-
-//*****************************************************************************************************************
-// Function to setup calibration
-//*****************************************************************************************************************
-
-void setupCalibration() {
-#ifdef DEBUG
-    Serial.println(F("Setup Calib"));
-#endif
-    delay(50);  // SOFT - Inserido para compatibilizar com iOS para iniciar calibracao
-    clearCMDBuffer();
-
-    interfaceFI(ON_SOUND_TONESEED_OFF);  // 0x02
-
-    SendDataBLE("11", CALIBDelimData);  // SOFT - FI = 360
-
-    flagCalibrationFI01 = 0x01;
-    flagCalibrationFI02 = 0x01;
-
-    ina219.powerSave(false);
-
-    while (flagCalibrationFI01 == 0x01) {
-        while (flagCalibrationFI02 == 0x01) {
-            char c;
-
-            if (bluetooth.available() > 0) {
-                while (bluetooth.available()) {
-                    c = processCharInput(cmdBuffer, bluetooth.read());
-
-                    if (c == '\n') {
-#ifdef DEBUG
-                        Serial.println(F("Chama Read Calib"));
-#endif
-                        readCalibration();
-
-                        timeoutStallMotor02 = millis();
-                        clearCMDBuffer();
-                    }
-                }
-            }
-        }
-
-        currentInmA = readCurrentInmA();
-
-        if (abs(currentInmA) > stallMotor) {
-            if (flagCalibrationFI03 == 0x01) {
-                flagCalibrationFI02 = 0x01;
-            }
-            if (flagCalibrationFI03 == 0x02) {
-                flagCalibrationFI02 = 0x00;
-                flagCalibrationFI01 = 0x00;
-            }
-
-            if (flagTurnMotor == 0x01) {
-                flagTurnMotor = 0x02;
-            }
-            if (flagTurnMotor == 0x03) {
-                flagTurnMotor = 0x04;
-            }
-            turnMotor();
-        }
-
-        if (millis() - timeoutStallMotor02 > timeoutMotor) {
-            if (flagCalibrationFI03 == 0x01) {
-                flagCalibrationFI02 = 0x01;
-            }
-            if (flagCalibrationFI03 == 0x02) {
-                flagCalibrationFI02 = 0x00;
-                flagCalibrationFI01 = 0x00;
-            }
-
-            if (flagTurnMotor == 0x01) {
-                flagTurnMotor = 0x02;
-            }
-            if (flagTurnMotor == 0x03) {
-                flagTurnMotor = 0x04;
-            }
-            turnMotor();
-        }
-    }
-
-    timeoutStallMotor03 = millis();
-
-    while (flagStatusDoor == 0x01) {
-        flagTurnMotor = 0x01;
-        turnMotor();
-
-        currentInmA = readCurrentInmA();
-
-        if (abs(currentInmA) > stallMotor) {
-            flagTurnMotor = 0x02;
-            turnMotor();
-            flagStatusDoor = 0x00;
-        }
-
-        if (millis() - timeoutStallMotor03 > timeoutMotor) {
-            flagTurnMotor = 0x02;
-            turnMotor();
-            flagStatusDoor = 0x00;
-        }
-    }
-
-    ina219.powerSave(true);
-
-    currentInmA = 0;
-    timeoutStallMotor02 = 0;
-    timeoutStallMotor03 = 0;
-
-    disconnectBLE1010();
-    delay(500 * timeToWait);
-
-    flagVerifierCalibration = 0x01;
-    EEPROM.update(verifierCalibration, flagVerifierCalibration);
-
-    interfaceFI(ON_SOUND_TONESEED_OFF);  // 0x02
-}
-
-//*****************************************************************************************************************
-// Function to read calibration
-//*****************************************************************************************************************
-
-void readCalibration() {
-    if (strcmp(commandToStartCali, cmdBuffer) == 0) {
-#ifdef DEBUG
-        Serial.println(F("commandToStartCali OK"));
-#endif
-        interfaceFI(ON_SOUND_TONEDEFAULT);  // 0x03
-
-        flagCalibrationFI02 = 0x00;
-        flagCalibrationFI03 = 0x01;
-        flagTurnMotor = 0x01;
-
-        turnMotor();
-
-        SendDataBLE("11", CALIBDelimData);  // SOFT - FI = 360
-    } else if (strcmp(commandToDoorClose, cmdBuffer) == 0) {
-#ifdef DEBUG
-        Serial.println(F("commandToDoorClose OK"));
-#endif
-
-        interfaceFI(ON_SOUND_TONEDEFAULT);  // 0x03
-
-        flagCalibrationFI02 = 0x00;
-        flagCalibrationFI03 = 0x02;
-        flagTurnMotor = 0x03;
-
-        flagStatusDoor = 0x00;
-        flagStatusDoor02 = flagStatusDoor;
-        flagStateMotor = 0;
-        SendDataBLE("11", CALIBDelimData);  // SOFT - FI = 360
-        SendDataBLE("1");                   // SOFT - FI = 360
-
-        EEPROM.update(calibrationOk, flagStatusDoor02);
-
-        turnMotor();
-    } else if (strcmp(commandToDoorOpen, cmdBuffer) == 0) {
-#ifdef DEBUG
-        Serial.println(F("commandToDoorOpen OK"));
-#endif
-        flagCalibrationFI02 = 0x00;
-        flagCalibrationFI03 = 0x02;
-        flagTurnMotor = 0x03;
-
-        flagStatusDoor = 0x01;
-        flagStatusDoor02 = flagStatusDoor;
-        flagStateMotor = 1;
-        SendDataBLE("11", CALIBDelimData);  // SOFT - FI = 360
-        SendDataBLE("2");                   // SOFT - FI = 360
-
-        EEPROM.update(calibrationOk, flagStatusDoor02);
-
-        turnMotor();
-    } else {
-#ifdef DEBUG
-        Serial.println(F("Not OK - mandando 22"));
-#endif
-        SendDataBLE("22");  // SOFT - FI = 360
-        delay(1000 * timeToWait);
-    }
-}
-
-//*****************************************************************************************************************
-// Turn motor one
-//*****************************************************************************************************************
-
-void turnMotor() {
-    if (flagTurnMotor == 0x01) {
-        rotateMotor01();
-    }
-
-    if (flagTurnMotor == 0x02) {
-        rotateMotor02();
-        delay(500 * timeToWait);
-        stopMotor();
-    }
-
-    if (flagTurnMotor == 0x03) {
-        rotateMotor02();
-    }
-
-    if (flagTurnMotor == 0x04) {
-        rotateMotor01();
-        delay(500 * timeToWait);
-        stopMotor();
-    }
-}
-
-/*
- * Função para exibir estado nos leds.
- * @param flagInterface Estado que será mostrado.
- */
-void interfaceFI(Interface flagInterface) {
-    // TODO Extrair função para o header `interface.h`.
-
-    if (flagInterface == FADEIN_FADEOUT) {
-        turnOffLEDs();
-        // FIXME Substituir loops por interrupção por timer
-        for (int i = minValuePWM; i <= maxValuePWM; i++) {
-            leds[2] = CRGB(0, i, 0);
-            FastLED.show();
-            delay(2 * timeToWait);
-        }
-
-        delay(50 * timeToWait);
-
-        for (int j = maxValuePWM; j >= minValuePWM; j--) {
-            leds[2] = CRGB(0, j, 0);
-            FastLED.show();
-            delay(2 * timeToWait);
-        }
-    } else if (flagInterface == ON_SOUND_TONESEED_OFF) {
-        turnOnLEDs(corOK);
-        if (flagWarningSound == 0x01) {
-            toneDefaultByTime(timeToToneSeedSetup * timeToWait);
-        }
-        turnOffLEDs();
-    } else if (flagInterface == ON_SOUND_TONEDEFAULT) {
-        turnOnLEDs(corOK);
-        if (flagWarningSound == 0x01) {
-            toneDefaultByTime(timeToToneDefault * timeToWait);
-        }
-        turnOffLEDs();
-    } else if (flagInterface == ON) {
-        turnOnLEDs(corOK);
-    } else if (flagInterface == OFF) {
-        turnOffLEDs();
-    } else if (flagInterface == ON_DELAY_OFF) {
-        turnOnLEDsDelay(corOK, 500 * timeToWait);
-        turnOffLEDs();
-    } else if (flagInterface == ON_TONESEED_OFF) {
-        turnOnLEDs(corOK);
-        toneDefaultByTime(timeToToneSeedSetup * timeToWait);
-        turnOffLEDs();
-    } else if (flagInterface == ON_TONESEED) {
-        turnOnLEDs(corOK);
-        toneDefaultByTime(timeToToneSeedSetup * timeToWait);
-    }
-}
-
-//*****************************************************************************************************************
-// Function to sound brand
-//*****************************************************************************************************************
-
-void soundBrand() {
-    if (flagWarningSound == 0x01) {
-        int i;
-
-        if (flagSoundBrand == 0x01) {
-            for (i = 0; i < maxNotes - 1; ++i) {
-                toneDefaultByTime(timeToTone, sBrandOpen[i]);
-            }
-            toneDefaultByTime(timeToTone * 2, sBrandOpen[i]);
-        } else if (flagSoundBrand == 0x02) {
-            for (i = 0; i < maxNotes - 1; ++i) {
-                toneDefaultByTime(timeToTone, sBrandClose[i]);
-            }
-            toneDefaultByTime(timeToTone * 2, sBrandClose[i]);
-        }
-    }
-}
-
-//*****************************************************************************************************************
-// Function to show battery level
-//*****************************************************************************************************************
-
-void showBatteryLevel() {
-    // Ajuste a lógica de exibição conforme necessário
-    if ((percBatteryLevel <= 100) && (percBatteryLevel > 30)) {
-        turnOnLEDs(corOK);
-    } else if ((percBatteryLevel <= 30) && (percBatteryLevel >= 0)) {
-        turnOnLEDs(corNOTOK);
-    }
-
-    if (flagLightWarning == 0x01) {
-        nonBlockingDelay(3 * showTheBatteryLevel);
-    }
-    if (flagLightWarning == 0x02) {
-        nonBlockingDelay(5 * showTheBatteryLevel);
-    }
-    if (flagLightWarning == 0x03) {
-        nonBlockingDelay(10 * showTheBatteryLevel);
-    }
-    turnOffLEDs();
-}
-
-//*****************************************************************************************************************
-// Function to deliver the number of jumps (with random generation)
-//*
-
-unsigned long send_saltos(unsigned long random_input, unsigned long seed) {
-    char TempStr[CMDBUFFER_SIZE] = "";
-
-    randNumber = random(0, 9999);
-#ifdef DEBUG
-    Serial.print(F("Send Saltos: "));
-    Serial.println(calc_saltos);
-#endif
-    if (VersBLE <= VersaoFW(3)) {
-        sprintf(TempStr, "%lu\n\n", randNumber + random_input + seed);
-    } else {
-        sprintf(TempStr, "%lu\n", randNumber + random_input + seed);
-    }
-    bluetooth.write(TempStr);
-
-    return randNumber;
-}
-
-void turnOnLEDsDelay(CRGB crgb, int atraso) {
-    turnOnLEDs(crgb);
-    delay(atraso);
-}
-
-// Ligar leds GREEN ->
-void turnOnLEDs(CRGB crgb) {
-    for (int count = 0; count < NUM_LEDS; count++) {
-        leds[count] = crgb;
-    }
-    FastLED.show();
-}
-
-void turnOffLEDs() {
-    for (int count = 0; count < NUM_LEDS; count++) {
-        leds[count] = CRGB(0, 0, 0);
-    }
-    FastLED.show();
-}
-
-void stopMotor() {
-    digitalWrite(pinTurn01, LOW);
-    digitalWrite(pinTurn02, LOW);
-}
-
-void rotateMotor01() {
-    digitalWrite(pinTurn01, HIGH);
-    digitalWrite(pinTurn02, LOW);
-}
-
-void rotateMotor02() {
-    digitalWrite(pinTurn01, LOW);
-    digitalWrite(pinTurn02, HIGH);
-}
-
-void toneDefaultByTime(unsigned int duration, unsigned int frequency) {
-    tone(pinBuzzer, frequency, duration);
-    delay(duration);
-    noTone(pinBuzzer);
-}
-
-String RespostaBLE(bool lenta) {
-    delay(100);
-    if (lenta) delay(timeToWaitBLE1010);
-    String retorno;
-    if (bluetooth.available() > 0) {
-        while (bluetooth.available()) {
-            b1 = bluetooth.read();
-            command += b1;
-            if (b1 == '\n') {
-                retorno = command;
-                b1 = 0;
-                command = "";
-            }
-        }
-#ifdef DEBUG
-        Serial.print(F("RespBLE  : "));
-        Serial.println(retorno);
-    } else {
-        Serial.println(F("BTSerial nao disp."));
-#endif
-    }
-    return retorno;
-}
-
-String rotinaWriteBluetooth(const char *str, bool lenta) {
-    bluetooth.write(str);
-#ifdef DEBUG
-    Serial.print(F("Envia comando: "));
-    Serial.print(str);
-    Serial.print(F(" -> "));
-    Serial.println(validator);
-#endif
-    return RespostaBLE(lenta);
-}
-
-void clearCMDBuffer() {
-    for (uint8_t Aux = 0; Aux < CMDBUFFER_SIZE; ++Aux) {
-        cmdBuffer[Aux] = 0;
-    }
-}
-
-// SOFT - FI = 360
-// SendDataBLE
-// params, char* TxData, string de dados a ser enviado,
-//         char AddData, byte que deve ser adicionado ao fim da string
-// return, none
-void SendDataBLE(const char *TxData, char AddData) {
-    uint8_t Aux;                       // SOFT - FI = 360 - Variavel auxiliar para calculos e processamento
-    char TempTx[CMDBUFFER_SIZE] = "";  // SOFT - FI = 360 - Array Temporario para armazenar string e manipular bytes de controle
-
-    strcpy(TempTx, TxData);        // SOFT - FI = 360 - Copia A string TxData para TempTx
-    Aux = strlen(TempTx);          // SOFT - FI = 360 - Calcula tamanho da string TempTx e guarda em Aux
-    TempTx[Aux++] = ENDWriteData;  // SOFT - FI = 360 - Carrega na posicao Aux do aray TempTx o byte de ENDWriteData
-    switch (VersBLE) {             // SOFT - FI = 360 - Verifica qual a versao do BLE para adicionar o ultimo byte corretamente e compatibilizar com o App
-        case VersaoFW(0):
-        case VersaoFW(1):
-        case VersaoFW(2):
-        case VersaoFW(3):
-            TempTx[Aux++] = ENDFrameVer03;  // SOFT - FI = 360 - Carrega na posicao Aux do aray TempTx o byte de ENDFrameVer03
-            break;
-
-        case VersaoFW(4):
-            if (AddData) {                // SOFT - FI = 360 - AddData!= 0 deve adicionar um byte no final da string TempTx, necessario para compatibilizar processos de SETUP e CALIB do app
-                TempTx[Aux++] = AddData;  // SOFT - FI = 360 - Carrega na posicao Aux do aray TempTx o byte de AddData
-            }
-            TempTx[Aux++] = ENDFrameVer04;  // SOFT - FI = 360 - Carrega na posicao Aux do aray TempTx o byte de EndFrameVer04
-            break;
-
-        default:
-            if (AddData) {                // SOFT - FI = 360 - AddData!= 0 deve adicionar um byte no final da string TempTx, necessario para compatibilizar processos de SETUP e CALIB do app
-                TempTx[Aux++] = AddData;  // SOFT - FI = 360 - Carrega na posicao Aux do aray TempTx o byte de AddData
-            }
-            TempTx[Aux++] = ENDFrameVer04;  // SOFT - FI = 360 - Carrega na posicao Aux do aray TempTx o byte de EndFrameVer04
-            break;
-    }
-    TempTx[Aux] = '\0';       // SOFT - FI = 360 - Carrega na posicao Aux do aray TempTx o byte terminador de string
-    bluetooth.print(TempTx);  // SOFT - FI = 360 - Envia o dado para a serial do BLE
-}
-
-// Função de atraso não bloqueante
-void nonBlockingDelay(unsigned long duration) {
-    unsigned long startTime = millis();
-    while (millis() - startTime < duration) {
-        // Aguarda o tempo sem bloquear outras operações
-        // Pode ser usado para executar outras tarefas enquanto aguarda
-    }
-}
-
-/*
- * Retorna o valor médio da corrente medida no sensor INA219.
- * @return corrente em miliamperes.
- */
-float readCurrentInmA() {
-    float current = 0.0f;
-    for (int i = 0; i < nSamples; i++) {
-        current += ina219.getCurrent_mA();
-    }
-    return current / nSamples;
+    dormir();                            // powerDown; acorda no connect (PD3), botão
+                                         // ou DADOS no RX (PCINT do SoftwareSerial)
+    DBG(F("[wake] btn=")); DBG(acordouBtn); DBG(F(" ble=")); DBGLN(acordouBLE);
+    if (acordouBtn) atenderBotao();
+    // Atende em QUALQUER wake, não só quando o PD3 subiu: módulos clones
+    // ("ver.12") não geram a borda de wake ao conectar, mas os DADOS que o app
+    // escreve chegam no RX do SoftwareSerial — cujo pin-change interrupt também
+    // acorda o MCU do powerDown. O firmware antigo IGNORAVA esse wake (voltava
+    // a dormir) e a fechadura ficava "conecta mas não responde" p/ sempre.
+    // O 1º write pode se perder (o byte que acordou chega picotado); o app e a
+    // bancada retransmitem, e a janela de 20s pega as tentativas seguintes.
+    atenderApp();
 }
