@@ -80,12 +80,12 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.12.1"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.12.2"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.12.1"
-VERSION_DATE = "2026-07-09"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Firmware v2.12.1: anti-duplicação POR COMANDO (FECHAR logo após ABRIR agora sempre gira — antes era engolido e o app mostrava sucesso sem motor; provado em bancada 09/07) + janela 6s→4s (retry humano de fechadura emperrada passa; tempestade de retry do app segue bloqueada) · inclui tudo da v2.12.0 (power-down desconectado, modo DEV, advi_test)"
+VERSION_DATE = "2026-07-11"               # data desta versão (ISO; bump a cada release)
+VERSION_NOTES = "Bancada v2.12.2: escolha SEGURA de fechadura em ambiente lotado — fallback (virgem/CHAVIFI/ffe0) só colado no Mac (rssi >= -60dBm); empate de sinal não chuta mais: desempate ATIVO por TST-INFO (lê o SER: da EEPROM = identidade real, imune a nome corrompido/duplicado), sem confirmação aborta listando; serial exato duplicado e garbled 2+ também resolvem por TST-INFO · firmware segue v2.12.1"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
