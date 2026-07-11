@@ -80,12 +80,12 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.12.2"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.12.3"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.12.1"
 VERSION_DATE = "2026-07-11"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.12.2: escolha SEGURA de fechadura em ambiente lotado — fallback (virgem/CHAVIFI/ffe0) só colado no Mac (rssi >= -60dBm); empate de sinal não chuta mais: desempate ATIVO por TST-INFO (lê o SER: da EEPROM = identidade real, imune a nome corrompido/duplicado), sem confirmação aborta listando; serial exato duplicado e garbled 2+ também resolvem por TST-INFO · firmware segue v2.12.1"
+VERSION_NOTES = "Bancada v2.12.3: REVERTE a escolha ativa da v2.12.2 (limiar 'colado no Mac' -60dBm + desempate por TST-INFO), que deu problema em campo — volta ao critério clássico da v2.12.1: prioridade por nome (serial exato > virgem/CHAVIFI > ffe0) e o RSSI MAIS FORTE (fechadura mais próxima) desempata · firmware segue v2.12.1"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -400,72 +400,12 @@ class Ble:
         return self.client is not None and self.client.is_connected
 
     # ---- scan ----
-    # ESCOLHA SEGURA EM AMBIENTE LOTADO DE FECHADURAS (regra dos dois guardas):
-    #   · Fallback (não-exato: CHAVIFI/virgem/ffe0) só vale COLADO no Mac
-    #     (rssi >= LIMIAR_MESA). RSSI não é distância confiável a metros, mas a
-    #     centímetros é: quem está na mesa passa, a sala inteira não.
-    #   · EMPATE TÉCNICO (dois candidatos da mesma classe com < MARGEM_DB de
-    #     diferença) = ambíguo → ABORTA e lista, em vez de chutar. Duas
-    #     fechaduras lado a lado têm sinal quase igual — cara-ou-coroa não.
-    #   · Vale até pro serial EXATO duplicado (bug antigo chegou a renomear uma
-    #     vizinha): 2 devices com o MESMO nome e sinal parecido → aborta.
-    LIMIAR_MESA = -60   # dBm — "está na mesa da bancada"
-    MARGEM_DB = 6       # diferença mínima p/ desempatar sem ambiguidade
-
-    # Identificação ATIVA: conecta no candidato e pergunta QUEM ELE É (TST-INFO
-    # → "SER:<serial gravado na EEPROM>"). É a identidade REAL da placa —
-    # independe do nome BLE (que corrompe/duplica) e do RSSI (que empata na
-    # mesa). Fechadura com firmware novo responde; virgem/legada fica muda → None.
-    # Comandos inócuos (nunca giram motor); desconecta sempre ao final.
-    async def _quem_e(self, addr):
-        try:
-            await self._connect(addr)
-            await self._cmd("TST-PING", ["PONG"], 3.0)  # acorda (1º write pode se perder)
-            _ok, buf = await self._cmd("TST-INFO", ["FIM-INFO"], 6.0)
-            m = re.search(r"SER:([A-Za-z0-9\-]+)", buf)
-            return m.group(1).upper() if m else None
-        except Exception as e:
-            LOG(f"  (TST-INFO em {addr} falhou: {e})")
-            return None
-        finally:
-            try:
-                await self._disconnect()
-            except Exception:
-                pass
-
-    async def _desempate(self, cands, rotulo, alvo_up=None):
-        """cands = [(classe, rssi, addr, nome)] — devolve addr ou None (ambíguo)."""
-        cands = sorted(cands, key=lambda c: (c[0], c[1]), reverse=True)
-        top = cands[0]
-        rivais = [c for c in cands[1:] if c[0] == top[0] and top[1] - c[1] < self.MARGEM_DB]
-        if not rivais:
-            LOG(f"  → escolhido: {top[3] or '(sem nome)'}  {top[2]}  rssi={top[1]}")
-            return top[2]
-        # EMPATE DE SINAL → identificação ATIVA pela EEPROM (TST-INFO), em vez
-        # de chutar. Só o candidato cujo serial gravado == alvo é escolhido.
-        if alvo_up:
-            LOG(f"  ⚖ Empate de sinal ({rotulo}) — perguntando a identidade real "
-                "(TST-INFO) de cada candidato...", "warn")
-            for c in [top] + rivais:
-                ser = await self._quem_e(c[2])
-                LOG(f"     · {c[3] or '(sem nome)'}  {c[2]}  → SER={ser or '(mudo)'}")
-                if ser == alvo_up:
-                    LOG(f"  → confirmado pela EEPROM: {c[2]}", "hi")
-                    return c[2]
-        LOG(f"  ✗ AMBÍGUO ({rotulo}): {1 + len(rivais)} candidatos com sinal "
-            f"parecido (< {self.MARGEM_DB} dB de diferença) e nenhum confirmou a "
-            "identidade — não vou chutar. Afaste/desligue as outras ou aproxime "
-            "a fechadura-alvo do Mac:", "err")
-        for c in [top] + rivais:
-            LOG(f"     · {c[3] or '(sem nome)'}  {c[2]}  rssi={c[1]}")
-        return None
-
     async def _scan(self, alvo, timeout):
         from bleak import BleakScanner
         LOG(f"Procurando fechadura '{alvo}' por BLE ({timeout:.0f}s)...", "hi")
+        achado = {}
         devs = await BleakScanner.discover(timeout=timeout, return_adv=True)
         alvo_up = alvo.upper()
-        candidatos = []   # (classe: 3=exato 2=CHAVIFI 1=ffe0, rssi, addr, nome)
         for addr, (dev, adv) in devs.items():
             nome = adv.local_name or dev.name or ""
             up = nome.upper()
@@ -482,25 +422,14 @@ class Ble:
                 tag = "★" if match else ("⛔" if outro_serial else "·")
                 LOG(f"  {tag} {nome or '(sem nome)'}  {dev.address}  rssi={adv.rssi}")
             if match:
-                classe = 3 if up == alvo_up else (2 if up.startswith("CHAVIFI") else 1)
-                candidatos.append((classe, adv.rssi, dev.address, nome))
-        if not candidatos:
-            return None
-        exatos = [c for c in candidatos if c[0] == 3]
-        if exatos:
-            return await self._desempate(
-                exatos, f"serial exato '{alvo}' duplicado no ar", alvo_up=alvo_up)
-        perto = [c for c in candidatos if c[1] >= self.LIMIAR_MESA]
-        if not perto:
-            LOG(f"  ✗ '{alvo}' não está no ar e nenhum candidato genérico está COLADO "
-                f"no Mac (rssi >= {self.LIMIAR_MESA}). Em ambiente cheio de fechaduras "
-                "só conecto no serial exato ou em quem está na mesa.", "err")
-            return None
-        return await self._desempate(perto, "genéricos na mesa", alvo_up=alvo_up)
+                # prioridade: nome exato > CHAVIFI > só ffe0 (mais forte desempata)
+                peso = (3000 if up == alvo_up else (2000 if up.startswith("CHAVIFI") else 1000)) + adv.rssi
+                if peso > achado.get("peso", -1e9):
+                    achado = {"addr": dev.address, "nome": nome, "peso": peso}
+        return achado.get("addr")
 
     def scan(self, alvo, timeout=8.0):
-        # +90s: o desempate ATIVO (TST-INFO) pode conectar em 2-3 candidatos.
-        return self._call(self._scan(alvo, timeout), timeout=timeout + 90)
+        return self._call(self._scan(alvo, timeout), timeout=timeout + 20)
 
     # ---- mapa de dispositivos "cara de fechadura" no ar (p/ a ADOÇÃO) ----
     # Devolve {addr: nome} de tudo que parece módulo de FI: nome de serial
@@ -602,7 +531,7 @@ class Ble:
         LOG(f"Procurando módulo p/ provisionar (serial {alvo} ou VIRGEM, {timeout:.0f}s)...", "hi")
         devs = await BleakScanner.discover(timeout=timeout, return_adv=True)
         alvo_up = alvo.upper()
-        exatos, virgens = [], []   # (classe, rssi, addr, nome) p/ o _desempate
+        melhor = None
         garbled = []   # candidatos = alvo com nome CORROMPIDO (garble no fim)
         for addr, (dev, adv) in devs.items():
             nome = (adv.local_name or dev.name or "")
@@ -619,48 +548,23 @@ class Ble:
             if corrompido:
                 garbled.append((dev.address, nome, adv.rssi))
             if match:
-                (exatos if exato else virgens).append(
-                    (3 if exato else 1, adv.rssi, dev.address, nome))
-        # 1) serial EXATO ganha sempre; duplicado no ar → desempate ATIVO (TST-INFO).
-        if exatos:
-            return await self._desempate(
-                exatos, f"serial exato '{alvo}' duplicado no ar", alvo_up=alvo_up)
-        # 2) nome CORROMPIDO do alvo: confirma a identidade ATIVAMENTE pela EEPROM
-        #    (TST-INFO) — resolve inclusive o caso de VÁRIOS garbled, que antes
-        #    abortava sempre. Firmware novo responde o serial verdadeiro; mudo → segue.
-        if garbled:
-            LOG("  ⚠ Nome(s) parecido(s)/corrompido(s) do alvo no ar — confirmando a "
-                "identidade real de cada um (TST-INFO)...", "warn")
-            for addr, nome, rssi in sorted(garbled, key=lambda g: g[2], reverse=True):
-                ser = await self._quem_e(addr)
-                LOG(f"     · {nome}  {addr}  rssi={rssi} → SER={ser or '(mudo)'}")
-                if ser == alvo_up:
-                    LOG(f"  ⚠ '{nome}' confirmado como o ALVO pela EEPROM (nome corrompido "
-                        f"no módulo). Vou reprovisionar por BLE e corrigir para {alvo}.", "warn")
-                    return addr
-        # 3) módulo VIRGEM: só COLADO no Mac e sem empate técnico (virgem não tem
-        #    serial na EEPROM — não há como confirmar identidade; proximidade é a
-        #    única defesa, então ela precisa ser conservadora).
-        if virgens:
-            perto = [c for c in virgens if c[1] >= self.LIMIAR_MESA]
-            if perto:
-                return await self._desempate(perto, "módulos virgens na mesa")
-            LOG(f"  ✗ Módulo(s) virgem(ns) no ar, mas NENHUM colado no Mac "
-                f"(rssi >= {self.LIMIAR_MESA}) — não vou provisionar um que pode ser "
-                "de outra bancada/sala. Aproxime a fechadura-alvo e repita.", "err")
-            return None
-        # 4) fallback antigo do garbled: sem confirmação ativa (fw legado, mudo),
-        #    UM único candidato corrompido ainda é aceito por exclusão; 2+ aborta.
+                peso = (10_000 if exato else 0) + adv.rssi   # serial exato ganha; senão RSSI
+                if melhor is None or peso > melhor[0]:
+                    melhor = (peso, dev.address, nome)
+        if melhor:
+            LOG(f"  → escolhido: {melhor[2] or '(sem nome)'}  {melhor[1]}")
+            return melhor[1]
+        # sem alvo exato/virgem: se há UM único nome CORROMPIDO do alvo, é ele (o
+        # módulo garble o último byte do AT+NAME — UART instável). Reprovisionar por
+        # BLE (caminho confiável do Mac) conserta o nome. Ambíguo (2+) → aborta.
         if len(garbled) == 1:
             addr, nome, _ = garbled[0]
-            LOG(f"  ⚠ '{nome}' é o único candidato e parece o ALVO com nome CORROMPIDO "
-                f"(não confirmou por TST-INFO — firmware antigo?). Vou reprovisionar por "
-                f"BLE e corrigir o nome para {alvo}.", "warn")
+            LOG(f"  ⚠ '{nome}' é o ALVO com o nome CORROMPIDO (garble de UART no módulo). "
+                f"Vou reprovisionar por BLE e corrigir o nome para {alvo}.", "warn")
             return addr
         if len(garbled) >= 2:
-            LOG("  ✗ Achei VÁRIOS nomes parecidos/corrompidos do alvo e nenhum confirmou "
-                "a identidade — ambíguo, NÃO vou arriscar renomear o errado. Deixe só a "
-                "fechadura-alvo ligada e repita:", "err")
+            LOG("  ✗ Achei VÁRIOS nomes parecidos/corrompidos do alvo — ambíguo, NÃO vou "
+                "arriscar renomear o errado. Deixe só a fechadura-alvo ligada e repita:", "err")
             for _a, _n, _r in garbled:
                 LOG(f"     · {_n}  {_a}  rssi={_r}")
             return None
@@ -671,8 +575,7 @@ class Ble:
         return None
 
     def scan_prov(self, alvo, timeout=8.0):
-        # +120s: a confirmação ATIVA (TST-INFO) pode conectar em vários candidatos.
-        return self._call(self._scan_prov(alvo, timeout), timeout=timeout + 120)
+        return self._call(self._scan_prov(alvo, timeout), timeout=timeout + 20)
 
     # Conecta, manda a sequência AT (uma por vez, lendo a resposta) e desconecta.
     # Baud-agnóstico: em MODE2 o módulo interpreta AT vindos do rádio (BLE).
