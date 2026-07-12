@@ -80,12 +80,12 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.12.1"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.12.4"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.12.1"
-VERSION_DATE = "2026-07-09"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Firmware v2.12.1: anti-duplicação POR COMANDO (FECHAR logo após ABRIR agora sempre gira — antes era engolido e o app mostrava sucesso sem motor; provado em bancada 09/07) + janela 6s→4s (retry humano de fechadura emperrada passa; tempestade de retry do app segue bloqueada) · inclui tudo da v2.12.0 (power-down desconectado, modo DEV, advi_test)"
+VERSION_DATE = "2026-07-11"               # data desta versão (ISO; bump a cada release)
+VERSION_NOTES = "Bancada v2.12.4 (produção em lote): gravação 2 estágios refinada — fuses+EEPROM no SCK lento (EEPROM é limitada pelo silício: rápido não ganha nada e falhava em parte dos chips), FLASH no rápido (-13s) com fallback automático · retry automático 1x no 'target does not answer' do 1º contato do USBasp · módulo clone com MAC como nome (12 hex, ex. 94DEB80D5852) aceito como VIRGEM no provisionamento e na adoção (guardas: só colado na bancada, perde de SOFT AT) · scan com saída antecipada no serial exato + reuso da sessão BLE entre provisionar/conectar · firmware segue v2.12.1"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -400,12 +400,53 @@ class Ble:
         return self.client is not None and self.client.is_connected
 
     # ---- scan ----
-    async def _scan(self, alvo, timeout):
+    # ⚡ Scan FATIADO com saída antecipada: o nome EXATO é decisivo sozinho
+    # (ganha de qualquer outro candidato), então achou → retorna na hora, sem
+    # queimar a janela inteira. O FALLBACK (CHAVIFI/ffe0 por sinal) continua
+    # exigindo a janela COMPLETA — decisão idêntica à de antes.
+    async def _scan_fatiado(self, alvo_up, timeout):
+        # UMA sessão CONTÍNUA de scan com callback (nada de parar/religar o
+        # rádio em fatias — isso se mostrou instável no macOS). O callback
+        # acumula tudo que aparece e sinaliza no instante em que o nome EXATO
+        # surge; aí seguramos +2s de CONFIRMAÇÃO (se houver uma SEGUNDA
+        # fechadura com o MESMO nome — bug antigo de renome — ela aparece e o
+        # desempate por RSSI mais forte fica IGUAL ao do scan de janela cheia).
         from bleak import BleakScanner
-        LOG(f"Procurando fechadura '{alvo}' por BLE ({timeout:.0f}s)...", "hi")
-        achado = {}
-        devs = await BleakScanner.discover(timeout=timeout, return_adv=True)
+        acumulado = {}
+        achou = asyncio.Event()
+
+        def cb(dev, adv):
+            acumulado[dev.address] = (dev, adv)
+            if (adv.local_name or dev.name or "").upper() == alvo_up:
+                achou.set()
+
+        t0 = time.time()
+        async with BleakScanner(detection_callback=cb):
+            try:
+                await asyncio.wait_for(achou.wait(), timeout=timeout)
+                await asyncio.sleep(2.0)   # janela de confirmação (duplicatas)
+            except asyncio.TimeoutError:
+                pass                       # janela cheia sem o exato → fallback
+
+        exatos = sorted(
+            (adv.rssi, dev.address, adv.local_name or dev.name or "")
+            for dev, adv in acumulado.values()
+            if (adv.local_name or dev.name or "").upper() == alvo_up)
+        if exatos:
+            rssi, addr, nome = exatos[-1]   # RSSI mais forte ganha (como antes)
+            LOG(f"  ★ {nome}  {addr}  rssi={rssi} (exato, em {time.time() - t0:.0f}s"
+                + (f"; {len(exatos)} com o mesmo nome — mais forte ganha)"
+                   if len(exatos) > 1 else ")"))
+            return addr, acumulado
+        return None, acumulado
+
+    async def _scan(self, alvo, timeout):
+        LOG(f"Procurando fechadura '{alvo}' por BLE (até {timeout:.0f}s)...", "hi")
         alvo_up = alvo.upper()
+        exato_addr, devs = await self._scan_fatiado(alvo_up, timeout)
+        if exato_addr:
+            return exato_addr
+        achado = {}
         for addr, (dev, adv) in devs.items():
             nome = adv.local_name or dev.name or ""
             up = nome.upper()
@@ -444,7 +485,10 @@ class Ble:
             uuids = [u.lower() for u in (adv.service_uuids or [])]
             ffe0 = any("ffe0" in u for u in uuids)
             if re.search(r"\d+FI\d+", up) or "SOFT AT" in up or "MLT-BT05" in up \
-               or up.startswith("CHAVIFI") or ffe0:
+               or up.startswith("CHAVIFI") or ffe0 \
+               or re.fullmatch(r"[0-9A-F]{12}", up):
+                # 12 hex = clone virgem com o MAC como nome (ex.: 94DEB80D5852) —
+                # sem isto a ADOÇÃO por ciclo de bateria era cega pra ele.
                 mapa[dev.address] = nome or "(sem nome)"
         return mapa
 
@@ -527,10 +571,14 @@ class Ble:
     # várias FIs, o "sinal mais forte" pegou a vizinha e a renomeou). Se só houver
     # outras fechaduras nomeadas por perto, ABORTA (não reconfigura ninguém).
     async def _scan_prov(self, alvo, timeout):
-        from bleak import BleakScanner
-        LOG(f"Procurando módulo p/ provisionar (serial {alvo} ou VIRGEM, {timeout:.0f}s)...", "hi")
-        devs = await BleakScanner.discover(timeout=timeout, return_adv=True)
+        LOG(f"Procurando módulo p/ provisionar (serial {alvo} ou VIRGEM, até {timeout:.0f}s)...", "hi")
         alvo_up = alvo.upper()
+        # ⚡ mesmo scan fatiado: serial EXATO no ar → decide na hora (ganha de
+        # virgem/garbled sempre); os fallbacks continuam vendo a janela cheia.
+        exato_addr, devs = await self._scan_fatiado(alvo_up, timeout)
+        if exato_addr:
+            LOG(f"  → escolhido: {alvo}  {exato_addr}")
+            return exato_addr
         melhor = None
         garbled = []   # candidatos = alvo com nome CORROMPIDO (garble no fim)
         for addr, (dev, adv) in devs.items():
@@ -538,6 +586,17 @@ class Ble:
             up = nome.upper()
             exato = (up == alvo_up)
             virgem = ("SOFT AT" in up or "MLT-BT05" in up or up.startswith("CHAVIFI"))
+            # Clones que saem de fábrica com o MAC como nome (ex.: "94DEB80D5852",
+            # exatamente 12 hex — visto na CH002FI001325 em 11/07). São virgens
+            # TAMBÉM, mas com guarda-corpos p/ não capturar gadget alheio com
+            # nome parecido: (a) só vale COLADO na bancada (rssi >= -65);
+            # (b) perde de qualquer virgem clássico no desempate (peso menor);
+            # (c) a receita pelo ar só "vinga" em quem responde OK+Set — num
+            # device estranho ela falha sem renomear nada.
+            mac_virgem = (not virgem and not exato
+                          and bool(re.fullmatch(r"[0-9A-F]{12}", up))
+                          and adv.rssi >= -65)
+            virgem = virgem or mac_virgem
             corrompido = _corrompido_do_alvo(up, alvo_up)
             # OUTRA fechadura já gravada (serial \d+FI\d+ ≠ alvo e NÃO corrompido do alvo): PROIBIDO.
             outro_serial = bool(re.search(r"\d+FI\d+", up)) and not exato and not corrompido
@@ -548,7 +607,8 @@ class Ble:
             if corrompido:
                 garbled.append((dev.address, nome, adv.rssi))
             if match:
-                peso = (10_000 if exato else 0) + adv.rssi   # serial exato ganha; senão RSSI
+                # serial exato ganha; virgem clássico > virgem-MAC; senão RSSI
+                peso = (10_000 if exato else 0) + adv.rssi - (500 if mac_virgem else 0)
                 if melhor is None or peso > melhor[0]:
                     melhor = (peso, dev.address, nome)
         if melhor:
@@ -783,10 +843,50 @@ def act_gravar(serial, mcu, mosfet="8"):
         #   hfuse: 0xD7 (EESAVE liga, sem bootloader) | lock: 0xCF
         lfuse = "0xFF" if m == "m328pb" else "0xF7"
         efuse = "0xFD"
-        rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
-                        "-U", f"lfuse:w:{lfuse}:m", "-U", "hfuse:w:0xD7:m",
-                        "-U", f"efuse:w:{efuse}:m", "-U", "lock:w:0xCF:m",
-                        "-U", f"eeprom:w:{seed_bin}:r", "-U", f"flash:w:{HEX}:i"])
+        # ⚡ GRAVAÇÃO EM 2 ESTÁGIOS (corta ~60-80s sem perder nada):
+        #   Estágio 1 (-B 8, SCK lento): SÓ os fuses — obrigatório lento porque
+        #   o chip pode vir de fábrica a 1MHz (CKDIV8) e o ISP exige SCK < clk/4.
+        #   Estágio 2 (-B 1, SCK rápido): lock+eeprom+flash — o avrdude resetou
+        #   o chip entre as invocações e o lfuse do estágio 1 já ativou o
+        #   CRISTAL 16MHz → ISP aguenta SCK alto. O lock vai no estágio 2 (e não
+        #   no 1) porque o chip-erase automático do write de flash APAGARIA um
+        #   lock gravado antes — a ordem final (erase→lock→eeprom→flash) fica
+        #   idêntica à da invocação única de hoje.
+        #   Fallback: se o estágio rápido falhar (USBasp clone que ignora SCK),
+        #   repete TUDO no -B 8 de hoje — nenhuma funcionalidade a menos.
+        # Estágio 1 com RETRY de contato: USBasp recém-plugado às vezes falha o
+        # 1º toque ("target does not answer") e funciona logo em seguida —
+        # visto em produção 11/07 (2 de 7 exigiam um 2º clique). Re-tenta 1×
+        # sozinho antes de devolver erro pro operador.
+        for _contato in (1, 2):
+            rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
+                            "-U", f"lfuse:w:{lfuse}:m", "-U", "hfuse:w:0xD7:m",
+                            "-U", f"efuse:w:{efuse}:m"])
+            if rc == 0 or "does not answer" not in out.lower():
+                break
+            LOG("Gravador não respondeu no 1º contato — tentando de novo em 2s "
+                "(não mexa no cabo)...", "warn")
+            time.sleep(2)
+        if rc == 0:
+            # ESTÁGIO 2a (-B 8): EEPROM no modo LENTO de propósito — o tempo de
+            # escrita de EEPROM é do SILÍCIO (~3,4ms/byte): 10,75s no rápido ×
+            # 10,99s no lento (medido 11/07). O rápido não ganha NADA e falhava
+            # a verificação em parte dos chips (2 de 7) → lento aqui é grátis.
+            # A EEPROM sobrevive ao chip-erase do estágio 2b via EESAVE (hfuse D7).
+            rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
+                            "-U", f"eeprom:w:{seed_bin}:r"])
+        if rc == 0:
+            # ESTÁGIO 2b (-B 1): lock+flash no modo RÁPIDO (o flash é quem
+            # ganha ~13s). O lock vem NESTE estágio porque o chip-erase
+            # automático do write de flash reseta os lock bits — ele precisa
+            # ser gravado depois do erase, como na invocação única original.
+            rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "1",
+                            "-U", "lock:w:0xCF:m", "-U", f"flash:w:{HEX}:i"])
+            if rc != 0:
+                LOG("Gravação rápida não pegou neste gravador — repetindo no modo "
+                    "lento (compatível)...", "warn")
+                rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
+                                "-U", "lock:w:0xCF:m", "-U", f"flash:w:{HEX}:i"])
         if rc == 0:
             MCU_REAL[serial] = m
             LOG(f"✓ {serial} gravada (chip {m}, placa {_placa_de(m)}). 1 bipe = viva; "
@@ -828,8 +928,15 @@ def act_validar(serial, mcu):
     for i, m in enumerate(candidatos):
         if i > 0:
             LOG(f"Assinatura não bateu — relendo como {m}...", "warn")
-        rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
+        # ⚡ leitura no SCK rápido (-B 1): o gravar acabou de ativar o cristal
+        # 16MHz. QUALQUER falha do modo rápido (inclusive assinatura — pode ser
+        # o próprio SCK alto corrompendo a leitura) re-tenta no -B 8 de sempre
+        # ANTES de concluir que o chip é outro.
+        rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "1",
                         "-U", f"eeprom:r:{eep}:r"])
+        if rc != 0:
+            rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
+                            "-U", f"eeprom:r:{eep}:r"])
         if rc == 0:
             MCU_REAL[serial] = m
             break
@@ -943,7 +1050,10 @@ def act_provisionar(serial, mcu, mosfet_pin):
 
     def _pong():
         try:
-            BLE.disconnect(); time.sleep(1.0)
+            estava = BLE.conectado()
+            BLE.disconnect()
+            if estava:
+                time.sleep(1.0)   # só espera anunciar de novo se havia conexão
             addr = BLE.scan(alvo, timeout=8.0)
             if not addr:
                 return False
@@ -1000,7 +1110,8 @@ def act_provisionar(serial, mcu, mosfet_pin):
 
     # Sem PONG → acha o módulo: alvo exato, virgem ou garble (scan blindado)...
     LOG("Sem PONG — procurando o módulo (virgem, pelo serial ou nome corrompido)...", "hi")
-    BLE.disconnect(); time.sleep(1.0)
+    if BLE.conectado():
+        BLE.disconnect(); time.sleep(1.0)
     try:
         addr = BLE.scan_prov(alvo, timeout=8.0)
     except Exception as e:
@@ -1029,11 +1140,22 @@ def act_conectar(serial, mcu):
             LOG(f"Aguardando o boot/provisionamento terminar ({falta:.0f}s)...", "hi")
             time.sleep(falta)
     alvo = serial[2:] if serial.startswith("CH") else serial
+    # ⚡ FAST-PATH: o provisionar acabou de deixar a fechadura CONECTADA e com
+    # PONG — reusa a sessão em vez de derrubar + re-escanear (8s) + reconectar.
+    # Se o PING falhar (sessão zumbi), segue o caminho completo de sempre.
+    if BLE.conectado():
+        for _ in range(2):
+            ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=3)
+            if ok:
+                LOG("✓ Fechadura já conectada (sessão da preparação do rádio) — PONG ok.", "ok")
+                STATUS("conectar", "ok"); return True
+        LOG("Sessão anterior não responde — reconectando do zero...", "warn")
     # Desconecta a sessão anterior ANTES do scan: dispositivo conectado NÃO
     # anuncia — escanear ainda conectado dava "não encontrada" falso (visto na
     # 2584, cujo módulo não aceita AT+DROP e a conexão nunca caía sozinha).
-    BLE.disconnect()
-    time.sleep(1.0)
+    if BLE.conectado():
+        BLE.disconnect()
+        time.sleep(1.0)
     try:
         addr = BLE.scan(alvo, timeout=8.0)
     except Exception as e:
