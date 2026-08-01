@@ -18,6 +18,9 @@ Placa (byte 912 da EEPROM — o firmware universal decide os pinos por ele):
 Pino do MOSFET (byte 914 da EEPROM): PIO do módulo BLE que chaveia o gate de
 energia — dirige as máscaras BEFC/AFTC e o corte AT+PIOx0 da hibernação em
 runtime. 90% das FIs = 8 (default); placas antigas usaram 6 ou 7.
+    12 = MOSFET AUTOMÁTICO (placa v2.7/retrofit 2024): gate no pino FÍSICO 12
+    do módulo = PIO2 (inendereçável por AT) — o firmware provisiona AT+PWRM1 e
+    o corte/religa fica por conta do auto-sleep do módulo.
 
 Seed (determinística do serial, igual backend DeviceSeedHelper.php):
     seed_k = int(sha256(serial + SECRET + k)[:8], 16) % 429496729   (k = 1..4)
@@ -66,9 +69,11 @@ def montar_eeprom(serial_number: str, placa: str = "fi15", mosfet: int = 8) -> b
     # placa (912): 1 = FI 1.0 (motor PB2/PB3, LEDs discretos); 0 = FI 1.5
     eeprom[912] = 0x01 if placa == "fi10" else 0x00
 
-    # pino do MOSFET (914): PIO do módulo que chaveia o gate (4..9; 8 = frota)
-    if not 4 <= mosfet <= 9:
-        raise SystemExit(f"Pino do MOSFET inválido: {mosfet} (use 4..9; 90% das FIs = 8)")
+    # pino do MOSFET (914): PIO do gate (4..9; 8 = frota) ou 12 = mosfet AUTO
+    # (pino físico 12/PIO2, placa v2.7 — corte via PWRM1)
+    if not (4 <= mosfet <= 9 or mosfet == 12):
+        raise SystemExit(f"Pino do MOSFET inválido: {mosfet} "
+                         "(use 4..9, ou 12 = mosfet automático da placa v2.7; 90% das FIs = 8)")
     eeprom[914] = mosfet
 
     # 916 QUEIMADO (ex-variante sem MOSFET, removida na v2.11.1) — fica 0.
@@ -96,7 +101,7 @@ def main():
 
     print(f"Serial : {serial}")
     print(f"Placa  : {'FI 1.0' if placa == 'fi10' else 'FI 1.5'}")
-    print(f"MOSFET : PIO{mosfet}")
+    print(f"MOSFET : {'pino12 (AUTO/PWRM1)' if mosfet == 12 else f'PIO{mosfet}'}")
     for i in range(4):
         print(f"  seed{i + 1} = {get_seed(serial, i + 1)}")
     print(f"Gravado: {saida} ({len(eeprom)} bytes)")

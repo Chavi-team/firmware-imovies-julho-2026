@@ -80,12 +80,12 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.12.4"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.13.0"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.12.1"
-VERSION_DATE = "2026-07-11"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.12.4 (produção em lote): gravação 2 estágios refinada — fuses+EEPROM no SCK lento (EEPROM é limitada pelo silício: rápido não ganha nada e falhava em parte dos chips), FLASH no rápido (-13s) com fallback automático · retry automático 1x no 'target does not answer' do 1º contato do USBasp · módulo clone com MAC como nome (12 hex, ex. 94DEB80D5852) aceito como VIRGEM no provisionamento e na adoção (guardas: só colado na bancada, perde de SOFT AT) · scan com saída antecipada no serial exato + reuso da sessão BLE entre provisionar/conectar · firmware segue v2.12.1"
+FIRMWARE_VERSION = "2.13.0"
+VERSION_DATE = "2026-07-31"               # data desta versão (ISO; bump a cada release)
+VERSION_NOTES = "Bancada v2.13.0 (MOSFET automático): suporte às placas v2.7/retrofit 2024 com gate no pino FÍSICO 12 do módulo = PIO2/VCC-EEPROM (inendereçável por AT — descoberta 31/07 via esquemático+manuais) · pino MOSFET aceita 12 na UI/seed.bin · provisionamento pelo ar e firmware usam AT+PWRM1 nessas placas (módulo ocioso dorme -> PIO2 cai -> corta a placa; conexão BLE religa; ~0,65mA ocioso) · teste de hibernação novo por UPTIME (TST-INFO) — prova corte+religa sem comando de corte · firmware v2.13.0 (mosfetAuto: PWRM1, BEFC000/AFTC008, boot-de-wake por PD3 alto, MOSFET:12-AUTO e UPTIME no TST-INFO)"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -175,6 +175,11 @@ def seeds_de(serial):
 def calcular_hex_befc_aftc(mosfet_pin):
     try:
         m_pin = int(mosfet_pin)
+        # ⭐ v2.13 MOSFET-AUTO (pino físico 12 = PIO2/VCC-EEPROM do módulo): o
+        # gate NÃO cabe nas máscaras (BEFC/AFTC cobrem só PIO3..11) — config
+        # igual à placa sem mosfet; quem corta/religa é o auto-sleep (PWRM1).
+        if m_pin == 12:
+            return "000", "008"
         mosfet_bit = m_pin - 3          # PIO3 = bit0
         bits_befc = [0] * 12
         bits_aftc = [0] * 12
@@ -213,7 +218,7 @@ def gerar_seed_bin(serial, placa, caminho, mosfet="8"):
         m = int(mosfet)
     except Exception:
         m = 8
-    eeprom[914] = m if 4 <= m <= 9 else 8
+    eeprom[914] = m if (4 <= m <= 9 or m == 12) else 8   # 12 = mosfet AUTO (v2.7)
     # 916 QUEIMADO (ex-variante sem MOSFET, removida na v2.11.1): fica 0 —
     # placas sem MOSFET usam a config NORMAL (o MCU delas é sempre alimentado).
     with open(caminho, "wb") as f:
@@ -984,9 +989,19 @@ BOOT_ESPERA_S = 30   # boot + provisionamento + melodia levam ~24s; margem p/ 30
 #   Depois: baud 9600 + config de dados/wake + nome + reset.
 def receita_ar(alvo, mosfet_pin):
     befc, aftc = calcular_hex_befc_aftc(mosfet_pin)
-    return ["AT+PWRM0", "AT+BAUD2", "AT+ROLE0", "AT+TYPE0", "AT+DELI3",
+    # ⭐ v2.13 MOSFET-AUTO (pino 12): o PWRM final é 1 — auto-sleep LIGADO de
+    # propósito (módulo ocioso dorme -> PIO2 cai -> mosfet corta a placa; a
+    # conexão BLE acorda e religa). O PWRM0 INICIAL fica: acorda módulos com
+    # herança de sleep p/ o resto da receita entrar; o PWRM definitivo vai por
+    # último, imediatamente antes do RESET.
+    auto = str(mosfet_pin).strip() == "12"
+    cmds = ["AT+PWRM0", "AT+BAUD2", "AT+ROLE0", "AT+TYPE0", "AT+DELI3",
             "AT+NOTI1", "AT+ADVI2", f"AT+BEFC{befc}", f"AT+AFTC{aftc}",
-            f"AT+NAME{alvo}", "AT+RESET"]
+            f"AT+NAME{alvo}"]
+    if auto:
+        cmds.append("AT+PWRM1")
+    cmds.append("AT+RESET")
+    return cmds
 
 
 # ADOÇÃO POR CICLO DE ENERGIA — identifica FISICAMENTE a fechadura da bancada
@@ -1434,6 +1449,91 @@ def act_testar_hibernacao(serial, mcu):
     STATUS("hibernar", "fail"); return False
 
 
+# ⭐ v2.13 — MOSFET-AUTO (pino físico 12 = PIO2/VCC-EEPROM do módulo): o corte
+# NÃO é comandável (PIO2 fora do AT) — o módulo corta a placa SOZINHO ao entrar
+# em auto-sleep (PWRM1) e religa ao acordar por CONEXÃO BLE. A prova do ciclo é
+# o UPTIME do TST-INFO (firmware 2.13+): desconecta, espera o auto-sleep cortar,
+# reconecta (a conexão religa) e lê o UPTIME — pequeno = o MCU REBOOTOU = cortou
+# e religou (PASS); grande (~uptime1+espera) = nunca cortou (FAIL).
+def _uptime_via_info():
+    ok, buf = BLE.cmd("TST-INFO", ["FIM-INFO"], timeout=10)
+    m = re.search(r"UPTIME:(\d+)", buf or "")
+    return (int(m.group(1)) if m else None), buf
+
+
+def act_testar_hibernacao_auto(serial, mcu, espera=180):
+    STATUS("hibernar", "run")
+    alvo = serial[2:] if serial.startswith("CH") else serial
+    if not BLE.conectado():
+        try:
+            addr = BLE.scan(alvo, timeout=8.0)
+            if not addr:
+                LOG("✗ Fechadura não encontrada por BLE — religue a bateria e tente de novo.", "err")
+                STATUS("hibernar", "fail"); return False
+            BLE.connect(addr)
+        except Exception as e:
+            LOG(f"✗ Erro ao conectar por BLE: {e}", "err")
+            STATUS("hibernar", "fail"); return False
+    u1, _ = _uptime_via_info()
+    if u1 is None:
+        LOG("✗ TST-INFO sem UPTIME — o firmware desta fechadura é anterior à 2.13. "
+            "Regrave com o firmware novo antes de testar a hibernação automática.", "err")
+        STATUS("hibernar", "fail"); return False
+    LOG(f"🔋 MOSFET-AUTO: uptime atual = {u1}s. Vou DESCONECTAR e esperar {espera}s "
+        "pelo auto-sleep do módulo (PWRM1) — ele deve CORTAR a placa sozinho.", "hi")
+    LOG("👂 Durante a espera a fechadura deve ficar em silêncio e SEM luz; o anúncio "
+        "BLE continua (é o módulo, que fica ligado). NÃO conecte nada nela.", "hi")
+    BLE.disconnect()
+    t0 = time.time()
+    prox_log = espera - 30
+    while time.time() - t0 < espera:
+        rest = espera - (time.time() - t0)
+        if rest <= prox_log:
+            LOG(f"  … aguardando o auto-sleep ({int(rest)}s restantes)")
+            prox_log -= 30
+        time.sleep(1)
+    # Reconecta — a PRÓPRIA conexão é o religamento (módulo acorda -> PIO2 sobe).
+    addr = None
+    for _ in range(3):
+        try:
+            addr = BLE.scan(alvo, timeout=10)
+        except Exception:
+            addr = None
+        if addr:
+            break
+    if not addr:
+        LOG("✗ Fechadura NÃO reapareceu no scan — o módulo deveria seguir anunciando "
+            "mesmo dormindo. Módulo/energia suspeitos; regrave pelo cabo.", "err")
+        STATUS("hibernar", "fail"); return False
+    try:
+        BLE.connect(addr)
+    except Exception as e:
+        LOG(f"✗ Erro ao reconectar: {e}", "err")
+        STATUS("hibernar", "fail"); return False
+    ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=10)
+    if not ok:
+        # dá uma 2ª chance: o MCU pode ainda estar terminando o boot frio
+        time.sleep(3)
+        ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=10)
+    if not ok:
+        LOG("✗ Reconectou mas SEM PONG — a placa pode não ter religado. Regrave pelo cabo.", "err")
+        STATUS("hibernar", "fail"); return False
+    u2, _ = _uptime_via_info()
+    if u2 is None:
+        LOG("⚠️ PONG ok mas TST-INFO sem UPTIME na volta — inconclusivo.", "warn")
+        STATUS("hibernar", "fail"); return False
+    if u2 < min(60, espera // 2):
+        LOG(f"✅ CORTOU E RELIGOU! uptime {u1}s → {u2}s após {espera}s de espera: o MCU "
+            "REBOOTOU no meio (a placa ficou sem energia e religou na conexão). A "
+            "hibernação automática (PWRM1) está ATIVA por hardware — nada a ativar.", "ok")
+        STATUS("hibernar", "ok"); return True
+    LOG(f"⚠️ NÃO CORTOU: uptime {u1}s → {u2}s (≈ contínuo). Ou o auto-sleep demora mais "
+        f"que {espera}s (teste de novo com espera maior), ou o gate não está no pino 12 "
+        "desta placa, ou o PWRM1 não pegou (reprovisione). A fechadura funciona 100% — "
+        "só não está hibernando (consumo como hoje).", "warn")
+    STATUS("hibernar", "fail"); return False
+
+
 def act_ativar_hibernacao(serial, mcu):
     if not BLE.conectado():
         LOG("Faça o passo 1 (Gravar e preparar) antes de ativar a hibernação.", "warn"); return False
@@ -1456,12 +1556,22 @@ def act_desativar_hibernacao(serial, mcu):
     return ok
 
 
-def act_hibernar_seguro(serial, mcu):
+def act_hibernar_seguro(serial, mcu, mosfet="8"):
     """HIBERNAÇÃO (Avançado) — segura. VALIDA o ciclo (corta a energia do MCU pelo
     MOSFET e confere se RELIGA sozinha) e SÓ ATIVA a hibernação se o corte→religa
     passar; senão deixa em IDLE seguro (a fechadura funciona 100%, só não hiberna).
     NUNCA liga às cegas — ativar é irreversível-por-cabo se o hardware não religar,
-    então o teste é o portão anti-brick. Requer o passo 1 (rádio conectado) feito."""
+    então o teste é o portão anti-brick. Requer o passo 1 (rádio conectado) feito.
+    ⭐ v2.13 pino MOSFET = 12 (AUTO): valida por UPTIME (o corte é do auto-sleep
+    PWRM1; não há comando nem 'ativar' — passa no teste = já está ativa)."""
+    if str(mosfet).strip() == "12":
+        ok = act_testar_hibernacao_auto(serial, mcu)
+        if not ok:
+            LOG("⚠️ Ciclo automático NÃO comprovado — a fechadura funciona 100%, só "
+                "segue sem hibernar (consumo de hoje). Reteste com espera maior ou "
+                "confira o pino do gate.", "warn")
+            STATUS("hibernar", "ok")   # decisão segura tomada
+        return {"hibernacao": bool(ok)}
     if not act_testar_hibernacao(serial, mcu):
         LOG("⚠️ Hibernação NÃO validada nesta fechadura — mantida DESLIGADA (IDLE "
             "seguro). A fechadura está pronta e funciona 100%; apenas não hiberna.", "warn")
@@ -1695,7 +1805,7 @@ PAGE = r"""<!DOCTYPE html>
         <label style="color:var(--muted);font-size:14px">Pino MOSFET</label>
         <input id="mosfet" inputmode="numeric" maxlength="2" value="8"
           style="width:60px;text-align:center"
-          title="Pino do MOSFET do módulo BLE. 90% das FIs = 8. Só mude se a placa usar outro.">
+          title="Pino do MOSFET do módulo BLE. 90% das FIs = 8. Só mude se a placa usar outro. 12 = MOSFET AUTOMÁTICO (placa v2.7/retrofit 2024: gate no pino físico 12 = PIO2; o firmware usa PWRM1 e o módulo corta/religa sozinho).">
       </div>
     </div>
     <button class="big" id="btn-next" style="margin-top:20px" disabled>PRÓXIMO ▶</button>
@@ -2267,7 +2377,7 @@ class Handler(BaseHTTPRequestHandler):
             r = act_gravar(serial, mcu, b.get("mosfet", "8"))
             return {"ok": bool(r)}
         if step == "hibernar":
-            r = act_hibernar_seguro(serial, mcu)
+            r = act_hibernar_seguro(serial, mcu, b.get("mosfet", "8"))
             return {"ok": True, "hibernacao": bool(r and r.get("hibernacao"))}
         fn = {"gravar": act_gravar, "validar": act_validar, "conectar": act_conectar,
               "autoteste": act_autoteste, "cadastrar": act_cadastrar,

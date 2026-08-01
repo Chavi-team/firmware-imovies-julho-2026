@@ -83,19 +83,29 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.12.1"
+#define FW_VERSION   "2.13.0"
 
-// ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
-// Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
-// gate é o PIO8 do módulo BLE (PIO8 ALTO = eletrônica LIGADA):
+// ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
+// GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
+// EEPROM 914 = 4..9, 90% = PIO8):
 //   AT+PIO80  -> corta o trilho NA HORA (o MCU DESLIGA; consumo ~zero)
 //   AT+AFTC028 -> ao CONECTAR o módulo religa o PIO8 -> o MCU dá boot e atende
 //   AT+BEFC020 -> ao DESCONECTAR religa também (o MCU boota, faz manutenção e
 //                 corta de novo) — é o ciclo do FI_1_0_400 de produção.
-// Vantagem extra: acorda por CONEXÃO sem depender do pino de wake PD3.
-// Custo: com o trilho cortado o BOTÃO FÍSICO não funciona (MCU desligado).
-// ✅ PROVADO em bancada (05/07 12:42, CH003FI003066 v2.2.2): TST-HIB cortou
+// GERAÇÃO 2 — MOSFET "AUTOMÁTICO" (⭐ v2.13; placa v2.7 integrada + retrofit
+// padrão 2024; EEPROM 914 = 12): o gate liga no PINO FÍSICO 12 do módulo =
+// PIO2 = VCC da EEPROM DO PRÓPRIO MÓDULO (manual 1010, tabela de pinos) — NÃO
+// endereçável por AT (AT+PIO cobre só PIO3..11; máscaras BEFC/AFTC = 9 bits).
+// O pino SEGUE O ESTADO DO MÓDULO: acordado = alto = placa LIGADA; auto-sleep
+// (AT+PWRM1) = baixo = placa CORTADA. A conexão BLE acorda o módulo -> PIO2
+// sobe -> a placa religa e o MCU dá boot frio. Corte e religa são 100%
+// automáticos: nenhum comando existe nem é necessário — a ÚNICA alavanca é
+// PWRM1 (em vez do PWRM0 padrão) no provisionamento. Módulo alimentado direto
+// da bateria (fora da chave); todo o resto atrás dela (~0,65mA total ocioso).
+// Custo (as duas gerações): trilho cortado = BOTÃO FÍSICO morto (MCU desligado).
+// ✅ G1 PROVADA em bancada (05/07 12:42, CH003FI003066 v2.2.2): TST-HIB cortou
 // (silêncio) e a reconexão religou o MCU com PONG imediato. LIGADO.
+// 🟡 G2: validar em bancada (teste por UPTIME — ver TST-INFO/bancada v2.13).
 #define FEATURE_HIBERNA_MOSFET  1
 
 // ---- pinos ----
@@ -173,8 +183,12 @@
                                // 0 = sono leve IDLE, seguro). Ativa via HIB-ON após
                                // validar o ciclo corta->religa na bancada (TST-HIB).
                                // (gravado pelo seed.bin/gerar_seed.py conforme a placa)
-#define EE_MOSFET       914    // PIO do módulo que chaveia o MOSFET (4..9; fora da
-                               // faixa/0xFF = default 8). Gravado pelo gravar.sh.
+#define EE_MOSFET       914    // Gate do MOSFET (gravado pelo gravar.sh/bancada):
+                               //   4..9 = PIO endereçável (geração 1; default 8)
+                               //   12   = MOSFET AUTOMÁTICO no pino físico 12 =
+                               //          PIO2/VCC-EEPROM do módulo (geração 2,
+                               //          placa v2.7 — corte via AT+PWRM1)
+                               // fora da faixa/0xFF = default 8.
 #define EE_MOD_FAM      915    // família do módulo (FAM_*), persistida na identificação
 // 916: QUEIMADO — foi a "variante sem MOSFET" (v2.11.0, removida na v2.11.1:
 // provado em bancada+app que a placa sem MOSFET funciona com a config NORMAL,
@@ -218,7 +232,11 @@ unsigned long seed01 = 0, seed02 = 0;
 uint8_t calibrationOk = 0;
 uint8_t g_moduloVers = 0;      // REV do módulo (3, 5, 12...; 0 = não leu)
 uint8_t g_moduloFam = FAM_DESCONHECIDA;   // família (AT+VERS? — 1010 × 5.2)
-uint8_t g_pinMosfet = 8;       // PIO do MOSFET (EEPROM 914; default 8 = frota)
+uint8_t g_pinMosfet = 8;       // gate do MOSFET (EEPROM 914; default 8 = frota;
+                               // 12 = automático/pino12 — ver cabeçalho)
+// MOSFET-AUTO (geração 2): gate no pino físico 12 = PIO2 = VCC da EEPROM do
+// módulo. Inendereçável por AT — o corte é o auto-sleep do módulo (PWRM1).
+bool mosfetAuto() { return g_pinMosfet == 12; }
 char serialFech[12] = {0};
 volatile bool acordouBLE = false, acordouBtn = false;
 bool moduloOk = false;
@@ -514,7 +532,14 @@ void configModuloLeve() {
     // "P" do "PONG" sumia (app recebia "ONG" != "PONG" -> sem PONG p/ sempre).
     // PWRM0 mantém o módulo sempre acordado e responsivo. O MCU continua dormindo
     // (powerDown) — a economia real de bateria está nele, não no módulo.
-    at("AT+PWRM0");
+    // ⭐⭐ v2.13 EXCEÇÃO — MOSFET-AUTO (pino12/PIO2): aqui é o CONTRÁRIO de
+    // propósito. AT+PWRM1 liga o auto-sleep: módulo ocioso dorme -> PIO2 cai ->
+    // o MOSFET corta a PLACA INTEIRA (MCU incluso; ocioso ~0,65mA = só o módulo
+    // anunciando). A conexão BLE acorda o módulo -> PIO2 sobe -> a placa religa
+    // e o MCU dá boot frio (caminho rápido no setup). O risco de "1º byte
+    // perdido" do PWRM1 não se aplica: quando o módulo dorme o MCU está MORTO —
+    // nunca há MCU falando com módulo dormindo.
+    at(mosfetAuto() ? "AT+PWRM1" : "AT+PWRM0");
     at("AT+TYPE0");    // sem pareamento (TYPE1 residual = pede PIN em toda conexão)
     // NOME reafirmado a CADA boot (como o changeName do FI_1_5), ANTES do MODE2.
     // ⭐ v2.10 AUTO-CURA: escreve, LÊ DE VOLTA (AT+NAME?) e compara — se a UART
@@ -564,8 +589,12 @@ void configModuloLeve() {
         // MCU nunca desliga — comunicação robusta, mais bateria. Config do AT.py.
         // Pino do MOSFET vem da EEPROM 914 (default 8 -> BEFC020/AFTC028, os
         // valores históricos da esteira; placas com gate no 6/7 gravam o byte).
-        atMascara("AT+BEFC", mascaraPio(g_pinMosfet));                  // MOSFET=1 antes
-        atMascara("AT+AFTC", mascaraPio(g_pinMosfet) | mascaraPio(6)); // +wake depois
+        // ⭐ v2.13 MOSFET-AUTO (pino12/PIO2): o gate NÃO cabe nas máscaras (PIO2
+        // é inendereçável) -> config igual à placa sem mosfet: BEFC000/AFTC008.
+        // Quem corta/religa é o auto-sleep (PWRM1 acima), não o BEFC/AFTC.
+        uint16_t mMos = mosfetAuto() ? 0 : mascaraPio(g_pinMosfet);
+        atMascara("AT+BEFC", mMos);                   // MOSFET=1 antes (se endereçável)
+        atMascara("AT+AFTC", mMos | mascaraPio(6));   // +wake depois
     }
     at("AT+PIO60");    // repouso arma a próxima borda de wake
     // Wake por FAMÍLIA/REV (manuais oficiais): AT+STATUS só existe no 5.2 — no
@@ -575,7 +604,9 @@ void configModuloLeve() {
     // Família desconhecida + rev<4 = manda também (conservador, era a regra antiga).
     if (g_moduloFam != FAM_1010 && g_moduloVers != 0 && g_moduloVers < 4) {
         char st[14];
-        snprintf(st, sizeof(st), "AT+STATUS%X", placa10 ? 6 : g_pinMosfet);
+        // MOSFET-AUTO: STATUS no PIO6 (o wake do PD3) — não existe "STATUSC".
+        snprintf(st, sizeof(st), "AT+STATUS%X",
+                 (placa10 || mosfetAuto()) ? 6 : g_pinMosfet);
         at(st);
     }
 }
@@ -913,9 +944,16 @@ void enviaInfo() {
     enviaLinha(buf);
     snprintf(buf, sizeof(buf), "PLACA:%s", placa10 ? "1.0" : "1.5");
     enviaLinha(buf);
-    snprintf(buf, sizeof(buf), "MOSFET:%u", g_pinMosfet);     // PIO do gate (EEPROM 914)
+    // 4..9 = gate em PIO endereçável; 12-AUTO = pino físico 12/PIO2 (PWRM1)
+    if (mosfetAuto()) snprintf_P(buf, sizeof(buf), PSTR("MOSFET:12-AUTO"));
+    else              snprintf_P(buf, sizeof(buf), PSTR("MOSFET:%u"), g_pinMosfet);
     enviaLinha(buf);
     snprintf(buf, sizeof(buf), "WAKE:v%02u", g_moduloVers);   // rev do módulo (00 = não leu)
+    enviaLinha(buf);
+    // Segundos desde o boot — a PROVA DE CORTE do teste de hibernação da
+    // bancada v2.13 (mosfet-auto): uptime pequeno após reconectar = o MCU
+    // REBOOTOU = a placa foi cortada e religada; uptime grande = nunca cortou.
+    snprintf_P(buf, sizeof(buf), PSTR("UPTIME:%lu"), millis() / 1000UL);
     enviaLinha(buf);
     enviaLinha("VER:" FW_VERSION);
     enviaLinha("FIM-INFO");
@@ -985,6 +1023,10 @@ void testeBancada(const String& t) {
     //   3 bipes graves após ~3s              = MCU vivo = módulo NÃO cortou
     //   "HIB-FALHOU-DROP" na tela            = nem o DROP derrubou (segue conectado)
     if (t.startsWith("TST-HIB")) {
+        // ⭐ v2.13 MOSFET-AUTO (pino12/PIO2): não existe comando de corte — o
+        // módulo corta sozinho ao dormir (PWRM1). A bancada valida por UPTIME
+        // (TST-INFO): derruba, espera o auto-sleep e confere se o MCU REBOOTOU.
+        if (mosfetAuto()) { enviaLinha("HIB-AUTO"); return; }
         enviaLinha("OK-HIB");
         delay(400);                          // a resposta sai antes do DROP
         at("AT+DROP", 500);                  // derruba a conexão -> módulo sai do túnel
@@ -1165,7 +1207,11 @@ void dormir() {
     // AT+PIO80 e só volta por CONEXÃO (boot fresco). Requer BEFC000 (config de
     // hibernação) — com BEFC020 o módulo re-liga o PIO8 e o corte não pega.
     // Se o hardware NÃO cortar (placa sem o gate), o código segue pro IDLE abaixo.
-    if (g_hiberna && !placa10 && digitalRead(PIN_WAKE) == LOW) {
+    // ⭐ v2.13 MOSFET-AUTO (pino12/PIO2): NÃO há comando de corte — o módulo
+    // corta a placa SOZINHO quando o auto-sleep (PWRM1) o derrubar. O MCU só
+    // segue pro powerDown abaixo e morre quando o corte vier (seguro: dormindo
+    // não há escrita de EEPROM em andamento).
+    if (g_hiberna && !placa10 && !mosfetAuto() && digitalRead(PIN_WAKE) == LOW) {
         at("AT+DROP", 200);
         at("AT+PIO60", 100);      // arma a borda de wake (PIO6 baixo)
         char pio[12];             // corta pelo PIO do MOSFET (EEPROM 914, default 8)
@@ -1297,9 +1343,15 @@ void setup() {
     if (g_moduloFam > FAM_52) g_moduloFam = FAM_DESCONHECIDA;
     // Pino do MOSFET (gravado pelo gravar.sh/bancada; 90% da frota = 8).
     g_pinMosfet = EEPROM.read(EE_MOSFET);
-    if (g_pinMosfet < 4 || g_pinMosfet > 9) g_pinMosfet = 8;
+    if ((g_pinMosfet < 4 || g_pinMosfet > 9) && g_pinMosfet != 12) g_pinMosfet = 8;
     g_wakeHib = (EEPROM.read(EE_HIB) == 1);
     if (g_wakeHib) EEPROM.update(EE_HIB, 0);
+    // ⭐ v2.13 MOSFET-AUTO: MCU nascendo com a CONEXÃO já de pé (PD3 alto) =
+    // este boot é o RELIGAMENTO pelo mosfet (conexão acordou o módulo -> PIO2
+    // subiu -> placa ligou) e tem um app conectado ESPERANDO. Caminho rápido,
+    // igual ao wake da hibernação G1: sem config de módulo, sem melodia.
+    // (Bateria recém-trocada chega aqui com PD3 baixo -> boot normal.)
+    if (mosfetAuto() && digitalRead(PIN_WAKE) == HIGH) g_wakeHib = true;
     g_hiberna = (EEPROM.read(EE_HIBERNA) == 1);   // hibernação por MOSFET ligada?
     DBG(F("[boot] hiberna=")); DBGLN(g_hiberna);
 
