@@ -80,10 +80,10 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.16.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.16.1"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.16.0"
+FIRMWARE_VERSION = "2.16.1"
 VERSION_DATE = "2026-08-02"               # data desta versão (ISO; bump a cada release)
 VERSION_NOTES = "Bancada v2.13.0 (MOSFET automático): suporte às placas v2.7/retrofit 2024 com gate no pino FÍSICO 12 do módulo = PIO2/VCC-EEPROM (inendereçável por AT — descoberta 31/07 via esquemático+manuais) · pino MOSFET aceita 12 na UI/seed.bin · provisionamento pelo ar e firmware usam AT+PWRM1 nessas placas (módulo ocioso dorme -> PIO2 cai -> corta a placa; conexão BLE religa; ~0,65mA ocioso) · teste de hibernação novo por UPTIME (TST-INFO) — prova corte+religa sem comando de corte · firmware v2.13.0 (mosfetAuto: PWRM1, BEFC000/AFTC008, boot-de-wake por PD3 alto, MOSFET:12-AUTO e UPTIME no TST-INFO)"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
@@ -222,6 +222,15 @@ def gerar_seed_bin(serial, placa, caminho, mosfet="8"):
     except Exception:
         m = 8
     eeprom[914] = m if (4 <= m <= 9 or m == 12) else 8   # 12 = mosfet AUTO (v2.7)
+    # ⭐⭐ v2.16.1: HIBERNAÇÃO (913) LIGADA POR PADRÃO nas placas com mosfet.
+    # O corte que SOBREVIVE à desconexão é o do FIRMWARE (dormir): a ordem
+    # AT+DROP -> AT+PIO<x>0 faz o módulo re-aplicar o BEFC ANTES do corte, então
+    # o corte é a última palavra até a próxima conexão (AFTC religa). O corte do
+    # APP, mandado CONECTADO, é desfeito quando o app desconecta (o módulo
+    # re-aplica o BEFC020 nesse evento) — provado em campo 02/08. Isso só é
+    # possível agora porque a 2400-slow o MCU consegue falar com o módulo.
+    # Desligar numa unidade: botão/TST-HIB-OFF na bancada.
+    eeprom[913] = 0x01
     # ⭐ v2.14: a bancada PROVISIONA O MÓDULO PELO AR logo após gravar — o seed
     # dela já marca "módulo provisionado" (910=0xC9) p/ o firmware NUNCA rodar o
     # sweep pesado (os AT+RESET dele cortam a própria placa nos modelos com

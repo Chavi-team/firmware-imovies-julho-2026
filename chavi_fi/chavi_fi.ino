@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.16.0"
+#define FW_VERSION   "2.16.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -1232,12 +1232,22 @@ void dormir() {
     // segue pro powerDown abaixo e morre quando o corte vier (seguro: dormindo
     // não há escrita de EEPROM em andamento).
     if (g_hiberna && !placa10 && !mosfetAuto() && digitalRead(PIN_WAKE) == LOW) {
+        // ⭐⭐ v2.16.1 — A ORDEM É O SEGREDO (receita do goToSleep legado):
+        // este módulo RE-APLICA a máscara BEFC no evento de DESCONEXÃO. Por
+        // isso o corte tem de ser a ÚLTIMA palavra: primeiro AT+DROP (deixa o
+        // módulo fazer o re-apply dele), depois uma folga para esse evento
+        // assentar, e SÓ ENTÃO o AT+PIOx0 — que fica valendo até a próxima
+        // conexão (aí o AFTC religa). É por isso que o corte do APP (mandado
+        // CONECTADO) não colava: a desconexão que vinha depois o desfazia.
         at("AT+DROP", 200);
+        delay(400);               // o re-apply do BEFC da desconexão acontece AQUI
         at("AT+PIO60", 100);      // arma a borda de wake (PIO6 baixo)
         char pio[12];             // corta pelo PIO do MOSFET (EEPROM 914, default 8)
         snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
         at(pio, 60);              // corta o MOSFET -> MCU morre aqui se cortou
-        delay(150);       // não cortou: segue p/ o IDLE abaixo
+        delay(200);
+        at(pio, 60);              // 2ª ordem: cobre o caso do 1º comando ter
+        delay(200);               // acordado o módulo em vez de ser executado
     }
     acordouBLE = false; acordouBtn = false;
     g_sessaoConectada = false;   // sessão encerrou -> melodia toca de novo no próximo OK+CONN

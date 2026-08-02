@@ -76,6 +76,10 @@ def montar_eeprom(serial_number: str, placa: str = "fi15", mosfet: int = 8) -> b
                          "(use 4..9, ou 12 = mosfet automático da placa v2.7; 90% das FIs = 8)")
     eeprom[914] = mosfet
 
+    # hibernação (913) LIGADA por padrão: o corte que sobrevive à desconexão é
+    # o do firmware (dormir: AT+DROP -> AT+PIOx0). Ver bancada/CONTEXTO v2.16.1.
+    eeprom[913] = 0x01
+
     # 916 QUEIMADO (ex-variante sem MOSFET, removida na v2.11.1) — fica 0.
 
     return eeprom
