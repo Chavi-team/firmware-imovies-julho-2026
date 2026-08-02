@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.21.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.22.0"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.21.0"
@@ -186,6 +186,8 @@ def calcular_hex_befc_aftc(mosfet_pin):
         # seguram o PIO8 alto mesmo assim (inócuo no pino-12; salva uma GERAÇÃO 1
         # rotulada errada como 12 — o BEFC000 da v2.13.0 CORTAVA o trilho dessas
         # placas p/ sempre; caso real CH003FI002910/R0 em 02/08).
+        if m_pin == 0:            # SEM mosfet: nada a chavear; config clássica
+            return "020", "028"
         if m_pin == 12:
             return "000", "008"
         mosfet_bit = m_pin - 3          # PIO3 = bit0
@@ -225,7 +227,7 @@ def gerar_seed_bin(serial, placa, caminho, mosfet="8"):
         m = int(mosfet)
     except Exception:
         m = 8
-    eeprom[914] = m if (4 <= m <= 9 or m == 12) else 8   # 12 = mosfet AUTO (v2.7)
+    eeprom[914] = m if (4 <= m <= 9 or m in (0, 12)) else 8   # 0 = SEM mosfet
     # ⭐⭐ v2.16.1: HIBERNAÇÃO (913) LIGADA POR PADRÃO nas placas com mosfet.
     # O corte que SOBREVIVE à desconexão é o do FIRMWARE (dormir): a ordem
     # AT+DROP -> AT+PIO<x>0 faz o módulo re-aplicar o BEFC ANTES do corte, então
@@ -234,7 +236,7 @@ def gerar_seed_bin(serial, placa, caminho, mosfet="8"):
     # re-aplica o BEFC020 nesse evento) — provado em campo 02/08. Isso só é
     # possível agora porque a 2400-slow o MCU consegue falar com o módulo.
     # Desligar numa unidade: botão/TST-HIB-OFF na bancada.
-    eeprom[913] = 0x01
+    eeprom[913] = 0x01 if eeprom[914] else 0x00   # corte só com mosfet
     # ⭐ v2.14: a bancada PROVISIONA O MÓDULO PELO AR logo após gravar — o seed
     # dela já marca "módulo provisionado" (910=0xC9) p/ o firmware NUNCA rodar o
     # sweep pesado (os AT+RESET dele cortam a própria placa nos modelos com
@@ -1037,7 +1039,7 @@ def receita_ar(alvo, mosfet_pin):
     # e o auto-sleep SÓ é utilizável em BAUD0, o único baud com wake-por-dado
     # na UART (o pino 24/WAKE tem só pull-up na placa). O PWRM0 INICIAL fica:
     # acorda módulo dormindo p/ o resto da receita entrar.
-    cmds = ["AT+PWRM0", "AT+VERS?", "AT+SHIELD1", "AT+BAUD0",
+    cmds = ["AT+PWRM0", "AT+VERS?", "AT+SHIELD1", "AT+BAUD0", "AT+UART1",
             "AT+ROLE0", "AT+IMME0", "AT+ADTY0", "AT+TYPE0", "AT+DELI3",
             "AT+NOTI1", "AT+ADVI2", f"AT+BEFC{befc}", f"AT+AFTC{aftc}",
             f"AT+NAME{alvo}", "AT+PWRM1", "AT+RESET"]
@@ -2160,10 +2162,19 @@ PAGE = r"""<!DOCTYPE html>
           <option value="m328p">FI 1.0</option></select>
       </div>
       <div class="row center" style="margin-top:12px">
-        <label style="color:var(--muted);font-size:14px">Pino MOSFET</label>
-        <input id="mosfet" inputmode="numeric" maxlength="2" value="8"
-          style="width:60px;text-align:center"
-          title="Pino do MOSFET do módulo BLE. 90% das FIs = 8. Só mude se a placa usar outro. 12 = MOSFET AUTOMÁTICO (placa v2.7/retrofit 2024: gate no pino físico 12 = PIO2; o firmware usa PWRM1 e o módulo corta/religa sozinho).">
+        <label style="color:var(--muted);font-size:14px">Chave de energia</label>
+        <select id="mosfet" style="padding:6px 10px;border-radius:8px">
+          <option value="8" selected>Com MOSFET — pino 13 (PIO8) · padrão</option>
+          <option value="0">Sem MOSFET (placa não corta a energia)</option>
+          <option value="7">Com MOSFET — pino 11 (PIO7)</option>
+          <option value="9">Com MOSFET — pino 14 (PIO9)</option>
+        </select>
+      </div>
+      <div class="row center" style="margin-top:4px">
+        <span style="color:var(--muted);font-size:12px">
+          A plaquinha verde emendada no cabo da bateria = tem MOSFET. Quase todas
+          usam o pino 13; as opções 11 e 14 existem para placas FI 1.0 antigas.
+        </span>
       </div>
     </div>
     <button class="big" id="btn-next" style="margin-top:20px" disabled>PRÓXIMO ▶</button>
@@ -2188,6 +2199,8 @@ PAGE = r"""<!DOCTYPE html>
          fluxo numerado de propósito — é teste de engenharia, sob demanda.
          Usa o campo "Pino MOSFET" da tela 1: 12 = teste por UPTIME (auto,
          ~3,5 min); 4..9 = teste clássico TST-HIB (corte comandado). -->
+    <!-- Teste de hibernação OCULTO (02/08): o corte agora é automático (app +
+         BEFC000 + firmware). Para reativar em diagnóstico, tire os comentários.
     <div style="margin-top:18px;padding:12px;border:1px dashed var(--muted);border-radius:10px">
       <div style="font-weight:600;margin-bottom:6px">🔋 Hibernação (mosfet) — validação</div>
       <div style="color:var(--muted);font-size:13px;margin-bottom:10px">
@@ -2197,6 +2210,7 @@ PAGE = r"""<!DOCTYPE html>
         durante a espera. Pinos 4..9: corte comandado (TST-HIB).</div>
       <button id="btn-hibernar" onclick="runStep('hibernar', this)">🔋 Testar hibernação</button>
     </div>
+    FIM DO TESTE DE HIBERNAÇÃO OCULTO -->
 
     <!-- RECUPERAÇÃO: OCULTA a pedido do Leonardo (09/07/2026). Para reativar,
          descomente este bloco INTEIRO e a fiação JS dos botões (procurar por
