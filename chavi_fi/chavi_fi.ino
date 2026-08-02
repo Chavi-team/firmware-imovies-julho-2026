@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.19.0"
+#define FW_VERSION   "2.20.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -841,6 +841,10 @@ void capturaMcusr(void) { g_mcusr = MCUSR; MCUSR = 0; }
 // leitura ruim do ADC deixava a fechadura muda até regravar. Aqui o sono é
 // por tempo, sempre reversível, e a leitura passa por mediana (v2.18.1).
 void esperaEnergiaReal() {
+    // pino de dados dos LEDs em nível BAIXO: sem dado válido os WS2812 mantêm
+    // o último valor (preto, apagado pelo dormir) em vez de acender lixo.
+    pinMode(PIN_LEDS, OUTPUT);
+    digitalWrite(PIN_LEDS, LOW);
     for (uint16_t i = 0; i < 300; i++) {          // teto ~5 min, nunca infinito
         uint16_t v = lerVccMv();
         if (!v || v >= VCC_MIN_BOOT_MV) return;   // energia real (ou inconclusivo)
@@ -1341,6 +1345,22 @@ void atenderBotao() {
 // Motor fica OUTPUT LOW (nunca Hi-Z — evita shoot-through na ponte H).
 void dormir() {
     motorPara();
+    // ⭐⭐ v2.20 — APAGA OS LEDs ANTES DE PERDER A ENERGIA. Os WS2812 GUARDAM o
+    // último valor recebido; se a placa é cortada com eles em estado indefinido
+    // (ou se acordam com lixo na alimentação parasita), ficam ACESOS puxando
+    // corrente justamente no repouso — foi visto em campo: placa cortada, botão
+    // morto e 2 LEDs acesos. Mandando "preto" agora, o valor travado é apagado,
+    // e o pino de dados fica em nível baixo (nenhum dado novo é interpretado).
+    if (!placa10) {
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
+        FastLED.show();
+        pinMode(PIN_LEDS, OUTPUT);
+        digitalWrite(PIN_LEDS, LOW);
+    } else {
+        digitalWrite(PIN_LED10_1, LOW);
+        digitalWrite(PIN_LED10_2, LOW);
+        digitalWrite(PIN_LED10_3, LOW);
+    }
     // HIBERNAÇÃO (toggle EE_HIBERNA): corta o trilho pelo MOSFET (receita do
     // FI_1_5_400). Chega aqui só quando OCIOSO+DESCONECTADO (atenderApp segura a
     // janela enquanto PD3 alto), então o at() não vaza pro app. O MCU DESLIGA no
