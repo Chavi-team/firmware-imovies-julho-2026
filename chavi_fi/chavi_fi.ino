@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.13.3"
+#define FW_VERSION   "2.14.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -1426,6 +1426,12 @@ void setup() {
     //   módulo OK  -> 2 piscadas VERDES (silencioso; "pronta")
     //   módulo MUDO -> 4 bipes GRAVES + vermelho (erro real de BLE) + diag de baud
     if (moduloOk) {
+        piscar(CRGB::Green, 2);
+    } else if (EEPROM.read(EE_MOD_CFG) == MOD_CFG_MAGIC) {
+        // ⭐ v2.14: módulo mudo p/ CONSULTA mas JÁ PROVISIONADO (a bancada marca
+        // a flag no seed.bin e configura o módulo PELO AR — caso dos R0 surdos
+        // p/ AT do MCU, que funcionam 100% mesmo assim). Não é erro: sem 4
+        // graves nem diagnóstico de baud a cada troca de bateria. 2 verdes.
         piscar(CRGB::Green, 2);
     } else {
         sinalModuloMudo();
