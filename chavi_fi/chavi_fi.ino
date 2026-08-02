@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.18.0"
+#define FW_VERSION   "2.19.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -408,6 +408,7 @@ void motorGiraMs(bool sentidoA, uint16_t ms) {
 // Agora o giro VIGIA o próprio VCC (bandgap, ~1ms) e PARA por conta própria se
 // o trilho afundar — a fechadura conclui o comando, responde e toca a melodia
 // em vez de morrer. Numa porta real o batente chega antes e isto nunca dispara.
+#define VCC_MIN_BOOT_MV  4200      // abaixo disto o boot é PARASITA (real = ~5V)
 #define VCC_MOTOR_MIN_MV 4300      // trilho saudável = 5V (StepUp); abaixo disto
                                    // o próximo passo é o brown-out
 void motorGira(bool sentidoA) {
@@ -824,6 +825,30 @@ void bleProvisionar() {
 uint8_t g_mcusr __attribute__((section(".noinit")));
 void capturaMcusr(void) __attribute__((naked, used, section(".init3")));
 void capturaMcusr(void) { g_mcusr = MCUSR; MCUSR = 0; }
+
+// ⭐⭐ v2.19 — ESPERA PELA ENERGIA REAL (fim do loop parasita, medido: 203 de
+// 204 boots por BROWN-OUT depois de um corte). Com a placa cortada, o TX do
+// módulo vaza pelo diodo do pino RX e alimenta o MCU o suficiente para ele
+// COMEÇAR a bootar; o consumo do boot derruba essa fonte fraquíssima, o BOD
+// dispara e tudo recomeça ~3x por segundo — bipes, bateria drenando à toa e o
+// comando seguinte pegando a placa num estado ruim (F07).
+// Aqui, ANTES de qualquer coisa que gaste energia (beep, LED, rádio), o MCU
+// confere o próprio VCC: alimentação real = ~5V (StepUp); parasita ~3V. Se
+// estiver parasita, ele DORME em ciclos de 1s (watchdog em modo interrupção,
+// consumo desprezível) e só continua o boot quando a energia de verdade
+// chegar — o que acontece quando o app conecta e o módulo religa o gate.
+// ⚠️ Diferente da v2.16.2 (removida): lá o MCU dormia PARA SEMPRE e uma
+// leitura ruim do ADC deixava a fechadura muda até regravar. Aqui o sono é
+// por tempo, sempre reversível, e a leitura passa por mediana (v2.18.1).
+void esperaEnergiaReal() {
+    for (uint16_t i = 0; i < 300; i++) {          // teto ~5 min, nunca infinito
+        uint16_t v = lerVccMv();
+        if (!v || v >= VCC_MIN_BOOT_MV) return;   // energia real (ou inconclusivo)
+        // sono de 1s com ADC e BOD desligados (a lib cuida do watchdog; definir
+        // um ISR(WDT_vect) próprio colide com o vetor dela)
+        LowPower.powerDown(SLEEP_1S, ADC_OFF, BOD_OFF);
+    }
+}
 
 void isrBtn() { acordouBtn = true; }
 void isrBLE() { acordouBLE = true; }
@@ -1400,16 +1425,29 @@ void dormir() {
 // dentro do chip (referência interna de 1,1V lida contra o VCC) e, se estiver
 // baixo, o boot é FALSO: não bipa, não fala com o módulo, e dorme fundo — o
 // módulo então adormece (PWRM1), solta o TX e o corte vira silêncio.
+// ⚠️ v2.18.1: a PRIMEIRA conversão após trocar referência/canal é lixo — usá-la
+// direto fazia a função devolver valores absurdos (e, no detector de boot da
+// v2.16.2, ISSO MATAVA A PLACA: o MCU se mandava dormir para sempre a cada boot
+// e a fechadura ficava muda até ser regravada — caso real 02/08 na 2910).
+// Agora: descarta 2 conversões e devolve a MEDIANA de 3.
 uint16_t lerVccMv() {
-    ADMUX  = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);  // AVcc ref, canal = bandgap 1V1
-    delay(3);                       // o bandgap precisa assentar
-    ADCSRA |= _BV(ADSC);
-    while (ADCSRA & _BV(ADSC));
-    uint16_t adc = ADC;
-    if (adc == 0) return 0;
-    return (uint16_t)(1125300UL / adc);          // 1,1V * 1023 * 1000 / adc
+    ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);   // AVcc ref, bandgap 1V1
+    delay(5);                                     // o bandgap precisa assentar
+    for (uint8_t d = 0; d < 2; d++) {             // descarta as 2 primeiras
+        ADCSRA |= _BV(ADSC); while (ADCSRA & _BV(ADSC)); (void)ADC;
+    }
+    uint16_t a[3];
+    for (uint8_t i = 0; i < 3; i++) {
+        ADCSRA |= _BV(ADSC); while (ADCSRA & _BV(ADSC));
+        a[i] = ADC;
+        delayMicroseconds(200);
+    }
+    // mediana (imune a uma leitura fora da curva)
+    uint16_t med = (a[0] > a[1]) ? ((a[1] > a[2]) ? a[1] : (a[0] > a[2]) ? a[2] : a[0])
+                                 : ((a[0] > a[2]) ? a[0] : (a[1] > a[2]) ? a[2] : a[1]);
+    if (med < 50 || med > 1023) return 0;         // fora de faixa = inconclusivo
+    return (uint16_t)(1125300UL / med);           // 1,1V * 1023 * 1000 / adc
 }
-#define VCC_MIN_BOOT_MV 4200        // abaixo disto o boot é parasita (real = ~5V)
 
 void setup() {
     // PLACA primeiro de tudo: os pinos do motor dependem dela (no FI 1.0 o
@@ -1441,23 +1479,14 @@ void setup() {
         *(volatile uint8_t *)0x65 |= 0x3D;   // PRR1: TIM3|SPI1|TIM4|PTC|TWI1
     }
 
-    // ⭐ v2.16.2: BOOT PARASITA? (placa cortada sendo alimentada pelo TX do
-    // módulo). Silêncio absoluto, nenhum AT, e power-down imediato — sem isso
-    // o ciclo bipe->AT->acorda módulo->TX alto->bipe nunca terminava.
-    // Guarda: só vale nas placas com mosfet (as sem gate nunca ficam cortadas)
-    // e o teste é repetido (uma leitura isolada pode pegar o StepUp subindo).
-    if (EEPROM.read(EE_HIBERNA) == 1) {          // (g_hiberna só é lido adiante)
-        uint16_t vcc = lerVccMv();
-        if (vcc && vcc < VCC_MIN_BOOT_MV) {
-            delay(50);
-            uint16_t vcc2 = lerVccMv();
-            if (vcc2 && vcc2 < VCC_MIN_BOOT_MV) {
-                ADCSRA &= ~_BV(ADEN);              // ADC off
-                set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-                sleep_enable(); sleep_bod_disable(); sleep_cpu();   // não volta
-            }
-        }
-    }
+    // (v2.16.2 tinha aqui um "detector de boot parasita" que mandava o MCU
+    // dormir para sempre se o VCC parecesse baixo. REMOVIDO na v2.18.1: uma
+    // leitura ruim do ADC bastava para a fechadura ficar MUDA até regravar
+    // — risco inaceitável para um ganho que o BOOT SILENCIOSO (v2.16.3) já
+    // entrega, quebrando a realimentação do loop sem tocar em energia.)
+
+    // ⭐ v2.19: só segue o boot quando a energia for REAL (ver esperaEnergiaReal)
+    if (EEPROM.read(EE_HIBERNA) == 1) esperaEnergiaReal();
 
     // ⭐ v2.18 TELEMETRIA: conta boots e, separadamente, os que vieram de
     // BROWN-OUT (BORF no MCUSR) — a métrica que separa "religou pelo mosfet"

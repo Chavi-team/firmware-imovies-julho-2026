@@ -61,7 +61,11 @@ class Sessao:
         return len(re.findall(r"[12]0\d{2}", self.buf))
 
     def campo(self, nome, padrao=None):
-        m = re.search(rf"{nome}:(-?\w+)", self.buf)
+        # ⚠️ o módulo entrega o TST-INFO com as linhas COLADAS (sem \n): um
+        # \w+ ganancioso engolia o nome do campo seguinte ("4979VCCMIN").
+        # RST é 1 letra; os demais são numéricos.
+        pad = r"([PBEW])" if nome == "RST" else r"(\d+)"
+        m = re.search(rf"{nome}:{pad}", self.buf)
         return m.group(1) if m else padrao
 
 
@@ -114,7 +118,7 @@ async def ciclo(addr, alvo, verbo, rajada, log):
                     r["conf2_s"] = round(time.monotonic() - t1, 2)
                     break
                 await asyncio.sleep(0.05)
-            m = re.search(r"[12]0(\d)\.(\d\d)", s.buf)
+            m = re.search(r"(\d)\.(\d\d)", s.buf)   # "2003.82" -> 3.82
             if m:
                 r["bat"] = float(f"{m.group(1)}.{m.group(2)}")
             if r["conf1_s"] is None:
