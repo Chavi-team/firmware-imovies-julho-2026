@@ -80,6 +80,14 @@ def montar_eeprom(serial_number: str, placa: str = "fi15", mosfet: int = 8) -> b
     # o do firmware (dormir: AT+DROP -> AT+PIOx0). Ver bancada/CONTEXTO v2.16.1.
     eeprom[913] = 0x01
 
+    # ⭐⭐ v2.17.3 — módulo "já provisionado" (910), IGUAL AO SEED DA BANCADA.
+    # Sem esta marca o firmware tenta se autoprovisionar a cada boot, e nas
+    # placas com MOSFET o AT+RESET desse processo derruba o gate e CORTA a
+    # própria energia no meio -> a fechadura some do ar (caso real 02/08: a
+    # 2910 ficou sem PONG após uma gravação por este script).
+    # A config do módulo vem SEMPRE pelo ar (bancada / receita) desde a v2.14.
+    eeprom[910] = 0xC9
+
     # 916 QUEIMADO (ex-variante sem MOSFET, removida na v2.11.1) — fica 0.
 
     return eeprom
