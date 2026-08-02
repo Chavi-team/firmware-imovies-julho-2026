@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.16.1"
+#define FW_VERSION   "2.16.2"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -1293,6 +1293,27 @@ void dormir() {
     }
 }
 
+// ⭐⭐ v2.16.2 — DETECTOR DE BOOT PARASITA (fim do bipe em loop com a placa
+// cortada). Com a placa hibernando (gate cortado), o TX da UART do módulo
+// (3,3V) vaza pelo diodo de proteção do pino RX e ALIMENTA fracamente o MCU.
+// Ele tenta bootar, BIPA e — pior — manda os AT da config no boot, que ACORDAM
+// o módulo e mantêm o TX alto: o ciclo se auto-alimenta e nunca para.
+// Como distinguir: alimentado de VERDADE o MCU roda com VCC = 5V (StepUp MT3608);
+// na alimentação parasita ele mal passa do brown-out (~3V). Medimos o VCC de
+// dentro do chip (referência interna de 1,1V lida contra o VCC) e, se estiver
+// baixo, o boot é FALSO: não bipa, não fala com o módulo, e dorme fundo — o
+// módulo então adormece (PWRM1), solta o TX e o corte vira silêncio.
+uint16_t lerVccMv() {
+    ADMUX  = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);  // AVcc ref, canal = bandgap 1V1
+    delay(3);                       // o bandgap precisa assentar
+    ADCSRA |= _BV(ADSC);
+    while (ADCSRA & _BV(ADSC));
+    uint16_t adc = ADC;
+    if (adc == 0) return 0;
+    return (uint16_t)(1125300UL / adc);          // 1,1V * 1023 * 1000 / adc
+}
+#define VCC_MIN_BOOT_MV 4200        // abaixo disto o boot é parasita (real = ~5V)
+
 void setup() {
     // PLACA primeiro de tudo: os pinos do motor dependem dela (no FI 1.0 o
     // PB3 é motor, não LED — configurar errado chacoalharia o motor).
@@ -1321,6 +1342,24 @@ void setup() {
                                              // trilha na placa; flutuando drenam
         *(volatile uint8_t *)0x64 |= 0x10;   // PRR0.PRUSART1 (UART1 ociosa)
         *(volatile uint8_t *)0x65 |= 0x3D;   // PRR1: TIM3|SPI1|TIM4|PTC|TWI1
+    }
+
+    // ⭐ v2.16.2: BOOT PARASITA? (placa cortada sendo alimentada pelo TX do
+    // módulo). Silêncio absoluto, nenhum AT, e power-down imediato — sem isso
+    // o ciclo bipe->AT->acorda módulo->TX alto->bipe nunca terminava.
+    // Guarda: só vale nas placas com mosfet (as sem gate nunca ficam cortadas)
+    // e o teste é repetido (uma leitura isolada pode pegar o StepUp subindo).
+    if (EEPROM.read(EE_HIBERNA) == 1) {          // (g_hiberna só é lido adiante)
+        uint16_t vcc = lerVccMv();
+        if (vcc && vcc < VCC_MIN_BOOT_MV) {
+            delay(50);
+            uint16_t vcc2 = lerVccMv();
+            if (vcc2 && vcc2 < VCC_MIN_BOOT_MV) {
+                ADCSRA &= ~_BV(ADEN);              // ADC off
+                set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+                sleep_enable(); sleep_bod_disable(); sleep_cpu();   // não volta
+            }
+        }
     }
 
     // ESTOU VIVO — a PRIMEIRA coisa, antes de tudo. Beep curto e AGUDO ao energizar.
