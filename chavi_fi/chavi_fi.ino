@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.17.2"
+#define FW_VERSION   "2.18.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -201,6 +201,14 @@
 // 916: QUEIMADO — foi a "variante sem MOSFET" (v2.11.0, removida na v2.11.1:
 // provado em bancada+app que a placa sem MOSFET funciona com a config NORMAL,
 // pois o MCU dela é sempre alimentado). Não reusar o byte sem apagar a frota.
+// ⭐⭐ v2.18 — TELEMETRIA DE SOAK (medir em vez de interpretar). Zerada por
+// TST-ZERA no início de cada bateria de testes.
+#define EE_BOOTS        918    // u16: quantas vezes o MCU bootou
+#define EE_BODS         920    // u16: bootou por BROWN-OUT (queda de tensão!)
+#define EE_CUTS         922    // u16: vezes que o firmware EXECUTOU o corte
+                               // (CUTS ~ BOOTS = o corte está funcionando;
+                               //  CUTS subindo e BOOTS parado = o módulo
+                               //  ignorou o comando de corte)
 #define EE_PROV_TENT    917    // ⭐ v2.13.3: tentativas de provisionamento pesado
                                // (anti-loop-de-suicídio: nas placas com mosfet, o
                                // AT+RESET do provisionamento reinicia o módulo,
@@ -256,6 +264,7 @@ volatile bool acordouBLE = false, acordouBtn = false;
 bool moduloOk = false;
 bool g_wakeHib = false;        // este boot foi um "acordar da hibernação"
 bool g_hiberna = false;        // HIBERNAÇÃO por corte de MOSFET ligada (EE_HIBERNA)
+uint16_t g_vccMinGiro = 0;       // menor VCC visto no último giro (mV)
 bool g_motorAbortouVcc = false;  // giro parou por queda de trilho (v2.17)
 uint16_t lerVccMv();             // (definida antes do setup)
 bool g_sessaoConectada = false; // já tocou a melodia de "conectou" nesta sessão BLE
@@ -403,6 +412,7 @@ void motorGiraMs(bool sentidoA, uint16_t ms) {
                                    // o próximo passo é o brown-out
 void motorGira(bool sentidoA) {
     g_motorAbortouVcc = false;
+    g_vccMinGiro = 0;
     if (!inaOk) {
         motorGiraMs(sentidoA, MOTOR_MS);       // 1. giro (fallback por tempo)
     } else {
@@ -417,6 +427,7 @@ void motorGira(bool sentidoA) {
             // trilho afundando? para AGORA (antes do brown-out levar o MCU)
             if (millis() - t0 > MOTOR_ARRANQUE_MS) {
                 uint16_t v = lerVccMv();
+                if (v && (g_vccMinGiro == 0 || v < g_vccMinGiro)) g_vccMinGiro = v;
                 if (v && v < VCC_MOTOR_MIN_MV) { g_motorAbortouVcc = true; break; }
             }
         }
@@ -807,6 +818,13 @@ void bleProvisionar() {
     configModuloLeve();
 }
 
+// MCUSR guarda o MOTIVO do último reset (power-on / brown-out / externo /
+// watchdog). Precisa ser lido ANTES do init do core; a seção .init3 roda antes
+// do main(). É o que distingue "religou pelo mosfet" de "morreu de brown-out".
+uint8_t g_mcusr __attribute__((section(".noinit")));
+void capturaMcusr(void) __attribute__((naked, used, section(".init3")));
+void capturaMcusr(void) { g_mcusr = MCUSR; MCUSR = 0; }
+
 void isrBtn() { acordouBtn = true; }
 void isrBLE() { acordouBLE = true; }
 
@@ -1025,6 +1043,26 @@ void enviaInfo() {
     // REBOOTOU = a placa foi cortada e religada; uptime grande = nunca cortou.
     snprintf_P(buf, sizeof(buf), PSTR("UPTIME:%lu"), millis() / 1000UL);
     enviaLinha(buf);
+    // ⭐ v2.18 — telemetria de soak (tudo que o teste automatizado precisa):
+    //  RST    motivo do último reset: P=power-on(religou pelo mosfet)
+    //         B=BROWN-OUT(caiu a tensão!) E=externo W=watchdog
+    //  BOOTS  quantos boots desde o TST-ZERA · BODS quantos foram brown-out
+    //  CUTS   quantas vezes o firmware EXECUTOU o corte de energia
+    //         (CUTS≈BOOTS = corte funciona; CUTS subindo com BOOTS parado =
+    //          o módulo ignorou o comando)
+    //  VCC    tensão do trilho agora · VCCMIN a MENOR vista no último giro
+    { uint16_t bo, bd, ct;
+      EEPROM.get(EE_BOOTS, bo); EEPROM.get(EE_BODS, bd); EEPROM.get(EE_CUTS, ct);
+      if (bo == 0xFFFF) bo = 0; if (bd == 0xFFFF) bd = 0; if (ct == 0xFFFF) ct = 0;
+      snprintf_P(buf, sizeof(buf), PSTR("RST:%c"),
+                 (g_mcusr & _BV(BORF)) ? 'B' : (g_mcusr & _BV(WDRF)) ? 'W'
+                 : (g_mcusr & _BV(EXTRF)) ? 'E' : 'P');
+      enviaLinha(buf);
+      snprintf_P(buf, sizeof(buf), PSTR("BOOTS:%u"), bo);   enviaLinha(buf);
+      snprintf_P(buf, sizeof(buf), PSTR("BODS:%u"), bd);    enviaLinha(buf);
+      snprintf_P(buf, sizeof(buf), PSTR("CUTS:%u"), ct);    enviaLinha(buf); }
+    snprintf_P(buf, sizeof(buf), PSTR("VCC:%u"), lerVccMv());       enviaLinha(buf);
+    snprintf_P(buf, sizeof(buf), PSTR("VCCMIN:%u"), g_vccMinGiro);  enviaLinha(buf);
     enviaLinha("VER:" FW_VERSION);
     enviaLinha("FIM-INFO");
 }
@@ -1114,6 +1152,13 @@ void testeBancada(const String& t) {
         delay(3000);                         // se cortou, nunca passa daqui
         EEPROM.update(EE_HIB, 0);
         beep(160, 400); beep(160, 400); beep(160, 400);   // 3 graves = NÃO cortou
+        return;
+    }
+    // ⭐ v2.18: zera a telemetria (início de uma bateria de testes)
+    if (t.startsWith("TST-ZERA")) {
+        uint16_t z = 0;
+        EEPROM.put(EE_BOOTS, z); EEPROM.put(EE_BODS, z); EEPROM.put(EE_CUTS, z);
+        enviaLinha("OK-ZERA");
         return;
     }
     if (t.startsWith("TST-ALL"))  {
@@ -1289,6 +1334,8 @@ void dormir() {
         // assentar, e SÓ ENTÃO o AT+PIOx0 — que fica valendo até a próxima
         // conexão (aí o AFTC religa). É por isso que o corte do APP (mandado
         // CONECTADO) não colava: a desconexão que vinha depois o desfazia.
+        { uint16_t c; EEPROM.get(EE_CUTS, c); if (c == 0xFFFF) c = 0;
+          c++; EEPROM.put(EE_CUTS, c); }        // telemetria: tentei cortar
         at("AT+DROP", 200);
         delay(400);               // o re-apply do BEFC da desconexão acontece AQUI
         at("AT+PIO60", 100);      // arma a borda de wake (PIO6 baixo)
@@ -1411,6 +1458,16 @@ void setup() {
             }
         }
     }
+
+    // ⭐ v2.18 TELEMETRIA: conta boots e, separadamente, os que vieram de
+    // BROWN-OUT (BORF no MCUSR) — a métrica que separa "religou pelo mosfet"
+    // (power-on/PORF) de "morreu de queda de tensão".
+    { uint16_t n; EEPROM.get(EE_BOOTS, n); if (n == 0xFFFF) n = 0;
+      n++; EEPROM.put(EE_BOOTS, n);
+      if (g_mcusr & _BV(BORF)) {
+          EEPROM.get(EE_BODS, n); if (n == 0xFFFF) n = 0;
+          n++; EEPROM.put(EE_BODS, n);
+      } }
 
     // ESTOU VIVO — a PRIMEIRA coisa, antes de tudo. Beep curto e AGUDO ao energizar.
     // Se não tocar = hardware/energia.
