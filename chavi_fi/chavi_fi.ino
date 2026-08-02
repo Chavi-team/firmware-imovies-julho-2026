@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.14.0"
+#define FW_VERSION   "2.14.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -1357,12 +1357,14 @@ void setup() {
     if ((g_pinMosfet < 4 || g_pinMosfet > 9) && g_pinMosfet != 12) g_pinMosfet = 8;
     g_wakeHib = (EEPROM.read(EE_HIB) == 1);
     if (g_wakeHib) EEPROM.update(EE_HIB, 0);
-    // ⭐ v2.13 MOSFET-AUTO: MCU nascendo com a CONEXÃO já de pé (PD3 alto) =
-    // este boot é o RELIGAMENTO pelo mosfet (conexão acordou o módulo -> PIO2
-    // subiu -> placa ligou) e tem um app conectado ESPERANDO. Caminho rápido,
-    // igual ao wake da hibernação G1: sem config de módulo, sem melodia.
-    // (Bateria recém-trocada chega aqui com PD3 baixo -> boot normal.)
-    if (mosfetAuto() && digitalRead(PIN_WAKE) == HIGH) g_wakeHib = true;
+    // ⭐ v2.14.1 (generalizado; era só mosfet-auto): MCU nascendo com a CONEXÃO
+    // já de pé (PD3 alto) = religamento por conexão — mosfet G1 religado pelo
+    // AFTC (corte pós-uso do app!), pino-12 pelo PIO2, ou bateria trocada com
+    // app conectado. Tem um cliente ESPERANDO: caminho rápido, sem config de
+    // módulo (seria adiada de qualquer forma) e sem melodia. CRÍTICO p/ o
+    // corte pós-uso: a sonda TST-PING do app chega ~1-2s após o connect e o
+    // boot normal (identificação 5x) levava 2-4s = falso "firmware legado".
+    if (digitalRead(PIN_WAKE) == HIGH) g_wakeHib = true;
     g_hiberna = (EEPROM.read(EE_HIBERNA) == 1);   // hibernação por MOSFET ligada?
     DBG(F("[boot] hiberna=")); DBGLN(g_hiberna);
 
