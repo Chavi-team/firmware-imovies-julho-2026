@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.14.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.14.1"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.14.0"
@@ -1140,8 +1140,26 @@ def act_provisionar(serial, mcu, mosfet_pin):
         return bool(ok)
 
     LOG("Verificando o rádio BLE (o firmware se auto-provisiona no boot)...", "hi")
+    recem_gravada = bool(_GRAVA_TS) and (time.time() - _GRAVA_TS) < 300
     if _pong():
-        LOG("✓ Rádio provisionado e respondendo (PONG). Reforço por BLE dispensado.", "ok")
+        if not recem_gravada:
+            LOG("✓ Rádio provisionado e respondendo (PONG). Reforço por BLE dispensado.", "ok")
+            STATUS("provisionar", "ok"); return True
+        # ⭐ v2.14.1: placa RECÉM-GRAVADA responde PONG, mas a receita roda MESMO
+        # ASSIM — a bancada é a dona da config do módulo (MODE2/IMME0/ADTY0/
+        # VERS?/máscaras). Pular no PONG deixava drift antigo na NVM: na 2910 a
+        # receita nova nunca chegou a rodar porque o PONG a dispensava.
+        LOG("PONG ok — placa recém-gravada: aplicando a receita COMPLETA pelo ar "
+            "mesmo assim (a bancada é a dona da config do módulo).", "hi")
+        try:
+            BLE.disconnect(); time.sleep(1.2)
+            addr = BLE.scan(alvo, timeout=8.0)
+        except Exception:
+            addr = None
+        if addr and _reforcar(addr):
+            STATUS("provisionar", "ok"); return True
+        LOG("⚠️ Não consegui aplicar a receita agora — a fechadura responde (PONG); "
+            "sigo em frente. Rode o passo de novo p/ forçar a receita.", "warn")
         STATUS("provisionar", "ok"); return True
 
     # Sem PONG → acha o módulo: alvo exato, virgem ou garble (scan blindado)...
@@ -1424,6 +1442,30 @@ def act_consertar_modulo(serial):
 #            que o app sai (arquitetura 100% hardware, nem o app comanda).
 #            Restaura BEFC020 no fim (estado seguro conhecido).
 # Se a FASE 1 passar, o corte em produção é comandável PELO APP (mesmo canal).
+def _pong_paciente(alvo, tentativas=5):
+    """PONG com paciência de BOOT FRIO: a placa recém-religada fica ~5-8s surda
+    (bipe + config-leve + identificação antes do atenderApp) — um PING único se
+    perde nesse meio (falso "não religou", caso real da 2910 em 02/08).
+    Reconecta se a sessão cair entre as tentativas."""
+    for _ in range(tentativas):
+        if not BLE.conectado():
+            try:
+                addr = BLE.scan(alvo, timeout=8)
+                if addr:
+                    BLE.connect(addr)
+            except Exception:
+                pass
+        if BLE.conectado():
+            try:
+                ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=4)
+                if ok:
+                    return True
+            except Exception:
+                pass
+        time.sleep(3)
+    return False
+
+
 def _testar_corte_remoto(alvo, mosfet, u1):
     try:
         pio = int(str(mosfet).strip())
@@ -1466,12 +1508,12 @@ def _testar_corte_remoto(alvo, mosfet, u1):
     except Exception as e:
         LOG(f"✗ Erro ao reconectar: {e}", "err")
         STATUS("hibernar", "fail"); return False
-    ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=8)
-    if not ok:
-        time.sleep(3)
-        ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=8)
-    if not ok:
-        LOG("✗ Reconectou mas o MCU não voltou (AFTC não religou?). Regrave pelo cabo.", "err")
+    # v2.14.1: PONG com paciência de boot frio (o falso "AFTC não religou" da
+    # 1ª rodada foi um PING único disparado ~2s após o GATT, no meio do boot).
+    if not _pong_paciente(alvo):
+        LOG("✗ Reconectou mas o MCU não voltou mesmo com paciência (~20s). "
+            "Se o botão físico estiver mudo, o AFTC não religou — ciclo de "
+            "bateria religa (BEFC020 no power-on). Regrave/reteste.", "err")
         STATUS("hibernar", "fail"); return False
     u2, _ = _uptime_via_info()
     if u2 is None or (u2 + 5) >= u1:
@@ -1500,8 +1542,7 @@ def _testar_corte_remoto(alvo, mosfet, u1):
         if addr:
             try:
                 BLE.connect(addr)
-                ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=8)
-                if ok:
+                if _pong_paciente(alvo, tentativas=4):
                     u3, _ = _uptime_via_info()
                     if u3 is not None and u_antes is not None and (u3 + 5) < u_antes:
                         befc_corta = True
