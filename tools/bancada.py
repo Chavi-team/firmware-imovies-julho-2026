@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.15.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.15.1"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.15.0"
@@ -1015,7 +1015,10 @@ def receita_ar(alvo, mosfet_pin):
     # NÃO mandar pelo ar: AT+PIO60 (derrubaria o PD3 no meio da sessão) e
     # AT+RENEW (proibido — apaga BEFC/AFTC = mata placa com mosfet).
     auto = str(mosfet_pin).strip() == "12"
-    cmds = ["AT+PWRM0", "AT+VERS?", "AT+SHIELD1", "AT+BAUD2", "AT+MODE2",
+    # (sem AT+MODE2: o 5.2 rev05 responde ERRO+CMD_N_PERMITIDO pelo ar —
+    # mudança de modo é bloqueada remotamente por segurança; MODE2 já é o
+    # padrão de fábrica dos dois módulos.)
+    cmds = ["AT+PWRM0", "AT+VERS?", "AT+SHIELD1", "AT+BAUD2",
             "AT+ROLE0", "AT+IMME0", "AT+ADTY0", "AT+TYPE0", "AT+DELI3",
             "AT+NOTI1", "AT+ADVI2", f"AT+BEFC{befc}", f"AT+AFTC{aftc}",
             f"AT+NAME{alvo}"]
@@ -1676,27 +1679,38 @@ def act_testar_hibernacao(serial, mcu, mosfet="8"):
         STATUS("hibernar", "fail"); return False
     u2, _ = _uptime_via_info()
     elapsed = time.time() - t0
-    # ⭐ v2.13.4: rebootou <=> o uptime ANDOU PARA TRÁS (u2 < u1). A fórmula
-    # anterior comparava com o relógio de parede (u1+decorrido) e caía num
-    # falso-positivo: no power-down o millis() do MCU CONGELA, então uma placa
-    # que NÃO cortou (só dormiu) também fica "atrasada" vs o relógio — caso
-    # real 2910: 123s→189s em 98s ("aprovada" sem nunca ter desligado). Com o
-    # u1 mínimo de 40s garantido acima, u2<u1 só acontece com reboot real.
-    if u2 is not None and (u2 + 5) < u1:
-        LOG(f"✅ CORTOU E RELIGOU de verdade: uptime {u1}s → {u2}s em {int(elapsed)}s "
-            "de teste (o uptime voltou p/ trás = o MCU rebootou). Ciclo "
-            "corta→religa PROVADO.", "ok")
+    # ⭐ v2.13.4: rebootou <=> o uptime ANDOU PARA TRÁS (u2 < u1) — imune ao
+    # millis congelado no power-down (falso-positivo anterior).
+    # ⭐⭐ v2.15.1: rebootar NÃO basta — o corte precisa ser SUSTENTADO. Caso
+    # real 2910 (5.2 rev05): 42s→36s = cortou no dormir() (a 2400! hipótese do
+    # baud confirmada) mas RELIGOU SOZINHA na hora — o módulo re-aplica o
+    # BEFC020 continuamente quando desconectado. Isso é um POWER-CYCLE (loop
+    # corta-religa com bipe a cada ~25s, ZERO economia), não hibernação.
+    # Sustentado de verdade = a placa ficou MORTA até a nossa reconexão =>
+    # uptime pequeno (<15s = segundos desde o religamento pela conexão).
+    rebootou = u2 is not None and (u2 + 5) < u1
+    if rebootou and u2 <= 15:
+        LOG(f"✅ CORTOU, FICOU CORTADA e religou NA CONEXÃO: uptime {u1}s → {u2}s "
+            f"em {int(elapsed)}s (rebootou E estava recém-religada). Hibernação "
+            "sustentada PROVADA.", "ok")
         STATUS("hibernar", "ok")
         return {"ok": True, "ja_ativada": falhou_drop}
-    LOG(f"✗ NÃO CORTOU: uptime {u1}s → {u2}s em {int(elapsed)}s (o uptime nunca "
-        "voltou p/ trás = o MCU nunca desligou; diferença p/ o relógio de parede "
-        "é só o millis congelado no sono). Autodesligamento NÃO validado.", "err")
+    if rebootou:
+        LOG(f"⚠️ PSEUDO-CORTE: uptime {u1}s → {u2}s — o MCU rebootou, mas estava "
+            f"ligado há {u2}s na reconexão = o corte foi DESFEITO na hora (o "
+            "módulo re-aplica o BEFC020 desconectado). Vira loop corta-religa "
+            "(bipe a cada ~25s) sem NENHUMA economia — desativando.", "err")
+    else:
+        LOG(f"✗ NÃO CORTOU: uptime {u1}s → {u2}s em {int(elapsed)}s (o uptime "
+            "nunca voltou p/ trás; a diferença p/ o relógio é só o millis "
+            "congelado no sono). Autodesligamento NÃO validado.", "err")
     BLE.cmd("TST-HIB-OFF", ["OK-HIB-OFF"], timeout=5)   # deixa em estado seguro
     LOG("(hibernação por firmware desativada — modo IDLE seguro)", "warn")
-    # ⭐ v2.15: ÚLTIMO RECURSO antes de desistir — PLANO C (corte remoto pelo
-    # ar, o canal que o app usa). Valida ao menos a camada principal do corte.
-    if u2 is not None and u2 >= 40:
-        LOG("Último recurso: PLANO C — corte remoto pelo ar (o canal do app).", "hi")
+    # ⭐ v2.15: ÚLTIMO RECURSO — PLANO C (corte remoto pelo ar, o canal do app),
+    # que inclui a FASE 2 (experimento BEFC000-na-desconexão): nos módulos que
+    # re-aplicam o BEFC, o BEFC000 é justamente o corte automático por hardware.
+    if u2 is not None and u2 >= 20:
+        LOG("Último recurso: PLANO C — corte remoto pelo ar + experimento BEFC000.", "hi")
         return _testar_corte_remoto(alvo, mosfet, u2)
     STATUS("hibernar", "fail"); return False
 
@@ -1784,14 +1798,18 @@ def act_testar_hibernacao_auto(serial, mcu, espera=180):
     if u2 is None:
         LOG("⚠️ PONG ok mas TST-INFO sem UPTIME na volta — inconclusivo.", "warn")
         STATUS("hibernar", "fail"); return False
-    # v2.13.4: reboot real <=> uptime voltou p/ trás (millis congela no sono —
-    # comparação com relógio de parede dava falso-positivo, caso 2910).
-    if (u2 + 5) < u1:
-        LOG(f"✅ CORTOU E RELIGOU! uptime {u1}s → {u2}s após {espera}s de espera: o "
-            "uptime voltou p/ trás = o MCU REBOOTOU (a placa ficou sem energia e "
-            "religou na conexão). A hibernação automática (PWRM1) está ATIVA por "
-            "hardware — nada a ativar.", "ok")
+    # v2.13.4: reboot real <=> uptime voltou p/ trás (millis congela no sono).
+    # v2.15.1: sustentado <=> u2 pequeno (recém-religada NA conexão; u2 grande
+    # com reboot = religou sozinha = power-cycle sem economia, caso 2910).
+    if (u2 + 5) < u1 and u2 <= 15:
+        LOG(f"✅ CORTOU, FICOU CORTADA e religou NA CONEXÃO! uptime {u1}s → {u2}s "
+            f"após {espera}s de espera. A hibernação automática (PWRM1) está "
+            "ATIVA por hardware — nada a ativar.", "ok")
         STATUS("hibernar", "ok"); return True
+    if (u2 + 5) < u1:
+        LOG(f"⚠️ PSEUDO-CORTE: uptime {u1}s → {u2}s — rebootou mas religou SOZINHA "
+            "(sem ficar cortada). Sem economia real nesta placa.", "err")
+        STATUS("hibernar", "fail"); return False
     LOG(f"⚠️ NÃO CORTOU: uptime {u1}s → {u2}s (nunca voltou p/ trás). Ou o auto-sleep "
         f"demora mais que {espera}s (teste de novo com espera maior), ou o gate não "
         "está no pino 12 desta placa, ou o PWRM1 não pegou (reprovisione). A fechadura "
