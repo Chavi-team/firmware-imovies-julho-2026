@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.13.4"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.13.5"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.13.3"
@@ -1395,7 +1395,120 @@ def act_consertar_modulo(serial):
 # MOSFET; se cortou, o MCU some do ar e depois RELIGA sozinho (Rocky). Re-scan +
 # PONG = ciclo provado seguro nesta fechadura.
 # ---------------------------------------------------------------------------
-def act_testar_hibernacao(serial, mcu):
+# ⭐ v2.13.5 — PLANO C: corte REMOTO pelo ar (p/ módulos surdos ao AT do MCU,
+# caso 2910/R0). Em MODE2 o lado remoto controla os PIOs; a bancada manda
+# AT+PIO<x>0 pela MESMA conexão de dados:
+#   FASE 1 — corte comandado: AT+PIO<x>0 -> o MCU tem que CALAR (TST-PING mudo
+#            com o módulo ainda conectado = prova em tempo real de corte);
+#            desconecta/reconecta -> AFTC religa -> uptime voltou p/ trás.
+#   FASE 2 — experimento NVM: AT+BEFC000 + desconectar -> se o módulo reaplica
+#            o estado pré-conexão na desconexão, a placa corta SOZINHA sempre
+#            que o app sai (arquitetura 100% hardware, nem o app comanda).
+#            Restaura BEFC020 no fim (estado seguro conhecido).
+# Se a FASE 1 passar, o corte em produção é comandável PELO APP (mesmo canal).
+def _testar_corte_remoto(alvo, mosfet, u1):
+    try:
+        pio = int(str(mosfet).strip())
+    except Exception:
+        pio = 8
+    if not 5 <= pio <= 11:
+        pio = 8                         # MODE2 só controla PIO5..11 remotamente
+    # ---- FASE 1: corte comandado pelo ar ----
+    ok, _ = BLE.cmd(f"AT+PIO{pio}0", ["OK+Set"], timeout=5)
+    if not ok:
+        LOG(f"✗ O módulo não aceitou AT+PIO{pio}0 pelo ar (sem OK+Set) — nem o "
+            "remoto controla os PIOs deste módulo. Sem caminho de corte.", "err")
+        STATUS("hibernar", "fail"); return False
+    ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=5)
+    if ok:
+        LOG(f"✗ O MCU AINDA RESPONDE após o corte remoto — o gate não é PIO{pio} "
+            "(ou o módulo não executou de verdade). Religando por garantia.", "err")
+        BLE.cmd(f"AT+PIO{pio}1", ["OK+Set"], timeout=5)
+        STATUS("hibernar", "fail"); return False
+    LOG(f"✓ CORTOU: o MCU calou após AT+PIO{pio}0 (módulo segue conectado, placa "
+        "sem energia). Agora o religamento pela conexão (AFTC)...", "ok")
+    try:
+        BLE.disconnect()
+    except Exception:
+        pass
+    time.sleep(3)
+    addr = None
+    for _ in range(3):
+        try:
+            addr = BLE.scan(alvo, timeout=10)
+        except Exception:
+            addr = None
+        if addr:
+            break
+    if not addr:
+        LOG("✗ Não reapareceu no scan após o corte — religue a bateria e me avise.", "err")
+        STATUS("hibernar", "fail"); return False
+    try:
+        BLE.connect(addr)
+    except Exception as e:
+        LOG(f"✗ Erro ao reconectar: {e}", "err")
+        STATUS("hibernar", "fail"); return False
+    ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=8)
+    if not ok:
+        time.sleep(3)
+        ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=8)
+    if not ok:
+        LOG("✗ Reconectou mas o MCU não voltou (AFTC não religou?). Regrave pelo cabo.", "err")
+        STATUS("hibernar", "fail"); return False
+    u2, _ = _uptime_via_info()
+    if u2 is None or (u2 + 5) >= u1:
+        LOG(f"✗ Inconclusivo: uptime {u1}s → {u2}s (esperava reboot).", "err")
+        STATUS("hibernar", "fail"); return False
+    LOG(f"✅ CORTE REMOTO PROVADO: uptime {u1}s → {u2}s (o MCU rebootou). O corte "
+        f"pelo ar (AT+PIO{pio}0) funciona e a CONEXÃO religa — este é o caminho "
+        "que o APP pode usar em produção nesta geração de placa.", "ok")
+    # ---- FASE 2: corte automático na DESCONEXÃO (BEFC000 na NVM)? ----
+    LOG("Experimento extra: BEFC000 pelo ar e desconecto — se o módulo reaplicar "
+        "o estado pré-conexão ao desconectar, a placa corta SOZINHA quando o app "
+        "sai (sem comando nenhum).", "hi")
+    befc_corta = False
+    if BLE.cmd("AT+BEFC000", ["OK+Set"], timeout=5)[0]:
+        u_antes, _ = _uptime_via_info()
+        try:
+            BLE.disconnect()
+        except Exception:
+            pass
+        time.sleep(15)
+        addr = None
+        try:
+            addr = BLE.scan(alvo, timeout=10)
+        except Exception:
+            addr = None
+        if addr:
+            try:
+                BLE.connect(addr)
+                ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=8)
+                if ok:
+                    u3, _ = _uptime_via_info()
+                    if u3 is not None and u_antes is not None and (u3 + 5) < u_antes:
+                        befc_corta = True
+            except Exception:
+                pass
+    if befc_corta:
+        LOG("✅✅ MELHOR CENÁRIO: com BEFC000 a placa cortou SOZINHA na desconexão "
+            "e religou na conexão — hibernação 100% por hardware do módulo, sem "
+            "app nem MCU comandando nada.", "ok")
+    else:
+        LOG("ℹ️ BEFC000 não cortou na desconexão (o módulo só aplica BEFC no "
+            "power-on). O corte fica por comando do APP (fase 1, provado).", "hi")
+    # estado seguro conhecido: BEFC020 de volta (power-on liga a placa)
+    if BLE.conectado():
+        BLE.cmd("AT+BEFC020", ["OK+Set"], timeout=5)
+        LOG("(BEFC020 restaurado — power-on volta a ligar a placa)", "hi")
+    else:
+        LOG("⚠️ Não consegui restaurar o BEFC020 (sem conexão). A placa está com "
+            "BEFC000: no próximo ciclo de bateria ela SÓ liga ao conectar. "
+            "Reconecte e rode o teste de novo, ou me avise.", "warn")
+    STATUS("hibernar", "ok")
+    return {"ok": True, "ja_ativada": False, "modo": "remoto", "befc_corta": befc_corta}
+
+
+def act_testar_hibernacao(serial, mcu, mosfet="8"):
     STATUS("hibernar", "run")
     alvo = serial[2:] if serial.startswith("CH") else serial
     # 1) garante conexão (o teste precisa mandar TST-HIB por BLE)
@@ -1423,12 +1536,15 @@ def act_testar_hibernacao(serial, mcu):
             "de testar a hibernação.", "err")
         STATUS("hibernar", "fail"); return False
     # módulo surdo p/ AT vindo do MCU (caso 2910/R0): o MCU não consegue
-    # comandar DROP/PIO80 — o corte comandado tende a ser impossível nesta
-    # unidade. Avisa já; o veredito por UPTIME confirma.
-    if "MOD:SEM-AT" in (buf1 or ""):
-        LOG("⚠️ TST-INFO diz MOD:SEM-AT — o módulo desta placa é SURDO para AT "
-            "vindos do MCU. O corte comandado (G1) provavelmente NÃO funciona "
-            "aqui; o veredito por UPTIME vai confirmar.", "warn")
+    # comandar DROP/PIO80 — nem o TST-HIB nem o plano B (dormir) funcionam.
+    # ⭐ v2.13.5 PLANO C: o MODE2 permite que o lado REMOTO controle os PIOs
+    # ("dispositivo remoto controla as saídas PIO5..11") — a BANCADA manda o
+    # corte pelo ar, prova em tempo real (TST-PING tem que CALAR) e religa
+    # pela conexão (AFTC). É o mesmo caminho que o APP usará em produção.
+    sem_at = "MOD:SEM-AT" in (buf1 or "")
+    if sem_at:
+        LOG("⚠️ MOD:SEM-AT — módulo surdo p/ AT do MCU. Indo direto ao PLANO C: "
+            "corte REMOTO pelo ar (o mesmo caminho que o app usará).", "warn")
     # ⚠️ millis() CONGELA no power-down: sem corte, u2 fica entre u1 e
     # u1+decorrido (relógio parado enquanto dorme); com corte real, u2 volta p/
     # TRÁS (~segundos desde o religamento). O veredito é "andou para trás", e
@@ -1442,6 +1558,8 @@ def act_testar_hibernacao(serial, mcu):
             LOG("✗ TST-INFO parou de responder na 2ª leitura.", "err")
             STATUS("hibernar", "fail"); return False
     t0 = time.time()
+    if sem_at:
+        return _testar_corte_remoto(alvo, mosfet, u1)
     LOG(f"🔋 Corte comandado (TST-HIB); uptime atual = {u1}s. O veredito sai pelo "
         "UPTIME após religar — silêncio no corte é esperado.", "hi")
     falhou_drop = False
@@ -1651,12 +1769,21 @@ def act_hibernar_seguro(serial, mcu, mosfet="8"):
                 "confira o pino do gate.", "warn")
             STATUS("hibernar", "ok")   # decisão segura tomada
         return {"hibernacao": bool(ok)}
-    r = act_testar_hibernacao(serial, mcu)
+    r = act_testar_hibernacao(serial, mcu, mosfet)
     if not r:
         LOG("⚠️ Hibernação NÃO validada nesta fechadura — mantida DESLIGADA (IDLE "
             "seguro). A fechadura está pronta e funciona 100%; apenas não hiberna.", "warn")
         STATUS("hibernar", "ok")   # o passo cumpriu seu papel: decisão segura tomada
         return {"hibernacao": False}
+    # modo REMOTO (plano C): o MCU não comanda o corte — ativar EE_HIBERNA seria
+    # inútil (dormir() mandaria AT p/ um módulo surdo). O corte é pelo AR (app).
+    if isinstance(r, dict) and r.get("modo") == "remoto":
+        LOG("📌 Corte validado no modo REMOTO: em produção, quem corta é o APP "
+            "(AT+PIO<x>0 pelo ar ao final do uso)" +
+            (" — ou o próprio módulo na desconexão (BEFC000), que também passou."
+             if r.get("befc_corta") else "."), "ok")
+        STATUS("hibernar", "ok")
+        return {"hibernacao": True, "modo": "remoto", "befc_corta": bool(r.get("befc_corta"))}
     # plano B do teste já ativou (TST-HIB-ON) — não repetir
     on = True if (isinstance(r, dict) and r.get("ja_ativada")) else act_ativar_hibernacao(serial, mcu)
     if on:
