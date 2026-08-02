@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.17.1"
+#define FW_VERSION   "2.17.2"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -439,8 +439,21 @@ void motorGira(bool sentidoA) {
             motorGiraMs(!sentidoA, MOTOR_RECUO_ABORT_MS);
         }
     } else if (MOTOR_RECUO_MS > 0) {
-        delay(80);
-        motorGiraMs(!sentidoA, MOTOR_RECUO_MS);
+        // ⭐⭐ v2.17.2 — COAST antes de inverter (causa-raiz do reset no fim do
+        // giro). 80ms NÃO param um motor com inércia: inverter o sentido com o
+        // eixo ainda girando é FRENAGEM POR INVERSÃO — a tensão gerada pelo
+        // motor se soma à aplicada e o pico de corrente chega ao DOBRO do
+        // stall, derrubando o trilho por alguns ms -> brown-out -> reset. Era
+        // o que comia a 2ª confirmação, a melodia e o próprio recuo (medido:
+        // 3/3 ciclos sem a 2ª confirmação, com bateria a 60%/3,82V — carga em
+        // que um giro normal NÃO derruba nada).
+        // 350ms de roda-livre (motor em LOW/LOW = freio suave da ponte H) +
+        // conferência do trilho antes de aplicar o sentido oposto.
+        delay(350);
+        uint16_t v = lerVccMv();
+        if (v == 0 || v >= VCC_MOTOR_MIN_MV) {
+            motorGiraMs(!sentidoA, MOTOR_RECUO_MS);
+        }
     }
 }
 
