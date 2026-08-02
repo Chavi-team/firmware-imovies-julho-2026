@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.16.3"
+#define FW_VERSION   "2.17.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -254,6 +254,8 @@ volatile bool acordouBLE = false, acordouBtn = false;
 bool moduloOk = false;
 bool g_wakeHib = false;        // este boot foi um "acordar da hibernação"
 bool g_hiberna = false;        // HIBERNAÇÃO por corte de MOSFET ligada (EE_HIBERNA)
+bool g_motorAbortouVcc = false;  // giro parou por queda de trilho (v2.17)
+uint16_t lerVccMv();             // (definida antes do setup)
 bool g_sessaoConectada = false; // já tocou a melodia de "conectou" nesta sessão BLE
 void atenderBotao();           // usada pelo atenderApp (definida mais abaixo)
 
@@ -383,7 +385,22 @@ void motorGiraMs(bool sentidoA, uint16_t ms) {
 //     aliviar a pressão do fim de curso — igual ao FI_1_5. O recuo é curto e
 //     NÃO desfaz a abertura (o came já passou o ponto); só solta o batente.
 // O motor NUNCA fica ligado: para no batente, no teto ou no fim de cada etapa.
+// ⭐⭐ v2.17 — PROTEÇÃO DE TRILHO (fim do reset no meio do giro). MEDIDO com
+// tools/simula_app.py na 2910: a 2ª confirmação (fim do giro) NUNCA chegava e a
+// fechadura dava o bipe de BOOT logo após o motor = o MCU estava MORRENDO no
+// giro. Motivo: o motor puxa do trilho de 12V; com a bateria meia-boca e a
+// resistência em série do retrofit (Rds-on do mosfet + fios finos + soldas), o
+// VCC cai até o brown-out (2,7V) e o MCU reinicia — o app fica sem a 2ª
+// confirmação, sem melodia, e o comando seguinte pega a placa em estado ruim
+// (F07). Pior no caso SEM CARGA MECÂNICA (bancada), onde o batente nunca é
+// atingido e o motor roda os 10s inteiros do teto.
+// Agora o giro VIGIA o próprio VCC (bandgap, ~1ms) e PARA por conta própria se
+// o trilho afundar — a fechadura conclui o comando, responde e toca a melodia
+// em vez de morrer. Numa porta real o batente chega antes e isto nunca dispara.
+#define VCC_MOTOR_MIN_MV 4300      // trilho saudável = 5V (StepUp); abaixo disto
+                                   // o próximo passo é o brown-out
 void motorGira(bool sentidoA) {
+    g_motorAbortouVcc = false;
     if (!inaOk) {
         motorGiraMs(sentidoA, MOTOR_MS);       // 1. giro (fallback por tempo)
     } else {
@@ -395,13 +412,23 @@ void motorGira(bool sentidoA) {
             for (uint8_t i = 0; i < 25; i++) mA += ina219.getCurrent_mA();
             mA /= 25.0f;
             if (millis() - t0 > MOTOR_ARRANQUE_MS && fabs(mA) > MOTOR_STALL_MA) break;
+            // trilho afundando? para AGORA (antes do brown-out levar o MCU)
+            if (millis() - t0 > MOTOR_ARRANQUE_MS) {
+                uint16_t v = lerVccMv();
+                if (v && v < VCC_MOTOR_MIN_MV) { g_motorAbortouVcc = true; break; }
+            }
         }
         motorPara();
         ina219.powerSave(true);
     }
     // 2. recuo/line-up (alivia o batente). Pausa curta antes p/ o motor parar
     //    de fato (inércia) e não dar shoot-through na inversão de sentido.
-    if (MOTOR_RECUO_MS > 0) {
+    // ⭐ v2.17: se o giro foi ABORTADO por queda de trilho, PULA o recuo (outro
+    //    giro afundaria de novo) e dá um tempo p/ a bateria se recuperar — o
+    //    que importa agora é concluir o comando (status + melodia) sem morrer.
+    if (g_motorAbortouVcc) {
+        delay(400);
+    } else if (MOTOR_RECUO_MS > 0) {
         delay(80);
         motorGiraMs(!sentidoA, MOTOR_RECUO_MS);
     }
