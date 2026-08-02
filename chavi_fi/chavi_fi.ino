@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.15.2"
+#define FW_VERSION   "2.16.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -124,18 +124,24 @@
 #define PIN_LED10_2  PIN_PB0
 #define PIN_LED10_3  PIN_PB1
 
-// BAUD do módulo BLE = 9600 (AT+BAUD2) = PADRÃO DE FÁBRICA do módulo (manual
-// pág.8/22). ⭐ PROVA (MS BLE Explorer na CH003FI002734): AT+BAUD? -> "OK+Get2"
-// = 9600. O módulo SAI DE FÁBRICA em 9600; forçá-lo a 2400 exige falar 9600 com
-// ele, e SoftwareSerial a 9600 no RC de 8MHz é marginal -> a conversão falhava e
-// o módulo ficava mudo p/ o MCU. Usar 9600 NATIVO elimina a briga: é a config de
-// referência do fabricante (Arduino a 16MHz + SoftwareSerial 9600, manual pág.12).
-// CLOCK: CRISTAL EXTERNO 16MHz (a placa TEM — schema1/2: X1 16MHz + 22pF). É
-// OBRIGATÓRIO p/ SoftwareSerial a 9600 ser confiável (o RC de 8MHz não dá conta).
-// Sem 2400-slow, o "wake por dado" some — mas com AT+PWRM0 (auto-sleep OFF) o
-// módulo não dorme, então não precisamos dele.
-#define BAUD_MODULO  9600
-#define AT_BAUD_CMD  "AT+BAUD2"    // -> 9600 (padrão de fábrica do módulo)
+// ⭐⭐ BAUD do módulo BLE = 2400-SLOW (AT+BAUD0) — DECISÃO 02/08/2026, volta à
+// config da PRODUÇÃO LEGADA (esteira at.js: BAUD0 + PWRM1 em toda a frota).
+// PORQUÊ (tabela do AT+PWRM, manual 1010 §54): o auto-sleep do módulo (PWRM1)
+// só permite ACORDAR POR DADO na UART quando o baud é BAUD0/2400-slow; nos
+// demais bauds o módulo dormindo só acorda por pulso GND no pino 24 (WAKE) —
+// que na placa tem apenas pull-up (R22), ninguém pulsa. Provado na 2910 em
+// 02/08: 9600 + PWRM1 = MCU nunca recebe nada (zero PONG, F07 no app).
+// E PWRM1 é OBRIGATÓRIO p/ a hibernação: com PWRM0 o módulo fica acordado e o
+// TX da UART dele (3,3V constante) ALIMENTA DE FORMA PARASITA o MCU da placa
+// CORTADA -> boots fracos em loop (bipe a cada ~1s). Dormindo, ele solta o TX.
+// Bônus: rádio 1,5mA -> 0,65mA (metade da conta de bateria).
+// CLOCK: cristal externo 16MHz. A 2400 o SoftwareSerial tem ~6.700 ciclos por
+// bit (contra ~1.700 a 9600) — é a config MAIS folgada, não menos. O trauma
+// histórico do 9600 vinha do RC interno de 8MHz (±10%), que não existe mais.
+// Módulo VIRGEM sai de fábrica em 9600 -> o provisionamento converte (o sweep
+// manda AT+BAUD0 em cada baud candidato; a bancada faz o mesmo pelo ar).
+#define BAUD_MODULO  2400
+#define AT_BAUD_CMD  "AT+BAUD0"    // -> 2400-slow (wake por dado + PWRM1)
 
 // Motor REAL (abrir/fechar/calibração): igual ao FI_1_5 de produção — gira até
 // detectar o BATENTE pela corrente (INA219 no I2C 0x45) ou até o teto duro.
@@ -545,12 +551,10 @@ void configModuloLeve() {
     // 9600, "ONG" sem o P etc.) perdeu relevância: a BANCADA é a dona da
     // config pelo ar (v2.14) e a conexão BLE acorda o módulo antes de
     // qualquer dado do app. No pino-12/auto o PWRM1 já era o próprio corte.
-    at("AT+PWRM0");   // ⚠️ v2.15.2: PWRM1 REVERTIDO — a 9600 o módulo dormindo
-                      // NÃO acorda por dado na UART (manual: wake por dado só em
-                      // BAUD0/2400-slow) -> MCU nunca recebe o comando do app,
-                      // ZERO PONG (provado na 2910 11:00). PWRM0 é obrigatório
-                      // ENQUANTO o baud for 9600. O backfeed (bipe ~1s com a
-                      // placa cortada) volta a existir: ver plano 2400+PWRM1.
+    at("AT+PWRM1");   // ⭐ v2.16: auto-sleep LIGADO (config da esteira legada).
+                      // Só funciona junto do BAUD0/2400-slow (wake por dado) —
+                      // ver o bloco do BAUD_MODULO. Mata o backfeed do corte e
+                      // derruba o rádio de 1,5mA p/ 0,65mA.
     at("AT+TYPE0");    // sem pareamento (TYPE1 residual = pede PIN em toda conexão)
     // NOME reafirmado a CADA boot (como o changeName do FI_1_5), ANTES do MODE2.
     // ⭐ v2.10 AUTO-CURA: escreve, LÊ DE VOLTA (AT+NAME?) e compara — se a UART
@@ -654,7 +658,7 @@ void bleProvisionar() {
     // Só os bauds ALCANÇÁVEIS pelo SoftwareSerial a 16MHz (9600 primeiro = o mais
     // comum). Tirei 57600/115200/1200: SoftwareSerial não os faz confiável, e
     // varrê-los só alongava o boot (colidia com a conexão da bancada).
-    static const long TODOS[] = {9600, 2400, 4800, 19200, 38400};
+    static const long TODOS[] = {2400, 9600, 4800, 19200, 38400};
     const uint8_t N = sizeof(TODOS) / sizeof(long);
 
     // PASSO 0 — SEM RENEW. ⚠️ O AT+RENEW/DEFAULT era veneno em DUAS frentes:
@@ -695,7 +699,7 @@ void bleProvisionar() {
         // surda p/ SEMPRE até o PWRM0 entrar pelo ar (bancada). Aqui é a
         // primeira coisa dita em CADA baud: se a janela existir, destrava já.
         at("AT+PWRM0", 120);
-        at(AT_BAUD_CMD, 250);                  // -> 9600
+        at(AT_BAUD_CMD, 250);                  // -> 2400-slow
         at("AT+RESET", 150);
         delay(600);                            // módulo reinicia no baud novo
     }
@@ -706,7 +710,7 @@ void bleProvisionar() {
     // PASSO 2 — config completa no baud alvo.
     at("AT+SHIELD1");
     at(AT_BAUD_CMD);                           // reafirma (só vale após reset)
-    at("AT+PWRM0");                            // auto-sleep OFF (sempre acordado)
+    at("AT+PWRM1");                            // auto-sleep ON (2400-slow: wake por dado)
     at("AT+ROLE0");                            // slave (ROLE1 residual = não anuncia)
     at("AT+IMME0");                            // anuncia sozinho ao ligar
     at("AT+ADTY0");                            // anúncio conectável
@@ -726,7 +730,7 @@ void bleProvisionar() {
     if (serialFech[0]) {
         char nm[24];
         snprintf(nm, sizeof(nm), "AT+NAME%s", serialFech);
-        const long bd[] = {2400, 9600, 38400, 19200, 57600, 4800};
+        const long bd[] = {2400, 9600, 38400, 19200, 4800};
         for (uint8_t i = 0; i < sizeof(bd) / sizeof(long); i++) {
             bluetooth.begin(bd[i]); delay(30);
             at("AT", 50); at("AT+PWRM0", 100); at(nm, 180);   // v2.10.1: acorda antes do nome
@@ -1047,25 +1051,9 @@ void testeBancada(const String& t) {
         delay(400);                          // a resposta sai antes do DROP
         at("AT+DROP", 500);                  // derruba a conexão -> módulo sai do túnel
         delay(500);
-        // ⭐ v2.15 FALLBACK A 2400 (hipótese do Leonardo, apoiada por evidência):
-        // lotes antigos de módulo (R0) só OUVEM AT do MCU no baud da esteira
-        // legada (2400), mesmo com os DADOS correndo a 9600 — a produção _400
-        // cortava a 2400 por anos, e o "loop de suicídio" provou que um
-        // AT+RESET mandado a 2400 EXECUTA num módulo surdo a 9600. Se o DROP a
-        // 9600 não derrubou, tenta a 2400; o corte segue no baud que funcionou.
-        // Só a sequência de energia desce a 2400 — dados/sonda/verbos ficam 9600.
-        bool a2400 = false;
-        if (digitalRead(PIN_WAKE) == HIGH) {
-            bluetooth.begin(2400);
-            delay(30);
-            at("AT+DROP", 400);
-            delay(500);
-            a2400 = (digitalRead(PIN_WAKE) == LOW);
-            if (!a2400) {
-                bluetooth.begin(BAUD_MODULO);   // restaura ANTES de responder
-                enviaLinha("HIB-FALHOU-DROP");
-                return;
-            }
+        if (digitalRead(PIN_WAKE) == HIGH) { // ainda conectado -> não dá p/ cortar
+            enviaLinha("HIB-FALHOU-DROP");
+            return;
         }
         atMascara("AT+BEFC", 0);             // ⭐ libera o gate (senão o BEFC re-liga)
         at("AT+PIO60", 200);                 // arma a borda de wake (PIO6 baixo)
@@ -1074,17 +1062,8 @@ void testeBancada(const String& t) {
         snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
         at(pio, 60);                         // CORTA o MOSFET -> MCU morre se cortou
         delay(3000);                         // se cortou, nunca passa daqui
-        if (!a2400) {                        // 9600 vivo: última carta, corte a 2400
-            bluetooth.begin(2400);
-            delay(30);
-            at("AT+PIO60", 100);
-            at(pio, 60);
-            delay(3000);                     // se cortou a 2400, morre aqui
-            bluetooth.begin(BAUD_MODULO);
-        }
         EEPROM.update(EE_HIB, 0);
         beep(160, 400); beep(160, 400); beep(160, 400);   // 3 graves = NÃO cortou
-        if (a2400) bluetooth.begin(BAUD_MODULO);
         return;
     }
     if (t.startsWith("TST-ALL"))  {
@@ -1258,17 +1237,7 @@ void dormir() {
         char pio[12];             // corta pelo PIO do MOSFET (EEPROM 914, default 8)
         snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
         at(pio, 60);              // corta o MOSFET -> MCU morre aqui se cortou
-        delay(150);
-        // ⭐ v2.15 FALLBACK A 2400 (ver TST-HIB): módulos do lote legado só
-        // ouvem AT do MCU a 2400 — troca SÓ para a sequência de corte e
-        // restaura; se o módulo obedecer, o MCU morre no meio (objetivo).
-        bluetooth.begin(2400);
-        delay(30);
-        at("AT+DROP", 150);
-        at("AT+PIO60", 80);
-        at(pio, 60);              // se ouve a 2400, morre AQUI
-        delay(150);
-        bluetooth.begin(BAUD_MODULO);   // não cortou em nenhum baud: segue p/ IDLE
+        delay(150);       // não cortou: segue p/ o IDLE abaixo
     }
     acordouBLE = false; acordouBtn = false;
     g_sessaoConectada = false;   // sessão encerrou -> melodia toca de novo no próximo OK+CONN

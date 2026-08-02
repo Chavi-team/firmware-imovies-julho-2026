@@ -80,10 +80,10 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.15.4"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.16.0"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.15.2"
+FIRMWARE_VERSION = "2.16.0"
 VERSION_DATE = "2026-08-02"               # data desta versão (ISO; bump a cada release)
 VERSION_NOTES = "Bancada v2.13.0 (MOSFET automático): suporte às placas v2.7/retrofit 2024 com gate no pino FÍSICO 12 do módulo = PIO2/VCC-EEPROM (inendereçável por AT — descoberta 31/07 via esquemático+manuais) · pino MOSFET aceita 12 na UI/seed.bin · provisionamento pelo ar e firmware usam AT+PWRM1 nessas placas (módulo ocioso dorme -> PIO2 cai -> corta a placa; conexão BLE religa; ~0,65mA ocioso) · teste de hibernação novo por UPTIME (TST-INFO) — prova corte+religa sem comando de corte · firmware v2.13.0 (mosfetAuto: PWRM1, BEFC000/AFTC008, boot-de-wake por PD3 alto, MOSFET:12-AUTO e UPTIME no TST-INFO)"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
@@ -1017,15 +1017,17 @@ def receita_ar(alvo, mosfet_pin):
     # (sem AT+MODE2: o 5.2 rev05 responde ERRO+CMD_N_PERMITIDO pelo ar —
     # mudança de modo é bloqueada remotamente por segurança; MODE2 já é o
     # padrão de fábrica dos dois módulos.)
-    # ⭐ v2.15.3: AT+PWRM1 final para TODAS as placas (não só pino-12) — igual
-    # à esteira legada (at.js mandava PWRM1 p/ toda a frota). Mata o BACKFEED
-    # (módulo sempre acordado alimenta de forma parasita o MCU de uma placa
-    # cortada pelo TX da UART = bipe em loop a cada ~1s, caso real 2910) e
-    # corta o consumo do rádio pela metade (1,5 -> 0,65mA).
-    cmds = ["AT+PWRM0", "AT+VERS?", "AT+SHIELD1", "AT+BAUD2",
+    # ⭐⭐ v2.16 — 2400-SLOW (BAUD0) + PWRM1 para TODAS as placas: a config da
+    # esteira legada (at.js), agora entendida. PWRM1 (auto-sleep) mata o
+    # BACKFEED (módulo acordado alimenta parasiticamente o MCU da placa cortada
+    # pelo TX da UART = bipe em loop ~1s) e derruba o rádio de 1,5 p/ 0,65mA;
+    # e o auto-sleep SÓ é utilizável em BAUD0, o único baud com wake-por-dado
+    # na UART (o pino 24/WAKE tem só pull-up na placa). O PWRM0 INICIAL fica:
+    # acorda módulo dormindo p/ o resto da receita entrar.
+    cmds = ["AT+PWRM0", "AT+VERS?", "AT+SHIELD1", "AT+BAUD0",
             "AT+ROLE0", "AT+IMME0", "AT+ADTY0", "AT+TYPE0", "AT+DELI3",
             "AT+NOTI1", "AT+ADVI2", f"AT+BEFC{befc}", f"AT+AFTC{aftc}",
-            f"AT+NAME{alvo}", "AT+PWRM0", "AT+RESET"]   # ⚠️ v2.15.4: PWRM1 revertido (a 9600 mata a UART do MCU — sem PONG)
+            f"AT+NAME{alvo}", "AT+PWRM1", "AT+RESET"]
     return cmds
 
 
@@ -1100,7 +1102,9 @@ def act_provisionar(serial, mcu, mosfet_pin):
             BLE.connect(addr)
         except Exception:
             return False
-        for _ in range(4):
+        # 2 tentativas bastam: fechadura viva responde na 1ª (o boot já
+        # terminou quando chegamos aqui). Mais tentativas só alongavam a falha.
+        for _ in range(2):
             ok, _r = BLE.cmd("TST-PING", ["PONG"], timeout=3)
             if ok:
                 return True
@@ -1113,12 +1117,8 @@ def act_provisionar(serial, mcu, mosfet_pin):
         except Exception as e:
             LOG(f"✗ Erro ao provisionar pelo ar: {e}", "err"); return False
         if not ok:
-            LOG("⚠️ Algum AT ficou sem resposta — repetindo uma vez...", "warn")
-            time.sleep(3)
-            try:
-                ok = BLE.provisionar_at(addr, receita_ar(alvo, mosfet_pin))
-            except Exception:
-                ok = False
+            LOG("⚠️ Algum AT ficou sem resposta (o RESET final não responde por "
+                "design). Sigo — o PONG é o juiz.", "warn")
         # ⭐ CRÍTICO (aprendido na 002FI001767): depois do AT+RESET, o MÓDULO já
         # está 100% configurado (todos OK+Set acima) — mas o MCU faz o PRÓPRIO
         # provisionamento no boot, e enquanto NÓS estivermos conectados o módulo
@@ -1126,21 +1126,21 @@ def act_provisionar(serial, mcu, mosfet_pin):
         # "AT+VERS?" que vazam pro túnel são ELE tentando) e nunca chega a
         # responder PONG. A cura é DESCONECTAR e deixar o MCU terminar SOZINHO.
         # Foi exatamente o "esperei e reconectei" que resolveu na mão.
+        # Desconecta e deixa o MCU terminar sozinho: conectados, o módulo fica
+        # em túnel e não responde ao MCU. UMA espera (a 2ª nunca salvou um caso
+        # real — quando falha, falha pelas duas).
         BLE.disconnect()
-        for tentativa in (1, 2):
-            LOG(f"Módulo configurado. Deixando o MCU terminar sozinho "
-                f"(desconectado, ~30s — tentativa {tentativa}/2)...", "hi")
-            time.sleep(30)   # DESCONECTADO de propósito: não competir com o MCU
-            if _pong():
-                LOG("✓ Rádio provisionado pelo ar (PWRM0 + 9600 + wake + nome) e "
-                    "respondendo (PONG).", "ok")
-                return True
-        # 2 tentativas sem PONG: o rádio está OK (provado pelos OK+Set), o MCU não
+        LOG("Módulo configurado. Deixando o MCU terminar sozinho (desconectado, ~30s)...", "hi")
+        time.sleep(30)
+        if _pong():
+            LOG("✓ Rádio provisionado pelo ar (2400-slow + PWRM1 + wake + nome) "
+                "e respondendo (PONG).", "ok")
+            return True
         _GRAVA_TS = time.time()
-        LOG("⚠️ Rádio configurado pelo ar, mas sem PONG do MCU após ~60s. "
-            "DIAGNÓSTICO PELO SOM ao religar a bateria: SILÊNCIO = sem energia "
-            "(bateria/fuses) · 1 bipe + 4 GRAVES = MCU vivo mas UART módulo→MCU "
-            "marginal (solda) · MELODIA = pronto, é só conectar de novo.", "warn")
+        LOG("⚠️ Rádio configurado pelo ar, mas sem PONG do MCU. DIAGNÓSTICO PELO "
+            "SOM ao religar a bateria: SILÊNCIO = sem energia (bateria/fuses) · "
+            "1 bipe + 4 GRAVES = MCU vivo mas UART módulo→MCU marginal (solda) · "
+            "MELODIA = pronto, é só conectar de novo.", "warn")
         return bool(ok)
 
     LOG("Verificando o rádio BLE (o firmware se auto-provisiona no boot)...", "hi")
@@ -1398,10 +1398,13 @@ def act_consertar_modulo(serial):
             "refaça o passo 1.", "ok")
         time.sleep(4)
         return True
-    LOG("Aplicando o padrão v2.10.1 pelo ar: PWRM0 (acorda a UART) + 9600 + reset...", "hi")
+    LOG("Aplicando o padrão v2.16 pelo ar: PWRM0 (acorda a UART) + 2400-slow "
+        "+ PWRM1 + reset...", "hi")
     BLE.cmd("AT+PWRM0", ["OK", "+"], timeout=2)
     time.sleep(0.4)
-    BLE.cmd("AT+BAUD2", ["OK", "+"], timeout=2)
+    BLE.cmd("AT+BAUD0", ["OK", "+"], timeout=2)
+    time.sleep(0.4)
+    BLE.cmd("AT+PWRM1", ["OK", "+"], timeout=2)
     time.sleep(0.4)
     BLE.cmd("AT+RESET", ["OK", "+"], timeout=2)
     BLE.disconnect()
@@ -1421,7 +1424,7 @@ def act_consertar_modulo(serial):
             LOG("✓✓ PONG! O módulo estava dormindo (PWRM1 legado) ou em baud "
                 "errado — PLACA RECUPERADA. Rode o auto-teste completo.", "ok")
             return True
-    LOG("✗ Sem PONG mesmo com o módulo acordado (PWRM0) a 9600 e comprovadamente "
+    LOG("✗ Sem PONG mesmo com o módulo reconfigurado (2400-slow) e comprovadamente "
         "bom pelo ar → solda/trilha TX-RX entre módulo e MCU = DEFEITO FÍSICO "
         "(laudo fechado).", "err")
     return False
@@ -1658,9 +1661,9 @@ def act_testar_hibernacao(serial, mcu, mosfet="8"):
         # antigos é fixo em 2400, o baud da esteira legada, mesmo com dados a
         # 9600). Se o autodesligamento funcionar, a placa ganha a camada de
         # BACKUP (gap do app fechado); o plano C fica como último recurso.
-        LOG("⚠️ MOD:SEM-AT — módulo surdo p/ AT do MCU a 9600. O firmware 2.15 "
-            "tenta o corte também a 2400 (baud da esteira legada); se falhar, "
-            "caímos no PLANO C (corte remoto pelo ar).", "warn")
+        LOG("⚠️ MOD:SEM-AT — o MCU não conseguiu falar com o módulo neste boot. "
+            "Com o padrão 2400-slow+PWRM1 (v2.16) isso deve desaparecer; se "
+            "persistir, o corte fica com o app (PLANO C).", "warn")
     # ⚠️ millis() CONGELA no power-down: sem corte, u2 fica entre u1 e
     # u1+decorrido (relógio parado enquanto dorme); com corte real, u2 volta p/
     # TRÁS (~segundos desde o religamento). O veredito é "andou para trás", e
@@ -2191,7 +2194,7 @@ PAGE = r"""<!DOCTYPE html>
       <div class="rec-sub">No fluxo NORMAL você <b>não precisa</b> destes botões — basta seguir os passos numerados acima. Use um destes só quando o problema abaixo acontecer:</div>
       <div class="rec-item">
         <button id="btn-consertar">🩺 Consertar módulo</button>
-        <div class="rec-desc">Diagnóstico completo pelo ar (VERS/BAUD/MODE/PWRM/NAME) + conserto: <b>acorda módulo dormindo</b> (PWRM1 legado) e força 9600. Use se a comunicação estiver <b>muda/saindo com lixo</b>.</div>
+        <div class="rec-desc">Diagnóstico completo pelo ar (VERS/BAUD/MODE/PWRM/NAME) + conserto: <b>acorda módulo dormindo</b> (PWRM0) e aplica o padrão 2400-slow + PWRM1. Use se a comunicação estiver <b>muda/saindo com lixo</b>.</div>
       </div>
       <div class="rec-item">
         <button id="btn-renomear">🔧 Renomear módulo</button>
