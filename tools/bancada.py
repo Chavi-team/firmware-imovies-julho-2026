@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.15.1"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.15.2"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.15.0"
@@ -1525,47 +1525,94 @@ def _testar_corte_remoto(alvo, mosfet, u1):
     LOG(f"✅ CORTE REMOTO PROVADO: uptime {u1}s → {u2}s (o MCU rebootou). O corte "
         f"pelo ar (AT+PIO{pio}0) funciona e a CONEXÃO religa — este é o caminho "
         "que o APP pode usar em produção nesta geração de placa.", "ok")
-    # ---- FASE 2: corte automático na DESCONEXÃO (BEFC000 na NVM)? ----
-    LOG("Experimento extra: BEFC000 pelo ar e desconecto — se o módulo reaplicar "
-        "o estado pré-conexão ao desconectar, a placa corta SOZINHA quando o app "
-        "sai (sem comando nenhum).", "hi")
+    # ---- FASE 2 (⭐ v2.15.2, o experimento DE VERDADE): BEFC000 + AT+RESET.
+    # Descoberta do run 10:42 (2910/5.2 ver.05): o módulo re-aplica na
+    # DESCONEXÃO o BEFC que carregou no BOOT (cache) — máscara escrita pelo ar
+    # só vale após RESET (mesmo padrão do BAUD/NAME). A fase 2 antiga escrevia
+    # BEFC000 e testava com o 020 ainda em cache: inconclusiva. Sequência real:
+    #   BEFC000 + RESET -> módulo reboota e aplica 000 (placa CORTA já aqui)
+    #   -> conectar religa (AFTC028) -> desconectar -> esperar -> reconectar:
+    #   uptime PEQUENO = ficou cortada DESCONECTADA = corte automático por
+    #   hardware em toda desconexão (gap zero, sem app nem firmware).
+    LOG("Experimento BEFC000+RESET (máscaras deste módulo só valem após reset): "
+        "a placa deve CORTAR já no reboot do módulo e ficar cortada sempre que "
+        "desconectada.", "hi")
     befc_corta = False
+    u3 = u4 = None
     if BLE.cmd("AT+BEFC000", ["OK+Set"], timeout=5)[0]:
-        u_antes, _ = _uptime_via_info()
+        try:
+            BLE.cmd("AT+RESET", ["OK+RESET"], timeout=4)
+        except Exception:
+            pass
         try:
             BLE.disconnect()
         except Exception:
             pass
-        time.sleep(15)
+        time.sleep(6)                       # módulo reboota; BEFC000 corta a placa
         addr = None
-        try:
-            addr = BLE.scan(alvo, timeout=10)
-        except Exception:
-            addr = None
+        for _ in range(3):
+            try:
+                addr = BLE.scan(alvo, timeout=10)
+            except Exception:
+                addr = None
+            if addr:
+                break
         if addr:
             try:
                 BLE.connect(addr)
-                if _pong_paciente(alvo, tentativas=4):
-                    u3, _ = _uptime_via_info()
-                    if u3 is not None and u_antes is not None and (u3 + 5) < u_antes:
-                        befc_corta = True
+            except Exception:
+                addr = None
+        if addr and _pong_paciente(alvo, tentativas=4):
+            u3, _ = _uptime_via_info()      # religou na conexão -> deve ser pequeno
+            try:
+                BLE.disconnect()
             except Exception:
                 pass
+            time.sleep(20)                  # desconectada: deve FICAR cortada
+            addr = None
+            try:
+                addr = BLE.scan(alvo, timeout=10)
+            except Exception:
+                addr = None
+            if addr:
+                try:
+                    BLE.connect(addr)
+                    if _pong_paciente(alvo, tentativas=4):
+                        u4, _ = _uptime_via_info()
+                        befc_corta = (u4 is not None and u4 <= 15)
+                except Exception:
+                    pass
+            LOG(f"BEFC000 valendo: religou com uptime {u3}s; após 20s desconectada, "
+                f"reconectar deu uptime {u4}s "
+                f"({'FICOU CORTADA desconectada ✓' if befc_corta else 'seguiu LIGADA ✗'}).",
+                "ok" if befc_corta else "warn")
     if befc_corta:
-        LOG("✅✅ MELHOR CENÁRIO: com BEFC000 a placa cortou SOZINHA na desconexão "
-            "e religou na conexão — hibernação 100% por hardware do módulo, sem "
-            "app nem MCU comandando nada.", "ok")
+        LOG("✅✅ MELHOR CENÁRIO CONFIRMADO: com BEFC000 valendo, a placa corta "
+            "SOZINHA em toda desconexão e religa em qualquer conexão — corte por "
+            "hardware, gap ZERO, sem app nem firmware comandando nada.", "ok")
     else:
-        LOG("ℹ️ BEFC000 não cortou na desconexão (o módulo só aplica BEFC no "
-            "power-on). O corte fica por comando do APP (fase 1, provado).", "hi")
-    # estado seguro conhecido: BEFC020 de volta (power-on liga a placa)
+        LOG("ℹ️ BEFC000 não sustentou o corte desconectada — o corte fica por "
+            "comando do APP (fase 1, provado).", "hi")
+    # estado seguro conhecido: BEFC020 + RESET (power-on volta a ligar a placa).
+    # Adotar BEFC000 como config de PRODUÇÃO é decisão à parte (receita+app).
+    if not BLE.conectado():
+        try:
+            addr = BLE.scan(alvo, timeout=10)
+            if addr:
+                BLE.connect(addr)
+        except Exception:
+            pass
     if BLE.conectado():
         BLE.cmd("AT+BEFC020", ["OK+Set"], timeout=5)
-        LOG("(BEFC020 restaurado — power-on volta a ligar a placa)", "hi")
+        try:
+            BLE.cmd("AT+RESET", ["OK+RESET"], timeout=4)
+        except Exception:
+            pass
+        LOG("(BEFC020+RESET restaurado — power-on volta a ligar a placa)", "hi")
     else:
-        LOG("⚠️ Não consegui restaurar o BEFC020 (sem conexão). A placa está com "
-            "BEFC000: no próximo ciclo de bateria ela SÓ liga ao conectar. "
-            "Reconecte e rode o teste de novo, ou me avise.", "warn")
+        LOG("⚠️ Não consegui restaurar o BEFC020 — a placa ficou com BEFC000: "
+            "cortada sempre que desconectada, religa ao conectar (app/bancada). "
+            "Rode o teste de novo p/ restaurar, ou me avise.", "warn")
     STATUS("hibernar", "ok")
     return {"ok": True, "ja_ativada": False, "modo": "remoto", "befc_corta": befc_corta}
 
