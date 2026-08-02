@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.13.0"
+#define FW_VERSION   "2.13.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -590,9 +590,14 @@ void configModuloLeve() {
         // Pino do MOSFET vem da EEPROM 914 (default 8 -> BEFC020/AFTC028, os
         // valores históricos da esteira; placas com gate no 6/7 gravam o byte).
         // ⭐ v2.13 MOSFET-AUTO (pino12/PIO2): o gate NÃO cabe nas máscaras (PIO2
-        // é inendereçável) -> config igual à placa sem mosfet: BEFC000/AFTC008.
-        // Quem corta/religa é o auto-sleep (PWRM1 acima), não o BEFC/AFTC.
-        uint16_t mMos = mosfetAuto() ? 0 : mascaraPio(g_pinMosfet);
+        // é inendereçável) — quem corta/religa é o auto-sleep (PWRM1 acima).
+        // ⭐⭐ v2.13.1 SEGURANÇA: mesmo no auto, as máscaras seguram o PIO8 ALTO
+        // (BEFC020/AFTC028). Numa placa pino-12 de verdade isso é inócuo (o
+        // pino 13 não liga em nada); numa GERAÇÃO 1 (gate em PIO real) rotulada
+        // errada como 12, é o que impede o BEFC000 de CORTAR o trilho p/ sempre
+        // (caso real: CH003FI002910, R0, morta pelo ar em 02/08 — MCU sem
+        // energia, botão morto, estalos no boot; resgate = regravar com 8).
+        uint16_t mMos = mosfetAuto() ? mascaraPio(8) : mascaraPio(g_pinMosfet);
         atMascara("AT+BEFC", mMos);                   // MOSFET=1 antes (se endereçável)
         atMascara("AT+AFTC", mMos | mascaraPio(6));   // +wake depois
     }
