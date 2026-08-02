@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.13.2"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.13.4"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.13.3"
@@ -1417,11 +1417,30 @@ def act_testar_hibernacao(serial, mcu):
     # voltou p/ trás (o MCU rebootou). E módulo que tunela o AT+DROP do MCU
     # (comum nos antigos) ganha PLANO B: liga a hibernação e deixa o próprio
     # dormir() cortar DESCONECTADO (aí o módulo interpreta AT), mesmo veredito.
-    u1, _ = _uptime_via_info()
+    u1, buf1 = _uptime_via_info()
     if u1 is None:
         LOG("✗ TST-INFO sem UPTIME — o firmware é anterior à 2.13. Regrave antes "
             "de testar a hibernação.", "err")
         STATUS("hibernar", "fail"); return False
+    # módulo surdo p/ AT vindo do MCU (caso 2910/R0): o MCU não consegue
+    # comandar DROP/PIO80 — o corte comandado tende a ser impossível nesta
+    # unidade. Avisa já; o veredito por UPTIME confirma.
+    if "MOD:SEM-AT" in (buf1 or ""):
+        LOG("⚠️ TST-INFO diz MOD:SEM-AT — o módulo desta placa é SURDO para AT "
+            "vindos do MCU. O corte comandado (G1) provavelmente NÃO funciona "
+            "aqui; o veredito por UPTIME vai confirmar.", "warn")
+    # ⚠️ millis() CONGELA no power-down: sem corte, u2 fica entre u1 e
+    # u1+decorrido (relógio parado enquanto dorme); com corte real, u2 volta p/
+    # TRÁS (~segundos desde o religamento). O veredito é "andou para trás", e
+    # p/ ser inequívoco o uptime inicial precisa de gordura (>=40s).
+    if u1 < 40:
+        LOG(f"uptime inicial baixo ({u1}s) — deixo a fechadura acumular relógio "
+            "por 40s antes do corte (veredito inequívoco).", "hi")
+        time.sleep(40)
+        u1, _ = _uptime_via_info()
+        if u1 is None:
+            LOG("✗ TST-INFO parou de responder na 2ª leitura.", "err")
+            STATUS("hibernar", "fail"); return False
     t0 = time.time()
     LOG(f"🔋 Corte comandado (TST-HIB); uptime atual = {u1}s. O veredito sai pelo "
         "UPTIME após religar — silêncio no corte é esperado.", "hi")
@@ -1476,14 +1495,21 @@ def act_testar_hibernacao(serial, mcu):
         STATUS("hibernar", "fail"); return False
     u2, _ = _uptime_via_info()
     elapsed = time.time() - t0
-    # rebootou <=> o uptime NÃO acompanhou o relógio (voltou p/ trás)
-    if u2 is not None and (u2 + 15) < (u1 + elapsed):
+    # ⭐ v2.13.4: rebootou <=> o uptime ANDOU PARA TRÁS (u2 < u1). A fórmula
+    # anterior comparava com o relógio de parede (u1+decorrido) e caía num
+    # falso-positivo: no power-down o millis() do MCU CONGELA, então uma placa
+    # que NÃO cortou (só dormiu) também fica "atrasada" vs o relógio — caso
+    # real 2910: 123s→189s em 98s ("aprovada" sem nunca ter desligado). Com o
+    # u1 mínimo de 40s garantido acima, u2<u1 só acontece com reboot real.
+    if u2 is not None and (u2 + 5) < u1:
         LOG(f"✅ CORTOU E RELIGOU de verdade: uptime {u1}s → {u2}s em {int(elapsed)}s "
-            "de teste (o MCU rebootou no meio). Ciclo corta→religa PROVADO.", "ok")
+            "de teste (o uptime voltou p/ trás = o MCU rebootou). Ciclo "
+            "corta→religa PROVADO.", "ok")
         STATUS("hibernar", "ok")
         return {"ok": True, "ja_ativada": falhou_drop}
-    LOG(f"✗ FALSO corte: uptime {u1}s → {u2}s em {int(elapsed)}s (o MCU nunca "
-        "desligou). Hibernação NÃO validada nesta placa.", "err")
+    LOG(f"✗ NÃO CORTOU: uptime {u1}s → {u2}s em {int(elapsed)}s (o uptime nunca "
+        "voltou p/ trás = o MCU nunca desligou; diferença p/ o relógio de parede "
+        "é só o millis congelado no sono). Hibernação NÃO validada nesta placa.", "err")
     BLE.cmd("TST-HIB-OFF", ["OK-HIB-OFF"], timeout=5)   # deixa em estado seguro
     LOG("(hibernação desativada — modo IDLE seguro)", "warn")
     STATUS("hibernar", "fail"); return False
@@ -1519,6 +1545,16 @@ def act_testar_hibernacao_auto(serial, mcu, espera=180):
         LOG("✗ TST-INFO sem UPTIME — o firmware desta fechadura é anterior à 2.13. "
             "Regrave com o firmware novo antes de testar a hibernação automática.", "err")
         STATUS("hibernar", "fail"); return False
+    # v2.13.4: mesmo racional do teste G1 — millis() congela no power-down, o
+    # veredito é "uptime voltou p/ trás"; garante gordura no u1 primeiro.
+    if u1 < 40:
+        LOG(f"uptime inicial baixo ({u1}s) — deixo acumular 40s de relógio antes "
+            "do teste (veredito inequívoco).", "hi")
+        time.sleep(40)
+        u1, _ = _uptime_via_info()
+        if u1 is None:
+            LOG("✗ TST-INFO parou de responder na 2ª leitura.", "err")
+            STATUS("hibernar", "fail"); return False
     LOG(f"🔋 MOSFET-AUTO: uptime atual = {u1}s. Vou DESCONECTAR e esperar {espera}s "
         "pelo auto-sleep do módulo (PWRM1) — ele deve CORTAR a placa sozinho.", "hi")
     LOG("👂 Durante a espera a fechadura deve ficar em silêncio e SEM luz; o anúncio "
@@ -1562,15 +1598,18 @@ def act_testar_hibernacao_auto(serial, mcu, espera=180):
     if u2 is None:
         LOG("⚠️ PONG ok mas TST-INFO sem UPTIME na volta — inconclusivo.", "warn")
         STATUS("hibernar", "fail"); return False
-    if u2 < min(60, espera // 2):
-        LOG(f"✅ CORTOU E RELIGOU! uptime {u1}s → {u2}s após {espera}s de espera: o MCU "
-            "REBOOTOU no meio (a placa ficou sem energia e religou na conexão). A "
-            "hibernação automática (PWRM1) está ATIVA por hardware — nada a ativar.", "ok")
+    # v2.13.4: reboot real <=> uptime voltou p/ trás (millis congela no sono —
+    # comparação com relógio de parede dava falso-positivo, caso 2910).
+    if (u2 + 5) < u1:
+        LOG(f"✅ CORTOU E RELIGOU! uptime {u1}s → {u2}s após {espera}s de espera: o "
+            "uptime voltou p/ trás = o MCU REBOOTOU (a placa ficou sem energia e "
+            "religou na conexão). A hibernação automática (PWRM1) está ATIVA por "
+            "hardware — nada a ativar.", "ok")
         STATUS("hibernar", "ok"); return True
-    LOG(f"⚠️ NÃO CORTOU: uptime {u1}s → {u2}s (≈ contínuo). Ou o auto-sleep demora mais "
-        f"que {espera}s (teste de novo com espera maior), ou o gate não está no pino 12 "
-        "desta placa, ou o PWRM1 não pegou (reprovisione). A fechadura funciona 100% — "
-        "só não está hibernando (consumo como hoje).", "warn")
+    LOG(f"⚠️ NÃO CORTOU: uptime {u1}s → {u2}s (nunca voltou p/ trás). Ou o auto-sleep "
+        f"demora mais que {espera}s (teste de novo com espera maior), ou o gate não "
+        "está no pino 12 desta placa, ou o PWRM1 não pegou (reprovisione). A fechadura "
+        "funciona 100% — só não está hibernando (consumo como hoje).", "warn")
     STATUS("hibernar", "fail"); return False
 
 
