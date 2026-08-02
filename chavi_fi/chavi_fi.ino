@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.17.0"
+#define FW_VERSION   "2.17.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -156,6 +156,8 @@
 // forçando o fim de curso e a próxima abertura pode travar). O legado usa
 // timeToLineUP=1000ms; aqui é ajustável. 0 = sem recuo.
 #define MOTOR_RECUO_MS   900
+#define MOTOR_RECUO_ABORT_MS 250   // recuo curto quando o giro abortou por queda
+                                   // de trilho (alivia o came sem afundar de novo)
 #define MOTOR_TST_MS 450       // pulso curto do motor no TESTE de bancada
                                // (menos energia de stall -> menos brownout)
 #define JANELA_MS    20000     // ocioso E desconectado: dorme após isso
@@ -427,7 +429,15 @@ void motorGira(bool sentidoA) {
     //    giro afundaria de novo) e dá um tempo p/ a bateria se recuperar — o
     //    que importa agora é concluir o comando (status + melodia) sem morrer.
     if (g_motorAbortouVcc) {
-        delay(400);
+        // Trilho afundou: espera a bateria se recuperar e, SE ela voltar a um
+        // nível saudável, faz um recuo CURTO. Pular o recuo por completo era
+        // elétricamente seguro mas deixava o came pressionando o fim de curso
+        // (próxima abertura dura); um pulso curto alivia sem afundar de novo.
+        delay(600);
+        uint16_t v = lerVccMv();
+        if (v == 0 || v >= VCC_MOTOR_MIN_MV) {
+            motorGiraMs(!sentidoA, MOTOR_RECUO_ABORT_MS);
+        }
     } else if (MOTOR_RECUO_MS > 0) {
         delay(80);
         motorGiraMs(!sentidoA, MOTOR_RECUO_MS);
