@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.13.1"
+#define FW_VERSION   "2.13.3"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -193,6 +193,12 @@
 // 916: QUEIMADO — foi a "variante sem MOSFET" (v2.11.0, removida na v2.11.1:
 // provado em bancada+app que a placa sem MOSFET funciona com a config NORMAL,
 // pois o MCU dela é sempre alimentado). Não reusar o byte sem apagar a frota.
+#define EE_PROV_TENT    917    // ⭐ v2.13.3: tentativas de provisionamento pesado
+                               // (anti-loop-de-suicídio: nas placas com mosfet, o
+                               // AT+RESET do provisionamento reinicia o módulo,
+                               // os PIOs caem no boot dele e o gate CORTA o
+                               // próprio MCU -> boot -> provisiona -> corta...
+                               // bipe agudo a cada ~2s. Teto de 3 tentativas.)
 
 // ---- família do módulo BLE (identificada pelo AT+VERS? — manuais Soft) ----
 #define FAM_DESCONHECIDA 0
@@ -577,18 +583,18 @@ void configModuloLeve() {
         at("AT+PIO81"); at("AT+PIO91");
         at("AT+BEFCFF7");
         at("AT+AFTCFFF");
-    } else if (g_hiberna) {
-        // HIBERNAÇÃO (receita do FI_1_5_400 de produção): o PIO do MOSFET NÃO é
-        // forçado alto -> o AT+PIOx0 do dormir() consegue CORTAR o trilho.
-        //   BEFC 000        = tudo baixo antes da conexão (MCU desligado no repouso)
-        //   AFTC mask(PIO6) = PIO6 alto depois -> borda de wake que religa o MCU
-        atMascara("AT+BEFC", 0);
-        atMascara("AT+AFTC", mascaraPio(6));
     } else {
-        // MODO NORMAL (IDLE): MOSFET SEMPRE ligado (antes e depois da conexão),
-        // MCU nunca desliga — comunicação robusta, mais bateria. Config do AT.py.
-        // Pino do MOSFET vem da EEPROM 914 (default 8 -> BEFC020/AFTC028, os
-        // valores históricos da esteira; placas com gate no 6/7 gravam o byte).
+        // MODO NORMAL *E* HIBERNAÇÃO G1 — MESMAS máscaras (⭐ v2.13.3):
+        //   BEFC mask(gate) = gate ALTO no power-on/pré-conexão -> ciclo de
+        //                     bateria e desconexão RELIGAM a placa;
+        //   AFTC mask(gate)|mask(6) = conexão religa o trilho E acorda o MCU.
+        // É o ciclo comprovado da frota _400 de produção: a hibernação G1
+        // difere só no dormir() — corte explícito AT+PIOx0, que persiste até o
+        // próximo evento (conexão/power-on religa e o MCU corta de novo após a
+        // janela ociosa).
+        // ⚠️ A config antiga da hibernação (BEFC000/AFTC008, até v2.13.2) era um
+        // CAMINHO DE TIJOLO: sem o bit do gate no AFTC, após o corte nem a
+        // CONEXÃO nem o ciclo de bateria religavam — só o cabo USBasp.
         // ⭐ v2.13 MOSFET-AUTO (pino12/PIO2): o gate NÃO cabe nas máscaras (PIO2
         // é inendereçável) — quem corta/religa é o auto-sleep (PWRM1 acima).
         // ⭐⭐ v2.13.1 SEGURANÇA: mesmo no auto, as máscaras seguram o PIO8 ALTO
@@ -1387,11 +1393,25 @@ void setup() {
     } else {
         configModuloLeve();                        // caminho rápido: 9600 direto
         moduloOk = (bleIdentificar() != 0);
-        for (uint8_t t = 0; !moduloOk && t < 2 && digitalRead(PIN_WAKE) == LOW; t++) {
+        // ⭐ v2.13.3 ANTI-LOOP-DE-SUICÍDIO (caso 2910): o sweep pesado manda
+        // AT+RESET — nas placas com mosfet o reboot do módulo derruba o gate e
+        // CORTA o MCU no meio, que reboota e re-provisiona p/ sempre (bipe
+        // agudo a cada ~2s; conectar pausa porque o provisionamento é adiado).
+        // Regra: sweep SÓ se nunca provisionou (flag EE_MOD_CFG) e no máximo 3
+        // tentativas (EE_PROV_TENT, zerado pelo seed.bin e no sucesso). Depois
+        // disso o boot fica na config leve (sem reset — segura p/ o gate);
+        // conserto adicional é pelo ar (bancada), que não depende do MCU.
+        bool jaProv = (EEPROM.read(EE_MOD_CFG) == MOD_CFG_MAGIC);
+        uint8_t tent = EEPROM.read(EE_PROV_TENT);
+        if (tent == 0xFF) tent = 0;                // EEPROM virgem
+        for (uint8_t t = 0; !moduloOk && !jaProv && tent < 3 && t < 2 &&
+                            digitalRead(PIN_WAKE) == LOW; t++) {
+            EEPROM.update(EE_PROV_TENT, ++tent);   // conta ANTES (pode morrer no reset)
             DBG(F("[boot] 9600 falhou - sweep passada ")); DBGLN(t + 1);
             bleProvisionar();                      // converte de qualquer baud -> 9600
             moduloOk = (bleIdentificar() != 0);
         }
+        if (moduloOk) EEPROM.update(EE_PROV_TENT, 0);
     }
     // Verifica o módulo com RETRY p/ NÃO dar 4 beeps à toa: logo após o
     // provisionamento (AT+RESET) o módulo fica grogue e não responde AT+VERS? na
