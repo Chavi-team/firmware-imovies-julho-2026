@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.20.0"
+#define FW_VERSION   "2.21.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -264,6 +264,7 @@ volatile bool acordouBLE = false, acordouBtn = false;
 bool moduloOk = false;
 bool g_wakeHib = false;        // este boot foi um "acordar da hibernação"
 bool g_hiberna = false;        // HIBERNAÇÃO por corte de MOSFET ligada (EE_HIBERNA)
+uint8_t g_atOk = 2;             // 2=não testado · 1=módulo respondeu ao MCU · 0=mudo
 uint16_t g_vccMinGiro = 0;       // menor VCC visto no último giro (mV)
 bool g_motorAbortouVcc = false;  // giro parou por queda de trilho (v2.17)
 uint16_t lerVccMv();             // (definida antes do setup)
@@ -482,9 +483,21 @@ void at(const char* c, uint16_t w = 150) {
     // (visto na bancada: "⟵ AT", "⟵ AT+NAME003FI002734" + lixo). AT é só p/
     // config, que só roda DESCONECTADO. Conectado, não manda nada.
     if (digitalRead(PIN_WAKE) == HIGH) return;
-    bluetooth.print(c);
+    // ⭐⭐ v2.21 — RESILIENTE AO DESPERTAR (a razão de o corte pelo firmware
+    // nunca pegar). Com AT+PWRM1 o módulo DORME quando ocioso e é acordado pelo
+    // primeiro dado da UART (só funciona em AT+BAUD0/2400-slow, manual §22) —
+    // mas ESSE primeiro byte se PERDE no despertar. O código já sabia disso em
+    // outro ponto (bleVivo manda "AT" 4× "porque o 1º só acorda"), mas aqui
+    // cada comando ia UMA vez: o AT+DROP era engolido e a sequência do corte
+    // saía torta. Agora: um '\r' de sacrifício acorda, pausa curta, e o comando
+    // vai DUAS vezes (repetir um AT de config/PIO é inócuo — mesmo resultado).
     bluetooth.print('\r');
-    delay(w);
+    delay(12);                       // tempo do módulo despertar
+    for (uint8_t t = 0; t < 2; t++) {
+        bluetooth.print(c);
+        bluetooth.print('\r');
+        delay(t == 0 ? 25 : w);      // 1ª rápida, 2ª com a espera pedida
+    }
     while (bluetooth.available()) bluetooth.read();
 }
 
@@ -1092,6 +1105,9 @@ void enviaInfo() {
       snprintf_P(buf, sizeof(buf), PSTR("CUTS:%u"), ct);    enviaLinha(buf); }
     snprintf_P(buf, sizeof(buf), PSTR("VCC:%u"), lerVccMv());       enviaLinha(buf);
     snprintf_P(buf, sizeof(buf), PSTR("VCCMIN:%u"), g_vccMinGiro);  enviaLinha(buf);
+    // ATOK: o módulo respondeu ao MCU na última tentativa de corte (medido
+    // DESCONECTADO, que é a condição real). 2 = ainda não houve tentativa.
+    snprintf_P(buf, sizeof(buf), PSTR("ATOK:%u"), g_atOk);          enviaLinha(buf);
     enviaLinha("VER:" FW_VERSION);
     enviaLinha("FIM-INFO");
 }
@@ -1382,7 +1398,8 @@ void dormir() {
         { uint16_t c; EEPROM.get(EE_CUTS, c); if (c == 0xFFFF) c = 0;
           c++; EEPROM.put(EE_CUTS, c); }        // telemetria: tentei cortar
         at("AT+DROP", 200);
-        delay(400);               // o re-apply do BEFC da desconexão acontece AQUI
+        delay(120);               // curto: pausa longa deixava o módulo readormecer
+                                  // (o re-apply do BEFC da desconexão acontece aqui)
         at("AT+PIO60", 100);      // arma a borda de wake (PIO6 baixo)
         char pio[12];             // corta pelo PIO do MOSFET (EEPROM 914, default 8)
         snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
