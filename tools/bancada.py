@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.19.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.20.0"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.19.0"
@@ -168,10 +168,15 @@ def seeds_de(serial):
     return [get_seed(serial, k) for k in range(1, 5)]
 
 
-# BEFC/AFTC a partir do pino do MOSFET (idêntico ao AT.py do dev): o gate do
-# MOSFET (alimenta periféricos/MCU) fica ALTO antes e depois da conexão; o PIO6
-# (wake) fica BAIXO antes e ALTO depois -> a borda que acorda o MCU.
-#   pino MOSFET 8 -> BEFC020 / AFTC028  (90% das FIs). Campo configurável.
+# ⭐⭐ v2.20 — BEFC do gate = 0 (CORTE PERSISTENTE). PROVADO em bancada 02/08:
+# o módulo RE-APLICA o estado "pré-conexão" (BEFC) algumas dezenas de segundos
+# depois de a conexão cair. Com BEFC020 (gate alto) isso RELIGAVA a placa
+# sozinha (~40s depois do corte, medido) e a economia sumia. Com BEFC000 o
+# mesmo mecanismo MANTÉM o gate baixo: a placa fica desligada até a próxima
+# CONEXÃO, que a religa pelo AFTC (medido: 60s cortada, uptime 4s ao voltar).
+#   AFTC continua com o gate + PIO6 (wake): pino 8 -> AFTC028.
+# ⚠️ Efeito colateral aceito: ao COLOCAR A BATERIA a placa nasce desligada e só
+# acorda na 1ª conexão do app (sem melodia de boot). É o preço do corte real.
 def calcular_hex_befc_aftc(mosfet_pin):
     try:
         m_pin = int(mosfet_pin)
@@ -182,12 +187,11 @@ def calcular_hex_befc_aftc(mosfet_pin):
         # rotulada errada como 12 — o BEFC000 da v2.13.0 CORTAVA o trilho dessas
         # placas p/ sempre; caso real CH003FI002910/R0 em 02/08).
         if m_pin == 12:
-            return "020", "028"
+            return "000", "008"
         mosfet_bit = m_pin - 3          # PIO3 = bit0
         bits_befc = [0] * 12
         bits_aftc = [0] * 12
         if 0 <= mosfet_bit < 12:
-            bits_befc[mosfet_bit] = 1
             bits_aftc[mosfet_bit] = 1
         bits_befc[3] = 0                # PIO6 (wake) BAIXO antes da conexão
         bits_aftc[3] = 1                # PIO6 ALTO depois -> borda de wake
