@@ -80,10 +80,10 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.15.2"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.15.3"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.15.0"
+FIRMWARE_VERSION = "2.15.1"
 VERSION_DATE = "2026-08-02"               # data desta versão (ISO; bump a cada release)
 VERSION_NOTES = "Bancada v2.13.0 (MOSFET automático): suporte às placas v2.7/retrofit 2024 com gate no pino FÍSICO 12 do módulo = PIO2/VCC-EEPROM (inendereçável por AT — descoberta 31/07 via esquemático+manuais) · pino MOSFET aceita 12 na UI/seed.bin · provisionamento pelo ar e firmware usam AT+PWRM1 nessas placas (módulo ocioso dorme -> PIO2 cai -> corta a placa; conexão BLE religa; ~0,65mA ocioso) · teste de hibernação novo por UPTIME (TST-INFO) — prova corte+religa sem comando de corte · firmware v2.13.0 (mosfetAuto: PWRM1, BEFC000/AFTC008, boot-de-wake por PD3 alto, MOSFET:12-AUTO e UPTIME no TST-INFO)"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
@@ -1014,17 +1014,18 @@ def receita_ar(alvo, mosfet_pin):
     #   ADTY0   = anúncio conectável (ADTY errado = conserto pelo ar impossível)
     # NÃO mandar pelo ar: AT+PIO60 (derrubaria o PD3 no meio da sessão) e
     # AT+RENEW (proibido — apaga BEFC/AFTC = mata placa com mosfet).
-    auto = str(mosfet_pin).strip() == "12"
     # (sem AT+MODE2: o 5.2 rev05 responde ERRO+CMD_N_PERMITIDO pelo ar —
     # mudança de modo é bloqueada remotamente por segurança; MODE2 já é o
     # padrão de fábrica dos dois módulos.)
+    # ⭐ v2.15.3: AT+PWRM1 final para TODAS as placas (não só pino-12) — igual
+    # à esteira legada (at.js mandava PWRM1 p/ toda a frota). Mata o BACKFEED
+    # (módulo sempre acordado alimenta de forma parasita o MCU de uma placa
+    # cortada pelo TX da UART = bipe em loop a cada ~1s, caso real 2910) e
+    # corta o consumo do rádio pela metade (1,5 -> 0,65mA).
     cmds = ["AT+PWRM0", "AT+VERS?", "AT+SHIELD1", "AT+BAUD2",
             "AT+ROLE0", "AT+IMME0", "AT+ADTY0", "AT+TYPE0", "AT+DELI3",
             "AT+NOTI1", "AT+ADVI2", f"AT+BEFC{befc}", f"AT+AFTC{aftc}",
-            f"AT+NAME{alvo}"]
-    if auto:
-        cmds.append("AT+PWRM1")
-    cmds.append("AT+RESET")
+            f"AT+NAME{alvo}", "AT+PWRM1", "AT+RESET"]
     return cmds
 
 

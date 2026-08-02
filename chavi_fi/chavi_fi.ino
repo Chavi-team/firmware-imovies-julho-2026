@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.15.0"
+#define FW_VERSION   "2.15.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -531,21 +531,21 @@ void configModuloLeve() {
     if (!placa10 && digitalRead(PIN_WAKE) == HIGH) {
         DBGLN(F("[cfg] conectado - pula config")); return;
     }
-    // ⭐ AT+PWRM0 = auto-sleep do módulo DESLIGADO (manual pág.39). O firmware
-    // ANTIGO mandava PWRM1 achando que DESLIGAVA o sleep — mas PWRM1 LIGA. Com o
-    // sleep ligado o módulo cochilava e o 1º byte de cada troca só o acordava e
-    // se PERDIA: no boot o AT sumia (4 bipes graves = "mudo") e na operação o
-    // "P" do "PONG" sumia (app recebia "ONG" != "PONG" -> sem PONG p/ sempre).
-    // PWRM0 mantém o módulo sempre acordado e responsivo. O MCU continua dormindo
-    // (powerDown) — a economia real de bateria está nele, não no módulo.
-    // ⭐⭐ v2.13 EXCEÇÃO — MOSFET-AUTO (pino12/PIO2): aqui é o CONTRÁRIO de
-    // propósito. AT+PWRM1 liga o auto-sleep: módulo ocioso dorme -> PIO2 cai ->
-    // o MOSFET corta a PLACA INTEIRA (MCU incluso; ocioso ~0,65mA = só o módulo
-    // anunciando). A conexão BLE acorda o módulo -> PIO2 sobe -> a placa religa
-    // e o MCU dá boot frio (caminho rápido no setup). O risco de "1º byte
-    // perdido" do PWRM1 não se aplica: quando o módulo dorme o MCU está MORTO —
-    // nunca há MCU falando com módulo dormindo.
-    at(mosfetAuto() ? "AT+PWRM1" : "AT+PWRM0");
+    // ⭐⭐ v2.15.1: AT+PWRM1 SEMPRE (auto-sleep do módulo LIGADO) — reversão
+    // consciente do PWRM0 da v2.9.12, por três motivos (02/08):
+    // (1) BACKFEED: com o módulo sempre acordado (PWRM0), o TX da UART dele
+    //     fica em 3,3V e ALIMENTA DE FORMA PARASITA o MCU de uma placa com
+    //     mosfet CORTADA -> tentativas de boot fracas em loop (bipe a cada
+    //     ~1s, caso real 2910). Com PWRM1 o módulo ocioso dorme, solta o TX
+    //     -> corte limpo e silencioso.
+    // (2) É a config da ESTEIRA DE PRODUÇÃO legada (at.js mandava PWRM1 p/
+    //     toda a frota — anos de campo).
+    // (3) Módulo dormindo = 0,65mA vs 1,5mA — metade do consumo de rádio.
+    // O custo histórico do PWRM1 (1º byte perdido no diálogo MCU->módulo a
+    // 9600, "ONG" sem o P etc.) perdeu relevância: a BANCADA é a dona da
+    // config pelo ar (v2.14) e a conexão BLE acorda o módulo antes de
+    // qualquer dado do app. No pino-12/auto o PWRM1 já era o próprio corte.
+    at("AT+PWRM1");
     at("AT+TYPE0");    // sem pareamento (TYPE1 residual = pede PIN em toda conexão)
     // NOME reafirmado a CADA boot (como o changeName do FI_1_5), ANTES do MODE2.
     // ⭐ v2.10 AUTO-CURA: escreve, LÊ DE VOLTA (AT+NAME?) e compara — se a UART
