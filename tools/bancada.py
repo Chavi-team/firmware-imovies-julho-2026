@@ -80,10 +80,10 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.14.1"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.15.0"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.14.1"
+FIRMWARE_VERSION = "2.15.0"
 VERSION_DATE = "2026-08-02"               # data desta versão (ISO; bump a cada release)
 VERSION_NOTES = "Bancada v2.13.0 (MOSFET automático): suporte às placas v2.7/retrofit 2024 com gate no pino FÍSICO 12 do módulo = PIO2/VCC-EEPROM (inendereçável por AT — descoberta 31/07 via esquemático+manuais) · pino MOSFET aceita 12 na UI/seed.bin · provisionamento pelo ar e firmware usam AT+PWRM1 nessas placas (módulo ocioso dorme -> PIO2 cai -> corta a placa; conexão BLE religa; ~0,65mA ocioso) · teste de hibernação novo por UPTIME (TST-INFO) — prova corte+religa sem comando de corte · firmware v2.13.0 (mosfetAuto: PWRM1, BEFC000/AFTC008, boot-de-wake por PD3 alto, MOSFET:12-AUTO e UPTIME no TST-INFO)"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
@@ -1602,8 +1602,14 @@ def act_testar_hibernacao(serial, mcu, mosfet="8"):
     # pela conexão (AFTC). É o mesmo caminho que o APP usará em produção.
     sem_at = "MOD:SEM-AT" in (buf1 or "")
     if sem_at:
-        LOG("⚠️ MOD:SEM-AT — módulo surdo p/ AT do MCU. Indo direto ao PLANO C: "
-            "corte REMOTO pelo ar (o mesmo caminho que o app usará).", "warn")
+        # ⭐ v2.15: NÃO pula mais direto ao plano C — o firmware 2.15 tenta o
+        # corte também a 2400 (hipótese: o parser de AT da UART dos módulos
+        # antigos é fixo em 2400, o baud da esteira legada, mesmo com dados a
+        # 9600). Se o autodesligamento funcionar, a placa ganha a camada de
+        # BACKUP (gap do app fechado); o plano C fica como último recurso.
+        LOG("⚠️ MOD:SEM-AT — módulo surdo p/ AT do MCU a 9600. O firmware 2.15 "
+            "tenta o corte também a 2400 (baud da esteira legada); se falhar, "
+            "caímos no PLANO C (corte remoto pelo ar).", "warn")
     # ⚠️ millis() CONGELA no power-down: sem corte, u2 fica entre u1 e
     # u1+decorrido (relógio parado enquanto dorme); com corte real, u2 volta p/
     # TRÁS (~segundos desde o religamento). O veredito é "andou para trás", e
@@ -1617,8 +1623,6 @@ def act_testar_hibernacao(serial, mcu, mosfet="8"):
             LOG("✗ TST-INFO parou de responder na 2ª leitura.", "err")
             STATUS("hibernar", "fail"); return False
     t0 = time.time()
-    if sem_at:
-        return _testar_corte_remoto(alvo, mosfet, u1)
     LOG(f"🔋 Corte comandado (TST-HIB); uptime atual = {u1}s. O veredito sai pelo "
         "UPTIME após religar — silêncio no corte é esperado.", "hi")
     falhou_drop = False
@@ -1686,9 +1690,14 @@ def act_testar_hibernacao(serial, mcu, mosfet="8"):
         return {"ok": True, "ja_ativada": falhou_drop}
     LOG(f"✗ NÃO CORTOU: uptime {u1}s → {u2}s em {int(elapsed)}s (o uptime nunca "
         "voltou p/ trás = o MCU nunca desligou; diferença p/ o relógio de parede "
-        "é só o millis congelado no sono). Hibernação NÃO validada nesta placa.", "err")
+        "é só o millis congelado no sono). Autodesligamento NÃO validado.", "err")
     BLE.cmd("TST-HIB-OFF", ["OK-HIB-OFF"], timeout=5)   # deixa em estado seguro
-    LOG("(hibernação desativada — modo IDLE seguro)", "warn")
+    LOG("(hibernação por firmware desativada — modo IDLE seguro)", "warn")
+    # ⭐ v2.15: ÚLTIMO RECURSO antes de desistir — PLANO C (corte remoto pelo
+    # ar, o canal que o app usa). Valida ao menos a camada principal do corte.
+    if u2 is not None and u2 >= 40:
+        LOG("Último recurso: PLANO C — corte remoto pelo ar (o canal do app).", "hi")
+        return _testar_corte_remoto(alvo, mosfet, u2)
     STATUS("hibernar", "fail"); return False
 
 

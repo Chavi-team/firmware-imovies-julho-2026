@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.14.1"
+#define FW_VERSION   "2.15.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -1042,19 +1042,44 @@ void testeBancada(const String& t) {
         delay(400);                          // a resposta sai antes do DROP
         at("AT+DROP", 500);                  // derruba a conexão -> módulo sai do túnel
         delay(500);
-        if (digitalRead(PIN_WAKE) == HIGH) { // ainda conectado -> não dá p/ cortar
-            enviaLinha("HIB-FALHOU-DROP");
-            return;
+        // ⭐ v2.15 FALLBACK A 2400 (hipótese do Leonardo, apoiada por evidência):
+        // lotes antigos de módulo (R0) só OUVEM AT do MCU no baud da esteira
+        // legada (2400), mesmo com os DADOS correndo a 9600 — a produção _400
+        // cortava a 2400 por anos, e o "loop de suicídio" provou que um
+        // AT+RESET mandado a 2400 EXECUTA num módulo surdo a 9600. Se o DROP a
+        // 9600 não derrubou, tenta a 2400; o corte segue no baud que funcionou.
+        // Só a sequência de energia desce a 2400 — dados/sonda/verbos ficam 9600.
+        bool a2400 = false;
+        if (digitalRead(PIN_WAKE) == HIGH) {
+            bluetooth.begin(2400);
+            delay(30);
+            at("AT+DROP", 400);
+            delay(500);
+            a2400 = (digitalRead(PIN_WAKE) == LOW);
+            if (!a2400) {
+                bluetooth.begin(BAUD_MODULO);   // restaura ANTES de responder
+                enviaLinha("HIB-FALHOU-DROP");
+                return;
+            }
         }
         atMascara("AT+BEFC", 0);             // ⭐ libera o gate (senão o BEFC re-liga)
         at("AT+PIO60", 200);                 // arma a borda de wake (PIO6 baixo)
         EEPROM.update(EE_HIB, 1);            // marca "desligou hibernando" p/ o wake
-        { char pio[12];                      // corta pelo PIO do MOSFET (EEPROM 914)
-          snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
-          at(pio, 60); }                     // CORTA o MOSFET -> MCU morre se cortou
+        char pio[12];                        // corta pelo PIO do MOSFET (EEPROM 914)
+        snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
+        at(pio, 60);                         // CORTA o MOSFET -> MCU morre se cortou
         delay(3000);                         // se cortou, nunca passa daqui
+        if (!a2400) {                        // 9600 vivo: última carta, corte a 2400
+            bluetooth.begin(2400);
+            delay(30);
+            at("AT+PIO60", 100);
+            at(pio, 60);
+            delay(3000);                     // se cortou a 2400, morre aqui
+            bluetooth.begin(BAUD_MODULO);
+        }
         EEPROM.update(EE_HIB, 0);
         beep(160, 400); beep(160, 400); beep(160, 400);   // 3 graves = NÃO cortou
+        if (a2400) bluetooth.begin(BAUD_MODULO);
         return;
     }
     if (t.startsWith("TST-ALL"))  {
@@ -1229,6 +1254,16 @@ void dormir() {
         snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
         at(pio, 60);              // corta o MOSFET -> MCU morre aqui se cortou
         delay(150);
+        // ⭐ v2.15 FALLBACK A 2400 (ver TST-HIB): módulos do lote legado só
+        // ouvem AT do MCU a 2400 — troca SÓ para a sequência de corte e
+        // restaura; se o módulo obedecer, o MCU morre no meio (objetivo).
+        bluetooth.begin(2400);
+        delay(30);
+        at("AT+DROP", 150);
+        at("AT+PIO60", 80);
+        at(pio, 60);              // se ouve a 2400, morre AQUI
+        delay(150);
+        bluetooth.begin(BAUD_MODULO);   // não cortou em nenhum baud: segue p/ IDLE
     }
     acordouBLE = false; acordouBtn = false;
     g_sessaoConectada = false;   // sessão encerrou -> melodia toca de novo no próximo OK+CONN
