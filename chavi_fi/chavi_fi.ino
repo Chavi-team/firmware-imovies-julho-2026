@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.15.1"
+#define FW_VERSION   "2.15.2"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -545,7 +545,12 @@ void configModuloLeve() {
     // 9600, "ONG" sem o P etc.) perdeu relevância: a BANCADA é a dona da
     // config pelo ar (v2.14) e a conexão BLE acorda o módulo antes de
     // qualquer dado do app. No pino-12/auto o PWRM1 já era o próprio corte.
-    at("AT+PWRM1");
+    at("AT+PWRM0");   // ⚠️ v2.15.2: PWRM1 REVERTIDO — a 9600 o módulo dormindo
+                      // NÃO acorda por dado na UART (manual: wake por dado só em
+                      // BAUD0/2400-slow) -> MCU nunca recebe o comando do app,
+                      // ZERO PONG (provado na 2910 11:00). PWRM0 é obrigatório
+                      // ENQUANTO o baud for 9600. O backfeed (bipe ~1s com a
+                      // placa cortada) volta a existir: ver plano 2400+PWRM1.
     at("AT+TYPE0");    // sem pareamento (TYPE1 residual = pede PIN em toda conexão)
     // NOME reafirmado a CADA boot (como o changeName do FI_1_5), ANTES do MODE2.
     // ⭐ v2.10 AUTO-CURA: escreve, LÊ DE VOLTA (AT+NAME?) e compara — se a UART
