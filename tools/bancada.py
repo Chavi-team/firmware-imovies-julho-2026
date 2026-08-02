@@ -1826,6 +1826,20 @@ PAGE = r"""<!DOCTYPE html>
     <div class="comp" id="comp"></div>
     <button class="big green" style="margin-top:12px" onclick="finalizar()">✔ FINALIZAR e iniciar a próxima</button>
 
+    <!-- ⭐ v2.13: teste de HIBERNAÇÃO visível (validação do MOSFET). Fora do
+         fluxo numerado de propósito — é teste de engenharia, sob demanda.
+         Usa o campo "Pino MOSFET" da tela 1: 12 = teste por UPTIME (auto,
+         ~3,5 min); 4..9 = teste clássico TST-HIB (corte comandado). -->
+    <div style="margin-top:18px;padding:12px;border:1px dashed var(--muted);border-radius:10px">
+      <div style="font-weight:600;margin-bottom:6px">🔋 Hibernação (mosfet) — validação</div>
+      <div style="color:var(--muted);font-size:13px;margin-bottom:10px">
+        Requer o rádio conectado (passo 1 feito). Pino MOSFET <b>12</b> (AUTO):
+        desconecta, espera ~3 min o auto-sleep cortar e reconecta conferindo o
+        <b>UPTIME</b> — acompanhe no REGISTRO e <b>não mexa na fechadura</b>
+        durante a espera. Pinos 4..9: corte comandado (TST-HIB).</div>
+      <button id="btn-hibernar" onclick="runStep('hibernar', this)">🔋 Testar hibernação</button>
+    </div>
+
     <!-- RECUPERAÇÃO: OCULTA a pedido do Leonardo (09/07/2026). Para reativar,
          descomente este bloco INTEIRO e a fiação JS dos botões (procurar por
          "RECUPERAÇÃO (botões estáticos"). O backend (/api/renomear,
