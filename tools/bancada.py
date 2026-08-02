@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.13.1"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.13.2"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.13.1"
@@ -1409,46 +1409,83 @@ def act_testar_hibernacao(serial, mcu):
         except Exception as e:
             LOG(f"✗ Erro ao conectar por BLE: {e}", "err")
             STATUS("hibernar", "fail"); return False
-    # 2) explica e pede p/ o operador OUVIR o corte + o religamento
-    LOG("🔋 Testando o ciclo da hibernação: vou CORTAR a energia do MCU pelo MOSFET "
-        "e depois verificar se ela RELIGA sozinha.", "hi")
-    LOG("👂 OUÇA a fechadura agora: ao cortar deve ficar em SILÊNCIO (cortou) e, ao "
-        "religar, deve tocar a MELODIA (Rocky). Se ficar muda pra sempre, o corte "
-        "funcionou mas o religamento não — aí é regravar pelo cabo.", "hi")
-    # 3) manda TST-HIB. OK-HIB = vai cortar (e derrubar o BLE); HIB-FALHOU-DROP =
-    #    não conseguiu nem derrubar a conexão (config/hardware).
-    ok, buf = BLE.cmd("TST-HIB", ["OK-HIB", "HIB-FALHOU-DROP"], timeout=6)
-    if "HIB-FALHOU-DROP" in buf:
-        LOG("⚠️ Não derrubou a conexão — não dá pra cortar (config/hardware).", "err")
+    # ⭐ v2.13.2: veredito por UPTIME (TST-INFO) — à prova de falso-positivo.
+    # CASO REAL (2910/R0, 02/08): o OK-HIB chegava 1s ANTES do HIB-FALHOU-DROP,
+    # a bancada retornava no OK-HIB, nunca via o FALHOU, reconectava, recebia
+    # PONG de um MCU que NUNCA desligou e declarava "religou" — e ATIVAVA a
+    # hibernação sem prova. Agora: uptime ANTES e DEPOIS; corte real = uptime
+    # voltou p/ trás (o MCU rebootou). E módulo que tunela o AT+DROP do MCU
+    # (comum nos antigos) ganha PLANO B: liga a hibernação e deixa o próprio
+    # dormir() cortar DESCONECTADO (aí o módulo interpreta AT), mesmo veredito.
+    u1, _ = _uptime_via_info()
+    if u1 is None:
+        LOG("✗ TST-INFO sem UPTIME — o firmware é anterior à 2.13. Regrave antes "
+            "de testar a hibernação.", "err")
         STATUS("hibernar", "fail"); return False
-    if not ok:
-        LOG("Não veio OK-HIB — sigo assim mesmo (a conexão pode ter caído junto com o corte).", "warn")
-    # 4) a conexão VAI CAIR (o firmware corta). Espera, limpa a sessão.
-    time.sleep(6)
-    BLE.disconnect()
-    time.sleep(2)
-    # 5) re-scan: se cortou e religou, ela reaparece anunciando
+    t0 = time.time()
+    LOG(f"🔋 Corte comandado (TST-HIB); uptime atual = {u1}s. O veredito sai pelo "
+        "UPTIME após religar — silêncio no corte é esperado.", "hi")
+    falhou_drop = False
     try:
-        addr = BLE.scan(alvo, timeout=10)
-    except Exception as e:
-        LOG(f"✗ Erro no re-scan BLE: {e}", "err")
-        STATUS("hibernar", "fail"); return False
+        ok, buf = BLE.cmd("TST-HIB", ["HIB-FALHOU-DROP"], timeout=6)
+        falhou_drop = bool(ok)          # só casa se o FALHOU chegou
+        if not ok and "OK-HIB" not in (buf or ""):
+            LOG("Sem OK-HIB — sigo (a conexão pode ter caído junto com o corte).", "warn")
+    except Exception:
+        pass                            # conexão caiu no meio = DROP funcionou
+    if falhou_drop:
+        LOG("⚠️ O módulo TUNELOU o AT+DROP (não derruba a conexão a pedido do MCU — "
+            "comum nos módulos antigos). PLANO B: ativo a hibernação e deixo o "
+            "firmware cortar SOZINHO no ocioso; veredito por UPTIME em ~90s.", "warn")
+        ok, _ = BLE.cmd("TST-HIB-ON", ["OK-HIB-ON"], timeout=5)
+        if not ok:
+            LOG("✗ Não confirmou o TST-HIB-ON do plano B.", "err")
+            STATUS("hibernar", "fail"); return False
+        BLE.disconnect()
+        time.sleep(90)                  # janela de teste (60s) + corte + folga
+    else:
+        time.sleep(6)                   # o corte vem ~1s após o OK-HIB
+        try:
+            BLE.disconnect()
+        except Exception:
+            pass
+        time.sleep(2)
+    # religa pela CONEXÃO e tira o veredito pelo UPTIME
+    addr = None
+    for _ in range(3):
+        try:
+            addr = BLE.scan(alvo, timeout=10)
+        except Exception:
+            addr = None
+        if addr:
+            break
     if not addr:
         LOG("⚠️ Não reapareceu no scan — se cortou e não religou, regrave pelo cabo.", "err")
         STATUS("hibernar", "fail"); return False
-    # 6) reconecta e confirma que o MCU está vivo (PONG)
     try:
         BLE.connect(addr)
     except Exception as e:
         LOG(f"✗ Erro ao reconectar: {e}", "err")
         STATUS("hibernar", "fail"); return False
-    ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=6)
-    if ok:
-        LOG("✅ RELIGOU e respondeu PONG! O ciclo corta→religa funciona nesta fechadura. "
-            "Se você ouviu silêncio no corte + Rocky ao religar, a hibernação é segura aqui. "
-            "Clique 'Ativar hibernação' para ligar de vez.", "ok")
-        STATUS("hibernar", "ok"); return True
-    LOG("⚠️ Reconectou mas SEM PONG — o MCU pode não ter religado. Regrave pelo cabo por segurança.", "err")
+    ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=8)
+    if not ok:
+        time.sleep(3)                   # boot frio pode estar terminando
+        ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=8)
+    if not ok:
+        LOG("⚠️ Reconectou mas SEM PONG — o MCU pode não ter religado. Regrave pelo cabo por segurança.", "err")
+        STATUS("hibernar", "fail"); return False
+    u2, _ = _uptime_via_info()
+    elapsed = time.time() - t0
+    # rebootou <=> o uptime NÃO acompanhou o relógio (voltou p/ trás)
+    if u2 is not None and (u2 + 15) < (u1 + elapsed):
+        LOG(f"✅ CORTOU E RELIGOU de verdade: uptime {u1}s → {u2}s em {int(elapsed)}s "
+            "de teste (o MCU rebootou no meio). Ciclo corta→religa PROVADO.", "ok")
+        STATUS("hibernar", "ok")
+        return {"ok": True, "ja_ativada": falhou_drop}
+    LOG(f"✗ FALSO corte: uptime {u1}s → {u2}s em {int(elapsed)}s (o MCU nunca "
+        "desligou). Hibernação NÃO validada nesta placa.", "err")
+    BLE.cmd("TST-HIB-OFF", ["OK-HIB-OFF"], timeout=5)   # deixa em estado seguro
+    LOG("(hibernação desativada — modo IDLE seguro)", "warn")
     STATUS("hibernar", "fail"); return False
 
 
@@ -1575,12 +1612,14 @@ def act_hibernar_seguro(serial, mcu, mosfet="8"):
                 "confira o pino do gate.", "warn")
             STATUS("hibernar", "ok")   # decisão segura tomada
         return {"hibernacao": bool(ok)}
-    if not act_testar_hibernacao(serial, mcu):
+    r = act_testar_hibernacao(serial, mcu)
+    if not r:
         LOG("⚠️ Hibernação NÃO validada nesta fechadura — mantida DESLIGADA (IDLE "
             "seguro). A fechadura está pronta e funciona 100%; apenas não hiberna.", "warn")
         STATUS("hibernar", "ok")   # o passo cumpriu seu papel: decisão segura tomada
         return {"hibernacao": False}
-    on = act_ativar_hibernacao(serial, mcu)
+    # plano B do teste já ativou (TST-HIB-ON) — não repetir
+    on = True if (isinstance(r, dict) and r.get("ja_ativada")) else act_ativar_hibernacao(serial, mcu)
     if on:
         LOG("✅ Hibernação ATIVADA e validada (corta→religa OK).", "ok")
     else:
