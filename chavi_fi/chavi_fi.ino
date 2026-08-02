@@ -83,7 +83,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.16.2"
+#define FW_VERSION   "2.16.3"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -1448,10 +1448,25 @@ void setup() {
     //     verifica. ~3s. É o caso do campo (reset -> módulo volta a 9600).
     //  2) SÓ se falhar -> conversão pesada (sweep), no MÁXIMO 2 passadas.
     // Se PD3 estiver alto (app já conectado), nem tenta (vazaria) — adia.
-    if (digitalRead(PIN_WAKE) == HIGH) {
+    // ⭐⭐ v2.16.3 — BOOT SILENCIOSO EM PLACA JÁ PROVISIONADA (fim do loop
+    // parasita, que virou F07 em campo). O MCU NÃO fala mais com o módulo no
+    // boot quando a flag EE_MOD_CFG está marcada (a BANCADA é a dona da config
+    // desde a v2.14 e a NVM do módulo guarda tudo entre ciclos de bateria).
+    // PORQUÊ: com a placa cortada, o TX do módulo alimenta o MCU de forma
+    // parasita; ele boota fraco e — ao mandar a dúzia de AT da "auto-cura" —
+    // ACORDA o módulo, que mantém o TX alto: o ciclo nunca terminava (bipes,
+    // primeiro acionamento degradado, F07). O firmware LEGADO não sofria disso
+    // justamente porque só configurava o módulo no 1º boot.
+    // Placa NÃO provisionada (gravação manual, sem bancada) mantém o
+    // comportamento antigo: config + identificação + sweep.
+    bool jaProvisionada = (EEPROM.read(EE_MOD_CFG) == MOD_CFG_MAGIC);
+    if (jaProvisionada) {
+        moduloOk = true;                           // config vive na NVM do módulo
+        DBGLN(F("[boot] ja provisionada - boot silencioso (sem AT)"));
+    } else if (digitalRead(PIN_WAKE) == HIGH) {
         DBGLN(F("[boot] conectado - provisionamento adiado"));
     } else {
-        configModuloLeve();                        // caminho rápido: 9600 direto
+        configModuloLeve();                        // caminho rápido
         moduloOk = (bleIdentificar() != 0);
         // ⭐ v2.13.3 ANTI-LOOP-DE-SUICÍDIO (caso 2910): o sweep pesado manda
         // AT+RESET — nas placas com mosfet o reboot do módulo derruba o gate e
