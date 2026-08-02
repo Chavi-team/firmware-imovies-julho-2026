@@ -46,7 +46,12 @@ from bleak import BleakClient, BleakScanner
 
 FFE1 = "0000ffe1-0000-1000-8000-00805f9b34fb"
 REPOUSOS = [("curto", 5), ("medio", 25), ("longo", 70)]
-PROBE_TETO = 25.0
+# ⭐ modo DORMIR (3º argumento "dormir"): repousos longos o bastante para o
+# AUTO-SLEEP DO MÓDULO agir e cortar a energia da placa. O soak normal (5-70s)
+# NUNCA deixa o módulo adormecer, e por isso media a fechadura sempre ligada —
+# BOOTS ficava 0 e parecia que o corte não existia (02/08).
+REPOUSOS_DORMIR = [("longo", 90), ("dorme", 300), ("dorme2", 420)]
+PROBE_TETO = 25.0        # o app desiste em 2,5s (ver nota de fidelidade)
 CONF_TETO = 25.0
 
 
@@ -150,6 +155,11 @@ async def main():
         raise SystemExit(1)
     alvo = sys.argv[1].strip().upper()
     minutos = float(sys.argv[2]) if len(sys.argv) > 2 else 40.0
+    modo_dormir = len(sys.argv) > 3 and sys.argv[3].startswith("dorm")
+    repousos = REPOUSOS_DORMIR if modo_dormir else REPOUSOS
+    if modo_dormir:
+        print("modo DORMIR: repousos de 90/300/420s (dá tempo do módulo "
+              "adormecer e CORTAR a energia da placa)")
     rnd = random.Random(20260802)          # sequência reproduzível
 
     csv_path = f"soak_{alvo}_{datetime.now().strftime('%H%M')}.csv"
@@ -180,7 +190,7 @@ async def main():
     linhas, n = [], 0
     while time.monotonic() < fim:
         n += 1
-        nome, espera = rnd.choice(REPOUSOS)
+        nome, espera = rnd.choice(repousos)
         verbo = "ABRIR" if n % 2 else "FECHAR"
         rajada = (n % 5 == 0)
         print(f"\n[{n}] {verbo}{' +RAJADA' if rajada else ''} "
