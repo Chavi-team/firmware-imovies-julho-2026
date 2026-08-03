@@ -84,8 +84,8 @@ BANCADA_VERSION = "2.22.0"                # versão desta bancada (bump a cada r
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.21.0"
-VERSION_DATE = "2026-08-02"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.13.0 (MOSFET automático): suporte às placas v2.7/retrofit 2024 com gate no pino FÍSICO 12 do módulo = PIO2/VCC-EEPROM (inendereçável por AT — descoberta 31/07 via esquemático+manuais) · pino MOSFET aceita 12 na UI/seed.bin · provisionamento pelo ar e firmware usam AT+PWRM1 nessas placas (módulo ocioso dorme -> PIO2 cai -> corta a placa; conexão BLE religa; ~0,65mA ocioso) · teste de hibernação novo por UPTIME (TST-INFO) — prova corte+religa sem comando de corte · firmware v2.13.0 (mosfetAuto: PWRM1, BEFC000/AFTC008, boot-de-wake por PD3 alto, MOSFET:12-AUTO e UPTIME no TST-INFO)"
+VERSION_DATE = "2026-08-03"               # data desta versão (ISO; bump a cada release)
+VERSION_NOTES = "Bancada v2.22.0: campo do pino MOSFET vira SELECT (8=placa 1.5 · 12=v2.7/retrofit 2024 via PIO2/VCC-EEPROM com AT+PWRM1) · AT+UART1 entra na receita de provisionamento · teste de hibernação oculto da UI (endpoints vivos) · at() resiliente ao DESPERTAR do módulo + diagnóstico ATOK (v2.21) · soak_test interpreta brown-out esperado do corte por MOSFET · firmware v2.21.0 embutido (apaga LEDs antes de perder energia; espera pela ENERGIA REAL no boot — fim do loop parasita)"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
