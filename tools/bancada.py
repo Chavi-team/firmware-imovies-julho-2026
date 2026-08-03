@@ -80,12 +80,12 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.22.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.23.0"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.21.0"
 VERSION_DATE = "2026-08-03"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.22.0: campo do pino MOSFET vira SELECT (8=placa 1.5 · 12=v2.7/retrofit 2024 via PIO2/VCC-EEPROM com AT+PWRM1) · AT+UART1 entra na receita de provisionamento · teste de hibernação oculto da UI (endpoints vivos) · at() resiliente ao DESPERTAR do módulo + diagnóstico ATOK (v2.21) · soak_test interpreta brown-out esperado do corte por MOSFET · firmware v2.21.0 embutido (apaga LEDs antes de perder energia; espera pela ENERGIA REAL no boot — fim do loop parasita)"
+VERSION_NOTES = "Bancada v2.23.0: passo 3 CERTIFICAR (burn-in de 8 ciclos reais ABRIR/FECHAR com reconexão fria e repouso sorteado — reprova defeito intermitente antes do campo) ·  campo do pino MOSFET vira SELECT (8=placa 1.5 · 12=v2.7/retrofit 2024 via PIO2/VCC-EEPROM com AT+PWRM1) · AT+UART1 entra na receita de provisionamento · teste de hibernação oculto da UI (endpoints vivos) · at() resiliente ao DESPERTAR do módulo + diagnóstico ATOK (v2.21) · soak_test interpreta brown-out esperado do corte por MOSFET · firmware v2.21.0 embutido (apaga LEDs antes de perder energia; espera pela ENERGIA REAL no boot — fim do loop parasita)"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -1291,6 +1291,72 @@ def act_autoteste(serial, mcu):
     LOG("✗ Auto-teste com falha(s).", "err"); STATUS("autoteste", "fail"); return False
 
 
+def act_certificar(serial, mcu, ciclos=8):
+    """Burn-in de APROVAÇÃO antes do campo: N ciclos REAIS de acionamento
+    (ABRIR/FECHAR alternados) com reconexão fria e repouso sorteado entre os
+    ciclos — o pior-caso de uso condensado, como o app faria. Critério duro:
+    TODO ciclo precisa de PONG + 2 confirmações (chegada do comando e fim do
+    giro). Qualquer falha REPROVA a unidade — é exatamente o defeito
+    intermitente (UART marginal, módulo surdo, motor fraco) que hoje só
+    aparece na casa do cliente."""
+    STATUS("certificar", "run")
+    alvo = serial[2:] if serial.startswith("CH") else serial
+    import random as _rnd
+    falhas, bats = [], []
+    LOG(f"🏋️ CERTIFICAR: {ciclos} ciclos reais de acionamento (burn-in ~5 min). "
+        "Deixe a fechadura parada e NÃO conecte o app do celular.", "hi")
+    for i in range(1, ciclos + 1):
+        verbo = "ABRIR" if i % 2 == 1 else "FECHAR"
+        # Reconexão FRIA a cada ciclo — replica o app (e exercita o religamento
+        # nas placas com corte por mosfet).
+        if BLE.conectado():
+            BLE.disconnect()
+            time.sleep(1.0)
+        if i > 1:
+            repouso = _rnd.choice([3, 8, 15])
+            LOG(f"  ciclo {i}/{ciclos}: repouso de {repouso}s…")
+            time.sleep(repouso)
+        try:
+            addr = BLE.scan(alvo, timeout=8.0)
+            if not addr:
+                falhas.append((i, "não apareceu no scan"))
+                LOG(f"  ✗ ciclo {i}: fechadura fora do ar", "err"); continue
+            BLE.connect(addr)
+        except Exception as e:
+            falhas.append((i, f"conexão: {e}"))
+            LOG(f"  ✗ ciclo {i}: erro de conexão ({e})", "err"); continue
+        ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=6)
+        if not ok:
+            falhas.append((i, "sem PONG"))
+            LOG(f"  ✗ ciclo {i}: conectou mas sem PONG", "err"); continue
+        # Verbo + 2 confirmações: o alvo impossível nunca casa — o cmd roda o
+        # teto inteiro acumulando o buffer, e o veredito sai da contagem de
+        # confirmações "[12]0xx" (1ª = comando chegou, 2ª = motor PAROU).
+        _, buf = BLE.cmd(verbo, ["\x00nunca\x00"], timeout=18)
+        n = len(re.findall(r"[12]0\d{2}", buf))
+        m = re.findall(r"[12]0(\d\.\d\d)", buf)
+        if m:
+            try: bats.append(float(m[-1]))
+            except ValueError: pass
+        if n >= 2:
+            LOG(f"  ✓ ciclo {i}/{ciclos}: {verbo} completo (giro confirmado)", "ok")
+        elif n == 1:
+            falhas.append((i, f"{verbo}: motor não confirmou o fim do giro"))
+            LOG(f"  ✗ ciclo {i}: só 1 confirmação — o giro não concluiu", "err")
+        else:
+            falhas.append((i, f"{verbo}: sem nenhuma confirmação"))
+            LOG(f"  ✗ ciclo {i}: verbo sem confirmação", "err")
+    if bats:
+        LOG(f"  bateria durante o burn-in: {min(bats):.2f}–{max(bats):.2f}V", "hi")
+    if not falhas:
+        LOG(f"✓✓ CERTIFICADA: {ciclos}/{ciclos} ciclos perfeitos — liberada p/ campo.", "ok")
+        STATUS("certificar", "ok"); return True
+    LOG(f"✗✗ REPROVADA: {len(falhas)} falha(s) em {ciclos} ciclos — NÃO instalar em campo:", "err")
+    for c, msg in falhas:
+        LOG(f"    ciclo {c}: {msg}", "err")
+    STATUS("certificar", "fail"); return False
+
+
 def act_teste1(serial, cmd):
     """Roda UM comando de teste e devolve {ok, resp}. A confirmação FÍSICA
     (o motor girou? apitou?) é feita no navegador e cruzada com este resultado."""
@@ -2288,7 +2354,8 @@ PAGE = r"""<!DOCTYPE html>
 const PASSOS = [
   ["gravar","1 · Gravar e preparar","Grava o firmware e as seeds (cabo USBasp), valida, e já PREPARA o rádio + CONECTA por Bluetooth — tudo de uma vez. Só este passo usa o cabo."],
   ["autoteste","2 · Testar","Testa cada peça e PERGUNTA se funcionou de verdade (buzzer, LEDs, motor, bateria)."],
-  ["cadastrar","3 · Cadastrar no sistema","Registra só o serial no backend."],
+  ["certificar","3 · Certificar (burn-in)","Roda 8 ciclos REAIS de abrir/fechar pelo Bluetooth, com reconexão e repouso entre eles (~5 min). Pega defeito intermitente que o teste rápido não vê. Falhou 1 ciclo = NÃO vai a campo."],
+  ["cadastrar","4 · Cadastrar no sistema","Registra só o serial no backend."],
 ];
 // Testes com a PERGUNTA física (o firmware pode dizer OK e a peça não funcionar).
 // Ordem: os leves primeiro; os MOTORES por ÚLTIMO (puxam corrente e podem dar
@@ -2766,7 +2833,8 @@ class Handler(BaseHTTPRequestHandler):
             r = act_hibernar_seguro(serial, mcu, b.get("mosfet", "8"))
             return {"ok": True, "hibernacao": bool(r and r.get("hibernacao"))}
         fn = {"gravar": act_gravar, "validar": act_validar, "conectar": act_conectar,
-              "autoteste": act_autoteste, "cadastrar": act_cadastrar,
+              "autoteste": act_autoteste, "certificar": act_certificar,
+              "cadastrar": act_cadastrar,
               "hib-on": act_ativar_hibernacao,
               "hib-off": act_desativar_hibernacao}.get(step)
         if not fn:
