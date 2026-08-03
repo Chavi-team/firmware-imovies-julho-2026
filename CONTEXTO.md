@@ -1137,3 +1137,43 @@ semântica no fio e depende do invariante CAL:0 na frota inteira.
 - ⚠️ NUNCA soltar o app com formato novo antes do firmware que o entende: o
   parser em campo é startsWith("ABRIR") → "ABRIR+1" viraria ABRIR fixo e
   portas ANTIHORÁRIAS girariam ao contrário, em silêncio.
+
+## v2.13.0 (31/07/2026) — MOSFET AUTOMÁTICO (pino físico 12 = PIO2): a solução da hibernação
+> Obs.: o "PLANO v2.13" acima (verbos ABRIR-H/-A) segue válido porém RENUMERADO para v2.14 —
+> este release tomou o número por urgência da descoberta de hardware.
+
+**Descoberta (31/07, esquemático "SCH_FI - Placa Principal v2.7_2024-08-16" + "Chave_MOSFET_CanalN"
++ manuais em `manual/`):** nas placas v2.7 (e no retrofit padrão 2024 — plaquinha GDSS no cabo da
+bateria), a chave é low-side no NEGATIVO da bateria (PJ2306, gate com pull-down 10k = desligada por
+padrão), o MÓDULO BLE é alimentado DIRETO da bateria (fora da chave) e o gate liga no **pino FÍSICO
+12 do módulo = PIO2**, que o manual do 1010 documenta como **"VCC da EEPROM"** do próprio módulo.
+PIO2 NÃO existe nos comandos AT (AT+PIO = PIO3..11; BEFC/AFTC = 9 bits 000..1FF) → o corte NUNCA
+foi comandável: **o gate segue o estado do módulo** (acordado = placa ligada; auto-sleep = placa
+cortada). Como mandamos AT+PWRM0 em tudo, o módulo nunca dorme → mosfet sempre ligado → "não
+usufruímos". `AT+SLEEP` é PROIBIDO (mata o advertising; só acorda por pulso no WAKE pino 24, que na
+placa está só em pull-up via R22). São DUAS GERAÇÕES de mosfet: G1 = gate em PIO 4..9 (retrofit
+_400/at.js, comandável — suporte que já tínhamos) e G2 = pino12/PIO2 (automático).
+
+**Implementação:**
+- **EEPROM 914 = 12** passa a valer: `mosfetAuto()` no firmware. Clamp do boot aceita 4..9 e 12.
+- `configModuloLeve`: mosfetAuto → **AT+PWRM1** (auto-sleep LIGADO de propósito: módulo ocioso
+  dorme → PIO2 cai → placa corta; conexão BLE acorda → religa; ~0,65mA ocioso em QUALQUER baud —
+  tabela do AT+PWRM — logo **o 9600 FICA**). Máscaras = BEFC000/AFTC008 (gate fora das máscaras).
+  STATUS (5.2 rev<04) → sempre 6 no auto (não existe "STATUSC").
+- `dormir()`: sem corte explícito no auto (não há comando); o MCU vai pro powerDown e morre quando
+  o módulo cortar (seguro: dormindo não há escrita de EEPROM em andamento).
+- **Boot-de-wake sem EE_HIB**: mosfetAuto + PD3 ALTO no boot = religamento por conexão (app
+  esperando) → caminho rápido (sem config/melodia). Bateria trocada chega com PD3 baixo → boot normal.
+- `TST-INFO` ganhou **UPTIME:<s>** (prova de corte) e MOSFET:12-AUTO. `TST-HIB` no auto responde
+  `HIB-AUTO` (não há o que cortar por comando).
+- **Bancada 2.13.0**: campo Pino MOSFET aceita 12 (hint na UI); seed.bin idem; `receita_ar` manda
+  AT+PWRM1 (por último, antes do RESET) quando pino=12; **teste de hibernação novo por UPTIME**
+  (`act_testar_hibernacao_auto`): lê UPTIME → desconecta → espera 180s o auto-sleep → reconecta (a
+  conexão É o religamento) → UPTIME pequeno = REBOOTOU = corte+religa provados. Sem "ativar": no
+  auto, passar no teste = já está ativa por hardware.
+- gerar_seed.py/gravar.sh aceitam 12 (docs atualizadas). Hex do packaging regerado.
+
+**VALIDAR EM BANCADA (pendente):** (1) placa morre sozinha com PWRM1? em quanto tempo (timeout do
+auto-sleep)? (2) conexão religa? latência até PONG? (3) corrente ociosa ~4mA→~0,65mA (amperímetro)?
+(4) troca de bateria: provisionamento+melodia cabem na janela acordada? Risco conhecido: sonda
+TST-PING do app pode chegar antes do fim do boot frio → se aparecer, retry no app.

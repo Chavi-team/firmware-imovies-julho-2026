@@ -18,6 +18,9 @@
 # PINO DO MOSFET (3º argumento, default 8): PIO do módulo BLE que chaveia o
 # gate de energia. 90% das FIs = 8; placas antigas usaram 6 ou 7. Vai no byte
 # 914 da EEPROM — o firmware universal calcula BEFC/AFTC/AT+PIOx0 em runtime.
+# ⭐ v2.13: use 12 para o MOSFET AUTOMÁTICO (placa v2.7/retrofit 2024): gate no
+# pino FÍSICO 12 do módulo = PIO2 (inendereçável por AT) — o firmware provisiona
+# AT+PWRM1 e o corte/religa fica por conta do auto-sleep do módulo.
 #
 # Requisitos: arduino-cli (com MiniCore), avrdude, USBasp conectado, python3.
 set -euo pipefail

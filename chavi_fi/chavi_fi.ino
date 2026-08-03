@@ -83,19 +83,29 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.12.1"
+#define FW_VERSION   "2.21.0"
 
-// ---- HIBERNAÇÃO PROFUNDA via MOSFET (arquitetura do FI_1_0_400) --------------
-// Nesta placa o trilho dos periféricos E DO MCU é chaveado por um MOSFET cujo
-// gate é o PIO8 do módulo BLE (PIO8 ALTO = eletrônica LIGADA):
+// ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
+// GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
+// EEPROM 914 = 4..9, 90% = PIO8):
 //   AT+PIO80  -> corta o trilho NA HORA (o MCU DESLIGA; consumo ~zero)
 //   AT+AFTC028 -> ao CONECTAR o módulo religa o PIO8 -> o MCU dá boot e atende
 //   AT+BEFC020 -> ao DESCONECTAR religa também (o MCU boota, faz manutenção e
 //                 corta de novo) — é o ciclo do FI_1_0_400 de produção.
-// Vantagem extra: acorda por CONEXÃO sem depender do pino de wake PD3.
-// Custo: com o trilho cortado o BOTÃO FÍSICO não funciona (MCU desligado).
-// ✅ PROVADO em bancada (05/07 12:42, CH003FI003066 v2.2.2): TST-HIB cortou
+// GERAÇÃO 2 — MOSFET "AUTOMÁTICO" (⭐ v2.13; placa v2.7 integrada + retrofit
+// padrão 2024; EEPROM 914 = 12): o gate liga no PINO FÍSICO 12 do módulo =
+// PIO2 = VCC da EEPROM DO PRÓPRIO MÓDULO (manual 1010, tabela de pinos) — NÃO
+// endereçável por AT (AT+PIO cobre só PIO3..11; máscaras BEFC/AFTC = 9 bits).
+// O pino SEGUE O ESTADO DO MÓDULO: acordado = alto = placa LIGADA; auto-sleep
+// (AT+PWRM1) = baixo = placa CORTADA. A conexão BLE acorda o módulo -> PIO2
+// sobe -> a placa religa e o MCU dá boot frio. Corte e religa são 100%
+// automáticos: nenhum comando existe nem é necessário — a ÚNICA alavanca é
+// PWRM1 (em vez do PWRM0 padrão) no provisionamento. Módulo alimentado direto
+// da bateria (fora da chave); todo o resto atrás dela (~0,65mA total ocioso).
+// Custo (as duas gerações): trilho cortado = BOTÃO FÍSICO morto (MCU desligado).
+// ✅ G1 PROVADA em bancada (05/07 12:42, CH003FI003066 v2.2.2): TST-HIB cortou
 // (silêncio) e a reconexão religou o MCU com PONG imediato. LIGADO.
+// 🟡 G2: validar em bancada (teste por UPTIME — ver TST-INFO/bancada v2.13).
 #define FEATURE_HIBERNA_MOSFET  1
 
 // ---- pinos ----
@@ -114,18 +124,24 @@
 #define PIN_LED10_2  PIN_PB0
 #define PIN_LED10_3  PIN_PB1
 
-// BAUD do módulo BLE = 9600 (AT+BAUD2) = PADRÃO DE FÁBRICA do módulo (manual
-// pág.8/22). ⭐ PROVA (MS BLE Explorer na CH003FI002734): AT+BAUD? -> "OK+Get2"
-// = 9600. O módulo SAI DE FÁBRICA em 9600; forçá-lo a 2400 exige falar 9600 com
-// ele, e SoftwareSerial a 9600 no RC de 8MHz é marginal -> a conversão falhava e
-// o módulo ficava mudo p/ o MCU. Usar 9600 NATIVO elimina a briga: é a config de
-// referência do fabricante (Arduino a 16MHz + SoftwareSerial 9600, manual pág.12).
-// CLOCK: CRISTAL EXTERNO 16MHz (a placa TEM — schema1/2: X1 16MHz + 22pF). É
-// OBRIGATÓRIO p/ SoftwareSerial a 9600 ser confiável (o RC de 8MHz não dá conta).
-// Sem 2400-slow, o "wake por dado" some — mas com AT+PWRM0 (auto-sleep OFF) o
-// módulo não dorme, então não precisamos dele.
-#define BAUD_MODULO  9600
-#define AT_BAUD_CMD  "AT+BAUD2"    // -> 9600 (padrão de fábrica do módulo)
+// ⭐⭐ BAUD do módulo BLE = 2400-SLOW (AT+BAUD0) — DECISÃO 02/08/2026, volta à
+// config da PRODUÇÃO LEGADA (esteira at.js: BAUD0 + PWRM1 em toda a frota).
+// PORQUÊ (tabela do AT+PWRM, manual 1010 §54): o auto-sleep do módulo (PWRM1)
+// só permite ACORDAR POR DADO na UART quando o baud é BAUD0/2400-slow; nos
+// demais bauds o módulo dormindo só acorda por pulso GND no pino 24 (WAKE) —
+// que na placa tem apenas pull-up (R22), ninguém pulsa. Provado na 2910 em
+// 02/08: 9600 + PWRM1 = MCU nunca recebe nada (zero PONG, F07 no app).
+// E PWRM1 é OBRIGATÓRIO p/ a hibernação: com PWRM0 o módulo fica acordado e o
+// TX da UART dele (3,3V constante) ALIMENTA DE FORMA PARASITA o MCU da placa
+// CORTADA -> boots fracos em loop (bipe a cada ~1s). Dormindo, ele solta o TX.
+// Bônus: rádio 1,5mA -> 0,65mA (metade da conta de bateria).
+// CLOCK: cristal externo 16MHz. A 2400 o SoftwareSerial tem ~6.700 ciclos por
+// bit (contra ~1.700 a 9600) — é a config MAIS folgada, não menos. O trauma
+// histórico do 9600 vinha do RC interno de 8MHz (±10%), que não existe mais.
+// Módulo VIRGEM sai de fábrica em 9600 -> o provisionamento converte (o sweep
+// manda AT+BAUD0 em cada baud candidato; a bancada faz o mesmo pelo ar).
+#define BAUD_MODULO  2400
+#define AT_BAUD_CMD  "AT+BAUD0"    // -> 2400-slow (wake por dado + PWRM1)
 
 // Motor REAL (abrir/fechar/calibração): igual ao FI_1_5 de produção — gira até
 // detectar o BATENTE pela corrente (INA219 no I2C 0x45) ou até o teto duro.
@@ -140,6 +156,8 @@
 // forçando o fim de curso e a próxima abertura pode travar). O legado usa
 // timeToLineUP=1000ms; aqui é ajustável. 0 = sem recuo.
 #define MOTOR_RECUO_MS   900
+#define MOTOR_RECUO_ABORT_MS 250   // recuo curto quando o giro abortou por queda
+                                   // de trilho (alivia o came sem afundar de novo)
 #define MOTOR_TST_MS 450       // pulso curto do motor no TESTE de bancada
                                // (menos energia de stall -> menos brownout)
 #define JANELA_MS    20000     // ocioso E desconectado: dorme após isso
@@ -173,12 +191,30 @@
                                // 0 = sono leve IDLE, seguro). Ativa via HIB-ON após
                                // validar o ciclo corta->religa na bancada (TST-HIB).
                                // (gravado pelo seed.bin/gerar_seed.py conforme a placa)
-#define EE_MOSFET       914    // PIO do módulo que chaveia o MOSFET (4..9; fora da
-                               // faixa/0xFF = default 8). Gravado pelo gravar.sh.
+#define EE_MOSFET       914    // Gate do MOSFET (gravado pelo gravar.sh/bancada):
+                               //   4..9 = PIO endereçável (geração 1; default 8)
+                               //   12   = MOSFET AUTOMÁTICO no pino físico 12 =
+                               //          PIO2/VCC-EEPROM do módulo (geração 2,
+                               //          placa v2.7 — corte via AT+PWRM1)
+                               // fora da faixa/0xFF = default 8.
 #define EE_MOD_FAM      915    // família do módulo (FAM_*), persistida na identificação
 // 916: QUEIMADO — foi a "variante sem MOSFET" (v2.11.0, removida na v2.11.1:
 // provado em bancada+app que a placa sem MOSFET funciona com a config NORMAL,
 // pois o MCU dela é sempre alimentado). Não reusar o byte sem apagar a frota.
+// ⭐⭐ v2.18 — TELEMETRIA DE SOAK (medir em vez de interpretar). Zerada por
+// TST-ZERA no início de cada bateria de testes.
+#define EE_BOOTS        918    // u16: quantas vezes o MCU bootou
+#define EE_BODS         920    // u16: bootou por BROWN-OUT (queda de tensão!)
+#define EE_CUTS         922    // u16: vezes que o firmware EXECUTOU o corte
+                               // (CUTS ~ BOOTS = o corte está funcionando;
+                               //  CUTS subindo e BOOTS parado = o módulo
+                               //  ignorou o comando de corte)
+#define EE_PROV_TENT    917    // ⭐ v2.13.3: tentativas de provisionamento pesado
+                               // (anti-loop-de-suicídio: nas placas com mosfet, o
+                               // AT+RESET do provisionamento reinicia o módulo,
+                               // os PIOs caem no boot dele e o gate CORTA o
+                               // próprio MCU -> boot -> provisiona -> corta...
+                               // bipe agudo a cada ~2s. Teto de 3 tentativas.)
 
 // ---- família do módulo BLE (identificada pelo AT+VERS? — manuais Soft) ----
 #define FAM_DESCONHECIDA 0
@@ -218,12 +254,20 @@ unsigned long seed01 = 0, seed02 = 0;
 uint8_t calibrationOk = 0;
 uint8_t g_moduloVers = 0;      // REV do módulo (3, 5, 12...; 0 = não leu)
 uint8_t g_moduloFam = FAM_DESCONHECIDA;   // família (AT+VERS? — 1010 × 5.2)
-uint8_t g_pinMosfet = 8;       // PIO do MOSFET (EEPROM 914; default 8 = frota)
+uint8_t g_pinMosfet = 8;       // gate do MOSFET (EEPROM 914; default 8 = frota;
+                               // 12 = automático/pino12 — ver cabeçalho)
+// MOSFET-AUTO (geração 2): gate no pino físico 12 = PIO2 = VCC da EEPROM do
+// módulo. Inendereçável por AT — o corte é o auto-sleep do módulo (PWRM1).
+bool mosfetAuto() { return g_pinMosfet == 12; }
 char serialFech[12] = {0};
 volatile bool acordouBLE = false, acordouBtn = false;
 bool moduloOk = false;
 bool g_wakeHib = false;        // este boot foi um "acordar da hibernação"
 bool g_hiberna = false;        // HIBERNAÇÃO por corte de MOSFET ligada (EE_HIBERNA)
+uint8_t g_atOk = 2;             // 2=não testado · 1=módulo respondeu ao MCU · 0=mudo
+uint16_t g_vccMinGiro = 0;       // menor VCC visto no último giro (mV)
+bool g_motorAbortouVcc = false;  // giro parou por queda de trilho (v2.17)
+uint16_t lerVccMv();             // (definida antes do setup)
 bool g_sessaoConectada = false; // já tocou a melodia de "conectou" nesta sessão BLE
 void atenderBotao();           // usada pelo atenderApp (definida mais abaixo)
 
@@ -353,7 +397,24 @@ void motorGiraMs(bool sentidoA, uint16_t ms) {
 //     aliviar a pressão do fim de curso — igual ao FI_1_5. O recuo é curto e
 //     NÃO desfaz a abertura (o came já passou o ponto); só solta o batente.
 // O motor NUNCA fica ligado: para no batente, no teto ou no fim de cada etapa.
+// ⭐⭐ v2.17 — PROTEÇÃO DE TRILHO (fim do reset no meio do giro). MEDIDO com
+// tools/simula_app.py na 2910: a 2ª confirmação (fim do giro) NUNCA chegava e a
+// fechadura dava o bipe de BOOT logo após o motor = o MCU estava MORRENDO no
+// giro. Motivo: o motor puxa do trilho de 12V; com a bateria meia-boca e a
+// resistência em série do retrofit (Rds-on do mosfet + fios finos + soldas), o
+// VCC cai até o brown-out (2,7V) e o MCU reinicia — o app fica sem a 2ª
+// confirmação, sem melodia, e o comando seguinte pega a placa em estado ruim
+// (F07). Pior no caso SEM CARGA MECÂNICA (bancada), onde o batente nunca é
+// atingido e o motor roda os 10s inteiros do teto.
+// Agora o giro VIGIA o próprio VCC (bandgap, ~1ms) e PARA por conta própria se
+// o trilho afundar — a fechadura conclui o comando, responde e toca a melodia
+// em vez de morrer. Numa porta real o batente chega antes e isto nunca dispara.
+#define VCC_MIN_BOOT_MV  4200      // abaixo disto o boot é PARASITA (real = ~5V)
+#define VCC_MOTOR_MIN_MV 4300      // trilho saudável = 5V (StepUp); abaixo disto
+                                   // o próximo passo é o brown-out
 void motorGira(bool sentidoA) {
+    g_motorAbortouVcc = false;
+    g_vccMinGiro = 0;
     if (!inaOk) {
         motorGiraMs(sentidoA, MOTOR_MS);       // 1. giro (fallback por tempo)
     } else {
@@ -365,15 +426,47 @@ void motorGira(bool sentidoA) {
             for (uint8_t i = 0; i < 25; i++) mA += ina219.getCurrent_mA();
             mA /= 25.0f;
             if (millis() - t0 > MOTOR_ARRANQUE_MS && fabs(mA) > MOTOR_STALL_MA) break;
+            // trilho afundando? para AGORA (antes do brown-out levar o MCU)
+            if (millis() - t0 > MOTOR_ARRANQUE_MS) {
+                uint16_t v = lerVccMv();
+                if (v && (g_vccMinGiro == 0 || v < g_vccMinGiro)) g_vccMinGiro = v;
+                if (v && v < VCC_MOTOR_MIN_MV) { g_motorAbortouVcc = true; break; }
+            }
         }
         motorPara();
         ina219.powerSave(true);
     }
     // 2. recuo/line-up (alivia o batente). Pausa curta antes p/ o motor parar
     //    de fato (inércia) e não dar shoot-through na inversão de sentido.
-    if (MOTOR_RECUO_MS > 0) {
-        delay(80);
-        motorGiraMs(!sentidoA, MOTOR_RECUO_MS);
+    // ⭐ v2.17: se o giro foi ABORTADO por queda de trilho, PULA o recuo (outro
+    //    giro afundaria de novo) e dá um tempo p/ a bateria se recuperar — o
+    //    que importa agora é concluir o comando (status + melodia) sem morrer.
+    if (g_motorAbortouVcc) {
+        // Trilho afundou: espera a bateria se recuperar e, SE ela voltar a um
+        // nível saudável, faz um recuo CURTO. Pular o recuo por completo era
+        // elétricamente seguro mas deixava o came pressionando o fim de curso
+        // (próxima abertura dura); um pulso curto alivia sem afundar de novo.
+        delay(600);
+        uint16_t v = lerVccMv();
+        if (v == 0 || v >= VCC_MOTOR_MIN_MV) {
+            motorGiraMs(!sentidoA, MOTOR_RECUO_ABORT_MS);
+        }
+    } else if (MOTOR_RECUO_MS > 0) {
+        // ⭐⭐ v2.17.2 — COAST antes de inverter (causa-raiz do reset no fim do
+        // giro). 80ms NÃO param um motor com inércia: inverter o sentido com o
+        // eixo ainda girando é FRENAGEM POR INVERSÃO — a tensão gerada pelo
+        // motor se soma à aplicada e o pico de corrente chega ao DOBRO do
+        // stall, derrubando o trilho por alguns ms -> brown-out -> reset. Era
+        // o que comia a 2ª confirmação, a melodia e o próprio recuo (medido:
+        // 3/3 ciclos sem a 2ª confirmação, com bateria a 60%/3,82V — carga em
+        // que um giro normal NÃO derruba nada).
+        // 350ms de roda-livre (motor em LOW/LOW = freio suave da ponte H) +
+        // conferência do trilho antes de aplicar o sentido oposto.
+        delay(350);
+        uint16_t v = lerVccMv();
+        if (v == 0 || v >= VCC_MOTOR_MIN_MV) {
+            motorGiraMs(!sentidoA, MOTOR_RECUO_MS);
+        }
     }
 }
 
@@ -390,9 +483,21 @@ void at(const char* c, uint16_t w = 150) {
     // (visto na bancada: "⟵ AT", "⟵ AT+NAME003FI002734" + lixo). AT é só p/
     // config, que só roda DESCONECTADO. Conectado, não manda nada.
     if (digitalRead(PIN_WAKE) == HIGH) return;
-    bluetooth.print(c);
+    // ⭐⭐ v2.21 — RESILIENTE AO DESPERTAR (a razão de o corte pelo firmware
+    // nunca pegar). Com AT+PWRM1 o módulo DORME quando ocioso e é acordado pelo
+    // primeiro dado da UART (só funciona em AT+BAUD0/2400-slow, manual §22) —
+    // mas ESSE primeiro byte se PERDE no despertar. O código já sabia disso em
+    // outro ponto (bleVivo manda "AT" 4× "porque o 1º só acorda"), mas aqui
+    // cada comando ia UMA vez: o AT+DROP era engolido e a sequência do corte
+    // saía torta. Agora: um '\r' de sacrifício acorda, pausa curta, e o comando
+    // vai DUAS vezes (repetir um AT de config/PIO é inócuo — mesmo resultado).
     bluetooth.print('\r');
-    delay(w);
+    delay(12);                       // tempo do módulo despertar
+    for (uint8_t t = 0; t < 2; t++) {
+        bluetooth.print(c);
+        bluetooth.print('\r');
+        delay(t == 0 ? 25 : w);      // 1ª rápida, 2ª com a espera pedida
+    }
     while (bluetooth.available()) bluetooth.read();
 }
 
@@ -507,14 +612,24 @@ void configModuloLeve() {
     if (!placa10 && digitalRead(PIN_WAKE) == HIGH) {
         DBGLN(F("[cfg] conectado - pula config")); return;
     }
-    // ⭐ AT+PWRM0 = auto-sleep do módulo DESLIGADO (manual pág.39). O firmware
-    // ANTIGO mandava PWRM1 achando que DESLIGAVA o sleep — mas PWRM1 LIGA. Com o
-    // sleep ligado o módulo cochilava e o 1º byte de cada troca só o acordava e
-    // se PERDIA: no boot o AT sumia (4 bipes graves = "mudo") e na operação o
-    // "P" do "PONG" sumia (app recebia "ONG" != "PONG" -> sem PONG p/ sempre).
-    // PWRM0 mantém o módulo sempre acordado e responsivo. O MCU continua dormindo
-    // (powerDown) — a economia real de bateria está nele, não no módulo.
-    at("AT+PWRM0");
+    // ⭐⭐ v2.15.1: AT+PWRM1 SEMPRE (auto-sleep do módulo LIGADO) — reversão
+    // consciente do PWRM0 da v2.9.12, por três motivos (02/08):
+    // (1) BACKFEED: com o módulo sempre acordado (PWRM0), o TX da UART dele
+    //     fica em 3,3V e ALIMENTA DE FORMA PARASITA o MCU de uma placa com
+    //     mosfet CORTADA -> tentativas de boot fracas em loop (bipe a cada
+    //     ~1s, caso real 2910). Com PWRM1 o módulo ocioso dorme, solta o TX
+    //     -> corte limpo e silencioso.
+    // (2) É a config da ESTEIRA DE PRODUÇÃO legada (at.js mandava PWRM1 p/
+    //     toda a frota — anos de campo).
+    // (3) Módulo dormindo = 0,65mA vs 1,5mA — metade do consumo de rádio.
+    // O custo histórico do PWRM1 (1º byte perdido no diálogo MCU->módulo a
+    // 9600, "ONG" sem o P etc.) perdeu relevância: a BANCADA é a dona da
+    // config pelo ar (v2.14) e a conexão BLE acorda o módulo antes de
+    // qualquer dado do app. No pino-12/auto o PWRM1 já era o próprio corte.
+    at("AT+PWRM1");   // ⭐ v2.16: auto-sleep LIGADO (config da esteira legada).
+                      // Só funciona junto do BAUD0/2400-slow (wake por dado) —
+                      // ver o bloco do BAUD_MODULO. Mata o backfeed do corte e
+                      // derruba o rádio de 1,5mA p/ 0,65mA.
     at("AT+TYPE0");    // sem pareamento (TYPE1 residual = pede PIN em toda conexão)
     // NOME reafirmado a CADA boot (como o changeName do FI_1_5), ANTES do MODE2.
     // ⭐ v2.10 AUTO-CURA: escreve, LÊ DE VOLTA (AT+NAME?) e compara — se a UART
@@ -552,20 +667,29 @@ void configModuloLeve() {
         at("AT+PIO81"); at("AT+PIO91");
         at("AT+BEFCFF7");
         at("AT+AFTCFFF");
-    } else if (g_hiberna) {
-        // HIBERNAÇÃO (receita do FI_1_5_400 de produção): o PIO do MOSFET NÃO é
-        // forçado alto -> o AT+PIOx0 do dormir() consegue CORTAR o trilho.
-        //   BEFC 000        = tudo baixo antes da conexão (MCU desligado no repouso)
-        //   AFTC mask(PIO6) = PIO6 alto depois -> borda de wake que religa o MCU
-        atMascara("AT+BEFC", 0);
-        atMascara("AT+AFTC", mascaraPio(6));
     } else {
-        // MODO NORMAL (IDLE): MOSFET SEMPRE ligado (antes e depois da conexão),
-        // MCU nunca desliga — comunicação robusta, mais bateria. Config do AT.py.
-        // Pino do MOSFET vem da EEPROM 914 (default 8 -> BEFC020/AFTC028, os
-        // valores históricos da esteira; placas com gate no 6/7 gravam o byte).
-        atMascara("AT+BEFC", mascaraPio(g_pinMosfet));                  // MOSFET=1 antes
-        atMascara("AT+AFTC", mascaraPio(g_pinMosfet) | mascaraPio(6)); // +wake depois
+        // MODO NORMAL *E* HIBERNAÇÃO G1 — MESMAS máscaras (⭐ v2.13.3):
+        //   BEFC mask(gate) = gate ALTO no power-on/pré-conexão -> ciclo de
+        //                     bateria e desconexão RELIGAM a placa;
+        //   AFTC mask(gate)|mask(6) = conexão religa o trilho E acorda o MCU.
+        // É o ciclo comprovado da frota _400 de produção: a hibernação G1
+        // difere só no dormir() — corte explícito AT+PIOx0, que persiste até o
+        // próximo evento (conexão/power-on religa e o MCU corta de novo após a
+        // janela ociosa).
+        // ⚠️ A config antiga da hibernação (BEFC000/AFTC008, até v2.13.2) era um
+        // CAMINHO DE TIJOLO: sem o bit do gate no AFTC, após o corte nem a
+        // CONEXÃO nem o ciclo de bateria religavam — só o cabo USBasp.
+        // ⭐ v2.13 MOSFET-AUTO (pino12/PIO2): o gate NÃO cabe nas máscaras (PIO2
+        // é inendereçável) — quem corta/religa é o auto-sleep (PWRM1 acima).
+        // ⭐⭐ v2.13.1 SEGURANÇA: mesmo no auto, as máscaras seguram o PIO8 ALTO
+        // (BEFC020/AFTC028). Numa placa pino-12 de verdade isso é inócuo (o
+        // pino 13 não liga em nada); numa GERAÇÃO 1 (gate em PIO real) rotulada
+        // errada como 12, é o que impede o BEFC000 de CORTAR o trilho p/ sempre
+        // (caso real: CH003FI002910, R0, morta pelo ar em 02/08 — MCU sem
+        // energia, botão morto, estalos no boot; resgate = regravar com 8).
+        uint16_t mMos = mosfetAuto() ? mascaraPio(8) : mascaraPio(g_pinMosfet);
+        atMascara("AT+BEFC", mMos);                   // MOSFET=1 antes (se endereçável)
+        atMascara("AT+AFTC", mMos | mascaraPio(6));   // +wake depois
     }
     at("AT+PIO60");    // repouso arma a próxima borda de wake
     // Wake por FAMÍLIA/REV (manuais oficiais): AT+STATUS só existe no 5.2 — no
@@ -575,7 +699,9 @@ void configModuloLeve() {
     // Família desconhecida + rev<4 = manda também (conservador, era a regra antiga).
     if (g_moduloFam != FAM_1010 && g_moduloVers != 0 && g_moduloVers < 4) {
         char st[14];
-        snprintf(st, sizeof(st), "AT+STATUS%X", placa10 ? 6 : g_pinMosfet);
+        // MOSFET-AUTO: STATUS no PIO6 (o wake do PD3) — não existe "STATUSC".
+        snprintf(st, sizeof(st), "AT+STATUS%X",
+                 (placa10 || mosfetAuto()) ? 6 : g_pinMosfet);
         at(st);
     }
 }
@@ -607,7 +733,7 @@ void bleProvisionar() {
     // Só os bauds ALCANÇÁVEIS pelo SoftwareSerial a 16MHz (9600 primeiro = o mais
     // comum). Tirei 57600/115200/1200: SoftwareSerial não os faz confiável, e
     // varrê-los só alongava o boot (colidia com a conexão da bancada).
-    static const long TODOS[] = {9600, 2400, 4800, 19200, 38400};
+    static const long TODOS[] = {2400, 9600, 4800, 19200, 38400};
     const uint8_t N = sizeof(TODOS) / sizeof(long);
 
     // PASSO 0 — SEM RENEW. ⚠️ O AT+RENEW/DEFAULT era veneno em DUAS frentes:
@@ -648,7 +774,7 @@ void bleProvisionar() {
         // surda p/ SEMPRE até o PWRM0 entrar pelo ar (bancada). Aqui é a
         // primeira coisa dita em CADA baud: se a janela existir, destrava já.
         at("AT+PWRM0", 120);
-        at(AT_BAUD_CMD, 250);                  // -> 9600
+        at(AT_BAUD_CMD, 250);                  // -> 2400-slow
         at("AT+RESET", 150);
         delay(600);                            // módulo reinicia no baud novo
     }
@@ -659,7 +785,7 @@ void bleProvisionar() {
     // PASSO 2 — config completa no baud alvo.
     at("AT+SHIELD1");
     at(AT_BAUD_CMD);                           // reafirma (só vale após reset)
-    at("AT+PWRM0");                            // auto-sleep OFF (sempre acordado)
+    at("AT+PWRM1");                            // auto-sleep ON (2400-slow: wake por dado)
     at("AT+ROLE0");                            // slave (ROLE1 residual = não anuncia)
     at("AT+IMME0");                            // anuncia sozinho ao ligar
     at("AT+ADTY0");                            // anúncio conectável
@@ -679,7 +805,7 @@ void bleProvisionar() {
     if (serialFech[0]) {
         char nm[24];
         snprintf(nm, sizeof(nm), "AT+NAME%s", serialFech);
-        const long bd[] = {2400, 9600, 38400, 19200, 57600, 4800};
+        const long bd[] = {2400, 9600, 38400, 19200, 4800};
         for (uint8_t i = 0; i < sizeof(bd) / sizeof(long); i++) {
             bluetooth.begin(bd[i]); delay(30);
             at("AT", 50); at("AT+PWRM0", 100); at(nm, 180);   // v2.10.1: acorda antes do nome
@@ -704,6 +830,41 @@ void bleProvisionar() {
     // exatamente isso que deixou a 0629 morta na bateria: config cedo demais,
     // módulo grogue, PIO do mosfet nunca subiu.
     configModuloLeve();
+}
+
+// MCUSR guarda o MOTIVO do último reset (power-on / brown-out / externo /
+// watchdog). Precisa ser lido ANTES do init do core; a seção .init3 roda antes
+// do main(). É o que distingue "religou pelo mosfet" de "morreu de brown-out".
+uint8_t g_mcusr __attribute__((section(".noinit")));
+void capturaMcusr(void) __attribute__((naked, used, section(".init3")));
+void capturaMcusr(void) { g_mcusr = MCUSR; MCUSR = 0; }
+
+// ⭐⭐ v2.19 — ESPERA PELA ENERGIA REAL (fim do loop parasita, medido: 203 de
+// 204 boots por BROWN-OUT depois de um corte). Com a placa cortada, o TX do
+// módulo vaza pelo diodo do pino RX e alimenta o MCU o suficiente para ele
+// COMEÇAR a bootar; o consumo do boot derruba essa fonte fraquíssima, o BOD
+// dispara e tudo recomeça ~3x por segundo — bipes, bateria drenando à toa e o
+// comando seguinte pegando a placa num estado ruim (F07).
+// Aqui, ANTES de qualquer coisa que gaste energia (beep, LED, rádio), o MCU
+// confere o próprio VCC: alimentação real = ~5V (StepUp); parasita ~3V. Se
+// estiver parasita, ele DORME em ciclos de 1s (watchdog em modo interrupção,
+// consumo desprezível) e só continua o boot quando a energia de verdade
+// chegar — o que acontece quando o app conecta e o módulo religa o gate.
+// ⚠️ Diferente da v2.16.2 (removida): lá o MCU dormia PARA SEMPRE e uma
+// leitura ruim do ADC deixava a fechadura muda até regravar. Aqui o sono é
+// por tempo, sempre reversível, e a leitura passa por mediana (v2.18.1).
+void esperaEnergiaReal() {
+    // pino de dados dos LEDs em nível BAIXO: sem dado válido os WS2812 mantêm
+    // o último valor (preto, apagado pelo dormir) em vez de acender lixo.
+    pinMode(PIN_LEDS, OUTPUT);
+    digitalWrite(PIN_LEDS, LOW);
+    for (uint16_t i = 0; i < 300; i++) {          // teto ~5 min, nunca infinito
+        uint16_t v = lerVccMv();
+        if (!v || v >= VCC_MIN_BOOT_MV) return;   // energia real (ou inconclusivo)
+        // sono de 1s com ADC e BOD desligados (a lib cuida do watchdog; definir
+        // um ISR(WDT_vect) próprio colide com o vetor dela)
+        LowPower.powerDown(SLEEP_1S, ADC_OFF, BOD_OFF);
+    }
 }
 
 void isrBtn() { acordouBtn = true; }
@@ -913,10 +1074,40 @@ void enviaInfo() {
     enviaLinha(buf);
     snprintf(buf, sizeof(buf), "PLACA:%s", placa10 ? "1.0" : "1.5");
     enviaLinha(buf);
-    snprintf(buf, sizeof(buf), "MOSFET:%u", g_pinMosfet);     // PIO do gate (EEPROM 914)
+    // 4..9 = gate em PIO endereçável; 12-AUTO = pino físico 12/PIO2 (PWRM1)
+    if (mosfetAuto()) snprintf_P(buf, sizeof(buf), PSTR("MOSFET:12-AUTO"));
+    else              snprintf_P(buf, sizeof(buf), PSTR("MOSFET:%u"), g_pinMosfet);
     enviaLinha(buf);
     snprintf(buf, sizeof(buf), "WAKE:v%02u", g_moduloVers);   // rev do módulo (00 = não leu)
     enviaLinha(buf);
+    // Segundos desde o boot — a PROVA DE CORTE do teste de hibernação da
+    // bancada v2.13 (mosfet-auto): uptime pequeno após reconectar = o MCU
+    // REBOOTOU = a placa foi cortada e religada; uptime grande = nunca cortou.
+    snprintf_P(buf, sizeof(buf), PSTR("UPTIME:%lu"), millis() / 1000UL);
+    enviaLinha(buf);
+    // ⭐ v2.18 — telemetria de soak (tudo que o teste automatizado precisa):
+    //  RST    motivo do último reset: P=power-on(religou pelo mosfet)
+    //         B=BROWN-OUT(caiu a tensão!) E=externo W=watchdog
+    //  BOOTS  quantos boots desde o TST-ZERA · BODS quantos foram brown-out
+    //  CUTS   quantas vezes o firmware EXECUTOU o corte de energia
+    //         (CUTS≈BOOTS = corte funciona; CUTS subindo com BOOTS parado =
+    //          o módulo ignorou o comando)
+    //  VCC    tensão do trilho agora · VCCMIN a MENOR vista no último giro
+    { uint16_t bo, bd, ct;
+      EEPROM.get(EE_BOOTS, bo); EEPROM.get(EE_BODS, bd); EEPROM.get(EE_CUTS, ct);
+      if (bo == 0xFFFF) bo = 0; if (bd == 0xFFFF) bd = 0; if (ct == 0xFFFF) ct = 0;
+      snprintf_P(buf, sizeof(buf), PSTR("RST:%c"),
+                 (g_mcusr & _BV(BORF)) ? 'B' : (g_mcusr & _BV(WDRF)) ? 'W'
+                 : (g_mcusr & _BV(EXTRF)) ? 'E' : 'P');
+      enviaLinha(buf);
+      snprintf_P(buf, sizeof(buf), PSTR("BOOTS:%u"), bo);   enviaLinha(buf);
+      snprintf_P(buf, sizeof(buf), PSTR("BODS:%u"), bd);    enviaLinha(buf);
+      snprintf_P(buf, sizeof(buf), PSTR("CUTS:%u"), ct);    enviaLinha(buf); }
+    snprintf_P(buf, sizeof(buf), PSTR("VCC:%u"), lerVccMv());       enviaLinha(buf);
+    snprintf_P(buf, sizeof(buf), PSTR("VCCMIN:%u"), g_vccMinGiro);  enviaLinha(buf);
+    // ATOK: o módulo respondeu ao MCU na última tentativa de corte (medido
+    // DESCONECTADO, que é a condição real). 2 = ainda não houve tentativa.
+    snprintf_P(buf, sizeof(buf), PSTR("ATOK:%u"), g_atOk);          enviaLinha(buf);
     enviaLinha("VER:" FW_VERSION);
     enviaLinha("FIM-INFO");
 }
@@ -985,6 +1176,10 @@ void testeBancada(const String& t) {
     //   3 bipes graves após ~3s              = MCU vivo = módulo NÃO cortou
     //   "HIB-FALHOU-DROP" na tela            = nem o DROP derrubou (segue conectado)
     if (t.startsWith("TST-HIB")) {
+        // ⭐ v2.13 MOSFET-AUTO (pino12/PIO2): não existe comando de corte — o
+        // módulo corta sozinho ao dormir (PWRM1). A bancada valida por UPTIME
+        // (TST-INFO): derruba, espera o auto-sleep e confere se o MCU REBOOTOU.
+        if (mosfetAuto()) { enviaLinha("HIB-AUTO"); return; }
         enviaLinha("OK-HIB");
         delay(400);                          // a resposta sai antes do DROP
         at("AT+DROP", 500);                  // derruba a conexão -> módulo sai do túnel
@@ -996,12 +1191,19 @@ void testeBancada(const String& t) {
         atMascara("AT+BEFC", 0);             // ⭐ libera o gate (senão o BEFC re-liga)
         at("AT+PIO60", 200);                 // arma a borda de wake (PIO6 baixo)
         EEPROM.update(EE_HIB, 1);            // marca "desligou hibernando" p/ o wake
-        { char pio[12];                      // corta pelo PIO do MOSFET (EEPROM 914)
-          snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
-          at(pio, 60); }                     // CORTA o MOSFET -> MCU morre se cortou
+        char pio[12];                        // corta pelo PIO do MOSFET (EEPROM 914)
+        snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
+        at(pio, 60);                         // CORTA o MOSFET -> MCU morre se cortou
         delay(3000);                         // se cortou, nunca passa daqui
         EEPROM.update(EE_HIB, 0);
         beep(160, 400); beep(160, 400); beep(160, 400);   // 3 graves = NÃO cortou
+        return;
+    }
+    // ⭐ v2.18: zera a telemetria (início de uma bateria de testes)
+    if (t.startsWith("TST-ZERA")) {
+        uint16_t z = 0;
+        EEPROM.put(EE_BOOTS, z); EEPROM.put(EE_BODS, z); EEPROM.put(EE_CUTS, z);
+        enviaLinha("OK-ZERA");
         return;
     }
     if (t.startsWith("TST-ALL"))  {
@@ -1159,19 +1361,52 @@ void atenderBotao() {
 // Motor fica OUTPUT LOW (nunca Hi-Z — evita shoot-through na ponte H).
 void dormir() {
     motorPara();
+    // ⭐⭐ v2.20 — APAGA OS LEDs ANTES DE PERDER A ENERGIA. Os WS2812 GUARDAM o
+    // último valor recebido; se a placa é cortada com eles em estado indefinido
+    // (ou se acordam com lixo na alimentação parasita), ficam ACESOS puxando
+    // corrente justamente no repouso — foi visto em campo: placa cortada, botão
+    // morto e 2 LEDs acesos. Mandando "preto" agora, o valor travado é apagado,
+    // e o pino de dados fica em nível baixo (nenhum dado novo é interpretado).
+    if (!placa10) {
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
+        FastLED.show();
+        pinMode(PIN_LEDS, OUTPUT);
+        digitalWrite(PIN_LEDS, LOW);
+    } else {
+        digitalWrite(PIN_LED10_1, LOW);
+        digitalWrite(PIN_LED10_2, LOW);
+        digitalWrite(PIN_LED10_3, LOW);
+    }
     // HIBERNAÇÃO (toggle EE_HIBERNA): corta o trilho pelo MOSFET (receita do
     // FI_1_5_400). Chega aqui só quando OCIOSO+DESCONECTADO (atenderApp segura a
     // janela enquanto PD3 alto), então o at() não vaza pro app. O MCU DESLIGA no
     // AT+PIO80 e só volta por CONEXÃO (boot fresco). Requer BEFC000 (config de
     // hibernação) — com BEFC020 o módulo re-liga o PIO8 e o corte não pega.
     // Se o hardware NÃO cortar (placa sem o gate), o código segue pro IDLE abaixo.
-    if (g_hiberna && !placa10 && digitalRead(PIN_WAKE) == LOW) {
+    // ⭐ v2.13 MOSFET-AUTO (pino12/PIO2): NÃO há comando de corte — o módulo
+    // corta a placa SOZINHO quando o auto-sleep (PWRM1) o derrubar. O MCU só
+    // segue pro powerDown abaixo e morre quando o corte vier (seguro: dormindo
+    // não há escrita de EEPROM em andamento).
+    if (g_hiberna && !placa10 && !mosfetAuto() && digitalRead(PIN_WAKE) == LOW) {
+        // ⭐⭐ v2.16.1 — A ORDEM É O SEGREDO (receita do goToSleep legado):
+        // este módulo RE-APLICA a máscara BEFC no evento de DESCONEXÃO. Por
+        // isso o corte tem de ser a ÚLTIMA palavra: primeiro AT+DROP (deixa o
+        // módulo fazer o re-apply dele), depois uma folga para esse evento
+        // assentar, e SÓ ENTÃO o AT+PIOx0 — que fica valendo até a próxima
+        // conexão (aí o AFTC religa). É por isso que o corte do APP (mandado
+        // CONECTADO) não colava: a desconexão que vinha depois o desfazia.
+        { uint16_t c; EEPROM.get(EE_CUTS, c); if (c == 0xFFFF) c = 0;
+          c++; EEPROM.put(EE_CUTS, c); }        // telemetria: tentei cortar
         at("AT+DROP", 200);
+        delay(120);               // curto: pausa longa deixava o módulo readormecer
+                                  // (o re-apply do BEFC da desconexão acontece aqui)
         at("AT+PIO60", 100);      // arma a borda de wake (PIO6 baixo)
         char pio[12];             // corta pelo PIO do MOSFET (EEPROM 914, default 8)
         snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
         at(pio, 60);              // corta o MOSFET -> MCU morre aqui se cortou
-        delay(150);
+        delay(200);
+        at(pio, 60);              // 2ª ordem: cobre o caso do 1º comando ter
+        delay(200);               // acordado o módulo em vez de ser executado
     }
     acordouBLE = false; acordouBtn = false;
     g_sessaoConectada = false;   // sessão encerrou -> melodia toca de novo no próximo OK+CONN
@@ -1217,6 +1452,40 @@ void dormir() {
     }
 }
 
+// ⭐⭐ v2.16.2 — DETECTOR DE BOOT PARASITA (fim do bipe em loop com a placa
+// cortada). Com a placa hibernando (gate cortado), o TX da UART do módulo
+// (3,3V) vaza pelo diodo de proteção do pino RX e ALIMENTA fracamente o MCU.
+// Ele tenta bootar, BIPA e — pior — manda os AT da config no boot, que ACORDAM
+// o módulo e mantêm o TX alto: o ciclo se auto-alimenta e nunca para.
+// Como distinguir: alimentado de VERDADE o MCU roda com VCC = 5V (StepUp MT3608);
+// na alimentação parasita ele mal passa do brown-out (~3V). Medimos o VCC de
+// dentro do chip (referência interna de 1,1V lida contra o VCC) e, se estiver
+// baixo, o boot é FALSO: não bipa, não fala com o módulo, e dorme fundo — o
+// módulo então adormece (PWRM1), solta o TX e o corte vira silêncio.
+// ⚠️ v2.18.1: a PRIMEIRA conversão após trocar referência/canal é lixo — usá-la
+// direto fazia a função devolver valores absurdos (e, no detector de boot da
+// v2.16.2, ISSO MATAVA A PLACA: o MCU se mandava dormir para sempre a cada boot
+// e a fechadura ficava muda até ser regravada — caso real 02/08 na 2910).
+// Agora: descarta 2 conversões e devolve a MEDIANA de 3.
+uint16_t lerVccMv() {
+    ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);   // AVcc ref, bandgap 1V1
+    delay(5);                                     // o bandgap precisa assentar
+    for (uint8_t d = 0; d < 2; d++) {             // descarta as 2 primeiras
+        ADCSRA |= _BV(ADSC); while (ADCSRA & _BV(ADSC)); (void)ADC;
+    }
+    uint16_t a[3];
+    for (uint8_t i = 0; i < 3; i++) {
+        ADCSRA |= _BV(ADSC); while (ADCSRA & _BV(ADSC));
+        a[i] = ADC;
+        delayMicroseconds(200);
+    }
+    // mediana (imune a uma leitura fora da curva)
+    uint16_t med = (a[0] > a[1]) ? ((a[1] > a[2]) ? a[1] : (a[0] > a[2]) ? a[2] : a[0])
+                                 : ((a[0] > a[2]) ? a[0] : (a[1] > a[2]) ? a[2] : a[1]);
+    if (med < 50 || med > 1023) return 0;         // fora de faixa = inconclusivo
+    return (uint16_t)(1125300UL / med);           // 1,1V * 1023 * 1000 / adc
+}
+
 void setup() {
     // PLACA primeiro de tudo: os pinos do motor dependem dela (no FI 1.0 o
     // PB3 é motor, não LED — configurar errado chacoalharia o motor).
@@ -1246,6 +1515,25 @@ void setup() {
         *(volatile uint8_t *)0x64 |= 0x10;   // PRR0.PRUSART1 (UART1 ociosa)
         *(volatile uint8_t *)0x65 |= 0x3D;   // PRR1: TIM3|SPI1|TIM4|PTC|TWI1
     }
+
+    // (v2.16.2 tinha aqui um "detector de boot parasita" que mandava o MCU
+    // dormir para sempre se o VCC parecesse baixo. REMOVIDO na v2.18.1: uma
+    // leitura ruim do ADC bastava para a fechadura ficar MUDA até regravar
+    // — risco inaceitável para um ganho que o BOOT SILENCIOSO (v2.16.3) já
+    // entrega, quebrando a realimentação do loop sem tocar em energia.)
+
+    // ⭐ v2.19: só segue o boot quando a energia for REAL (ver esperaEnergiaReal)
+    if (EEPROM.read(EE_HIBERNA) == 1) esperaEnergiaReal();
+
+    // ⭐ v2.18 TELEMETRIA: conta boots e, separadamente, os que vieram de
+    // BROWN-OUT (BORF no MCUSR) — a métrica que separa "religou pelo mosfet"
+    // (power-on/PORF) de "morreu de queda de tensão".
+    { uint16_t n; EEPROM.get(EE_BOOTS, n); if (n == 0xFFFF) n = 0;
+      n++; EEPROM.put(EE_BOOTS, n);
+      if (g_mcusr & _BV(BORF)) {
+          EEPROM.get(EE_BODS, n); if (n == 0xFFFF) n = 0;
+          n++; EEPROM.put(EE_BODS, n);
+      } }
 
     // ESTOU VIVO — a PRIMEIRA coisa, antes de tudo. Beep curto e AGUDO ao energizar.
     // Se não tocar = hardware/energia.
@@ -1297,9 +1585,17 @@ void setup() {
     if (g_moduloFam > FAM_52) g_moduloFam = FAM_DESCONHECIDA;
     // Pino do MOSFET (gravado pelo gravar.sh/bancada; 90% da frota = 8).
     g_pinMosfet = EEPROM.read(EE_MOSFET);
-    if (g_pinMosfet < 4 || g_pinMosfet > 9) g_pinMosfet = 8;
+    if ((g_pinMosfet < 4 || g_pinMosfet > 9) && g_pinMosfet != 12) g_pinMosfet = 8;
     g_wakeHib = (EEPROM.read(EE_HIB) == 1);
     if (g_wakeHib) EEPROM.update(EE_HIB, 0);
+    // ⭐ v2.14.1 (generalizado; era só mosfet-auto): MCU nascendo com a CONEXÃO
+    // já de pé (PD3 alto) = religamento por conexão — mosfet G1 religado pelo
+    // AFTC (corte pós-uso do app!), pino-12 pelo PIO2, ou bateria trocada com
+    // app conectado. Tem um cliente ESPERANDO: caminho rápido, sem config de
+    // módulo (seria adiada de qualquer forma) e sem melodia. CRÍTICO p/ o
+    // corte pós-uso: a sonda TST-PING do app chega ~1-2s após o connect e o
+    // boot normal (identificação 5x) levava 2-4s = falso "firmware legado".
+    if (digitalRead(PIN_WAKE) == HIGH) g_wakeHib = true;
     g_hiberna = (EEPROM.read(EE_HIBERNA) == 1);   // hibernação por MOSFET ligada?
     DBG(F("[boot] hiberna=")); DBGLN(g_hiberna);
 
@@ -1325,16 +1621,45 @@ void setup() {
     //     verifica. ~3s. É o caso do campo (reset -> módulo volta a 9600).
     //  2) SÓ se falhar -> conversão pesada (sweep), no MÁXIMO 2 passadas.
     // Se PD3 estiver alto (app já conectado), nem tenta (vazaria) — adia.
-    if (digitalRead(PIN_WAKE) == HIGH) {
+    // ⭐⭐ v2.16.3 — BOOT SILENCIOSO EM PLACA JÁ PROVISIONADA (fim do loop
+    // parasita, que virou F07 em campo). O MCU NÃO fala mais com o módulo no
+    // boot quando a flag EE_MOD_CFG está marcada (a BANCADA é a dona da config
+    // desde a v2.14 e a NVM do módulo guarda tudo entre ciclos de bateria).
+    // PORQUÊ: com a placa cortada, o TX do módulo alimenta o MCU de forma
+    // parasita; ele boota fraco e — ao mandar a dúzia de AT da "auto-cura" —
+    // ACORDA o módulo, que mantém o TX alto: o ciclo nunca terminava (bipes,
+    // primeiro acionamento degradado, F07). O firmware LEGADO não sofria disso
+    // justamente porque só configurava o módulo no 1º boot.
+    // Placa NÃO provisionada (gravação manual, sem bancada) mantém o
+    // comportamento antigo: config + identificação + sweep.
+    bool jaProvisionada = (EEPROM.read(EE_MOD_CFG) == MOD_CFG_MAGIC);
+    if (jaProvisionada) {
+        moduloOk = true;                           // config vive na NVM do módulo
+        DBGLN(F("[boot] ja provisionada - boot silencioso (sem AT)"));
+    } else if (digitalRead(PIN_WAKE) == HIGH) {
         DBGLN(F("[boot] conectado - provisionamento adiado"));
     } else {
-        configModuloLeve();                        // caminho rápido: 9600 direto
+        configModuloLeve();                        // caminho rápido
         moduloOk = (bleIdentificar() != 0);
-        for (uint8_t t = 0; !moduloOk && t < 2 && digitalRead(PIN_WAKE) == LOW; t++) {
+        // ⭐ v2.13.3 ANTI-LOOP-DE-SUICÍDIO (caso 2910): o sweep pesado manda
+        // AT+RESET — nas placas com mosfet o reboot do módulo derruba o gate e
+        // CORTA o MCU no meio, que reboota e re-provisiona p/ sempre (bipe
+        // agudo a cada ~2s; conectar pausa porque o provisionamento é adiado).
+        // Regra: sweep SÓ se nunca provisionou (flag EE_MOD_CFG) e no máximo 3
+        // tentativas (EE_PROV_TENT, zerado pelo seed.bin e no sucesso). Depois
+        // disso o boot fica na config leve (sem reset — segura p/ o gate);
+        // conserto adicional é pelo ar (bancada), que não depende do MCU.
+        bool jaProv = (EEPROM.read(EE_MOD_CFG) == MOD_CFG_MAGIC);
+        uint8_t tent = EEPROM.read(EE_PROV_TENT);
+        if (tent == 0xFF) tent = 0;                // EEPROM virgem
+        for (uint8_t t = 0; !moduloOk && !jaProv && tent < 3 && t < 2 &&
+                            digitalRead(PIN_WAKE) == LOW; t++) {
+            EEPROM.update(EE_PROV_TENT, ++tent);   // conta ANTES (pode morrer no reset)
             DBG(F("[boot] 9600 falhou - sweep passada ")); DBGLN(t + 1);
             bleProvisionar();                      // converte de qualquer baud -> 9600
             moduloOk = (bleIdentificar() != 0);
         }
+        if (moduloOk) EEPROM.update(EE_PROV_TENT, 0);
     }
     // Verifica o módulo com RETRY p/ NÃO dar 4 beeps à toa: logo após o
     // provisionamento (AT+RESET) o módulo fica grogue e não responde AT+VERS? na
@@ -1349,6 +1674,12 @@ void setup() {
     //   módulo OK  -> 2 piscadas VERDES (silencioso; "pronta")
     //   módulo MUDO -> 4 bipes GRAVES + vermelho (erro real de BLE) + diag de baud
     if (moduloOk) {
+        piscar(CRGB::Green, 2);
+    } else if (EEPROM.read(EE_MOD_CFG) == MOD_CFG_MAGIC) {
+        // ⭐ v2.14: módulo mudo p/ CONSULTA mas JÁ PROVISIONADO (a bancada marca
+        // a flag no seed.bin e configura o módulo PELO AR — caso dos R0 surdos
+        // p/ AT do MCU, que funcionam 100% mesmo assim). Não é erro: sem 4
+        // graves nem diagnóstico de baud a cada troca de bateria. 2 verdes.
         piscar(CRGB::Green, 2);
     } else {
         sinalModuloMudo();
