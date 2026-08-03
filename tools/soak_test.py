@@ -240,7 +240,16 @@ async def main():
           f"CUTS={ult['cuts']}")
     try:
         bo, bd, ct = int(ult["boots"]), int(ult["bods"]), int(ult["cuts"])
-        print(f"  brown-outs: {bd} " + ("✅ nenhum" if bd == 0 else "❌ HÁ QUEDA DE TENSÃO"))
+        # ⚠️ com o corte por MOSFET ativo, TODO religamento é registrado como
+        # brown-out (a tensão cai de verdade quando o gate abre) — BODS≈BOOTS é
+        # o ESPERADO. Só é sintoma quando há brown-outs SEM cortes (queda de
+        # tensão real, tipicamente no giro do motor).
+        if ct > 0:
+            extra = bd - bo
+            print(f"  brown-outs: {bd} de {bo} boots — esperado com o corte ativo "
+                  + ("✅" if extra <= 0 else f"⚠️ {extra} além dos religamentos"))
+        else:
+            print(f"  brown-outs: {bd} " + ("✅ nenhum" if bd == 0 else "❌ QUEDA DE TENSÃO REAL"))
         if ct == 0:
             print("  corte de energia: ❌ o firmware NUNCA executou o corte")
         elif bo >= ct * 0.7:
