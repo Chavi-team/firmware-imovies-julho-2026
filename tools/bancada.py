@@ -80,10 +80,10 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.23.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.24.0"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.21.0"
+FIRMWARE_VERSION = "2.23.0"
 VERSION_DATE = "2026-08-03"               # data desta versão (ISO; bump a cada release)
 VERSION_NOTES = "Bancada v2.23.0: passo 3 CERTIFICAR (burn-in de 8 ciclos reais ABRIR/FECHAR com reconexão fria e repouso sorteado — reprova defeito intermitente antes do campo) ·  campo do pino MOSFET vira SELECT (8=placa 1.5 · 12=v2.7/retrofit 2024 via PIO2/VCC-EEPROM com AT+PWRM1) · AT+UART1 entra na receita de provisionamento · teste de hibernação oculto da UI (endpoints vivos) · at() resiliente ao DESPERTAR do módulo + diagnóstico ATOK (v2.21) · soak_test interpreta brown-out esperado do corte por MOSFET · firmware v2.21.0 embutido (apaga LEDs antes de perder energia; espera pela ENERGIA REAL no boot — fim do loop parasita)"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
@@ -708,6 +708,48 @@ class Ble:
     def provisionar_at(self, addr, comandos):
         return self._call(self._provisionar_at(addr, comandos), timeout=60)
 
+    # ---- LEITURA da config do módulo PELO AR (somente perguntas) -------------
+    # Espelho do _provisionar_at, mas sem escrever nada: manda "AT+XXX?" e
+    # devolve {pergunta: resposta}. É o que permite AUDITAR uma fechadura em
+    # campo sem abrir a placa — o MCU não participa (em MODE2 o módulo
+    # intercepta o AT vindo do celular e responde ele mesmo).
+    async def _ler_at(self, addr, perguntas):
+        from bleak import BleakClient
+        if self.client and self.client.is_connected:
+            await self.client.disconnect()
+        self.client = BleakClient(addr)
+        await self.client.connect()
+        rx = {"txt": "", "ev": asyncio.Event()}
+
+        def cb(_c, data: bytearray):
+            r = data.decode("utf-8", errors="ignore").strip("\x00\r\n ")
+            if r:
+                rx["txt"] = r
+                rx["ev"].set()
+
+        await self.client.start_notify(CHR_FFE1, cb)
+        await asyncio.sleep(1.2)
+        out = {}
+        for q in perguntas:
+            rx["txt"] = ""; rx["ev"].clear()
+            await self.client.write_gatt_char(CHR_FFE1, q.encode("utf-8"), response=False)
+            try:
+                await asyncio.wait_for(rx["ev"].wait(), timeout=2.0)
+                out[q] = rx["txt"]
+            except asyncio.TimeoutError:
+                out[q] = ""
+            await asyncio.sleep(0.35)
+        for fn in (lambda: self.client.stop_notify(CHR_FFE1), lambda: self.client.disconnect()):
+            try:
+                await fn()
+            except Exception:
+                pass
+        self.client = None
+        return out
+
+    def ler_at(self, addr, perguntas):
+        return self._call(self._ler_at(addr, perguntas), timeout=90)
+
 
 # ---------------------------------------------------------------------------
 # Backend
@@ -1044,6 +1086,158 @@ def receita_ar(alvo, mosfet_pin):
             "AT+NOTI1", "AT+ADVI2", f"AT+BEFC{befc}", f"AT+AFTC{aftc}",
             f"AT+NAME{alvo}", "AT+PWRM1", "AT+RESET"]
     return cmds
+
+
+# ---------------------------------------------------------------------------
+# AUDITORIA E CONSERTO PELO AR (frota em campo, sem abrir a placa)
+# ---------------------------------------------------------------------------
+# Contexto (09/08/2026): a frota tem 2.000+ FI que NÃO podem ser abertas. Numa
+# placa com BEFC000/AFTC028 o MCU nunca consegue configurar o módulo — ela só
+# tem energia enquanto há cliente conectado, e conectado o PD3 está alto,
+# condição em que o firmware (corretamente) se recusa a mandar AT. A saída é o
+# ar: em AT+MODE2 (padrão de fábrica) o manual garante que o módulo "permite
+# comandos AT vindos do dispositivo remoto".
+
+# O que cada parâmetro TEM de valer, e com que comando se corrige.
+# A ordem desta lista é a ordem de aplicação; PWRM fica por último de propósito
+# (depois dele o módulo dorme e para de ouvir a UART).
+def config_esperada(alvo, mosfet_pin):
+    befc, aftc = calcular_hex_befc_aftc(mosfet_pin)
+    return [
+        # (pergunta,      esperado, comando de correção,  crítico?)
+        ("AT+BAUD?",      "0",      "AT+BAUD0",           True),
+        ("AT+UART?",      "1",      "AT+UART1",           True),
+        ("AT+ROLE?",      "0",      "AT+ROLE0",           True),
+        ("AT+IMME?",      "0",      "AT+IMME0",           False),
+        ("AT+ADTY?",      "0",      "AT+ADTY0",           True),
+        ("AT+TYPE?",      "0",      "AT+TYPE0",           False),
+        ("AT+DELI?",      "3",      "AT+DELI3",           False),
+        ("AT+NOTI?",      "1",      "AT+NOTI1",           False),
+        ("AT+ADVI?",      "2",      "AT+ADVI2",           False),
+        # ⚠️ STATUS: o manual do 5.2 (p.29) AVISA que o AT+STATUS CONFLITA com
+        # BEFC/AFTC e exige AT+RESET depois. O padrão é 0 (desligado). Achado em
+        # campo na 003FI002910: STATUS=A (PIO10) — apontando para um pino sem
+        # trilha, mas em cima justamente do mecanismo que faz o corte funcionar.
+        ("AT+STATUS?",    "0",      "AT+STATUS0",         False),
+        ("AT+BEFC?",      befc,     f"AT+BEFC{befc}",     True),
+        ("AT+AFTC?",      aftc,     f"AT+AFTC{aftc}",     True),
+        ("AT+NAME?",      alvo,     f"AT+NAME{alvo}",     True),
+        ("AT+PWRM?",      "1",      "AT+PWRM1",           True),
+    ]
+
+
+def _valor(resposta):
+    """Extrai o valor de 'OK+Get:XXX' / 'OK+Set:XXX'. Vazio se não reconhecer."""
+    if not resposta:
+        return ""
+    for marca in ("OK+Get:", "OK+Set:", "OK+NAME:", "OK+ADDR:"):
+        i = resposta.find(marca)
+        if i >= 0:
+            return resposta[i + len(marca):].strip()
+    return resposta.strip()
+
+
+# Trava de segurança: nunca gravar um par BEFC/AFTC que deixe o gate SEM
+# caminho de volta. Se o bit do mosfet estiver 0 no AFTC, a placa é cortada e
+# NUNCA MAIS religa ao conectar — foi o que matou a CH003FI002910/R0 em 02/08.
+def _par_mascaras_seguro(befc, aftc, mosfet_pin):
+    try:
+        m = int(mosfet_pin)
+        if m in (0, 12):
+            return True, ""       # sem gate endereçável: máscaras são inócuas
+        bit = 1 << (m - 3)        # PIO3 = bit0
+        if int(aftc, 16) & bit:
+            return True, ""
+        return False, (f"AFTC {aftc} NÃO liga o PIO{m} (bit {bit:#05x}) ao conectar: "
+                       f"gravar isso corta o trilho PARA SEMPRE.")
+    except Exception as e:
+        return False, f"máscaras ilegíveis ({e})"
+
+
+def _auditar(alvo, mosfet_pin):
+    """Lê a config pelo ar e devolve (addr, achados, leitura_bruta).
+    achados = lista de (pergunta, esperado, lido, ok, comando, critico)."""
+    addr = BLE.scan(alvo, timeout=10.0)
+    if not addr:
+        LOG(f"✗ '{alvo}' não apareceu no ar. Aproxime-se e tente de novo.", "err")
+        return None, None, None
+    esperado = config_esperada(alvo, mosfet_pin)
+    perguntas = ["AT+VERS?"] + [p for p, _e, _c, _k in esperado]
+    LOG(f"🔎 Lendo a configuração de '{alvo}' pelo ar ({len(perguntas)} perguntas)…", "hi")
+    bruto = BLE.ler_at(addr, perguntas)
+    vers = _valor(bruto.get("AT+VERS?", ""))
+    LOG(f"  módulo: {vers or '(não respondeu ao AT+VERS?)'}")
+    achados = []
+    for p, e, c, k in esperado:
+        lido = _valor(bruto.get(p, ""))
+        achados.append((p, e, lido, lido.upper() == e.upper(), c, k))
+    return addr, achados, bruto
+
+
+def act_laudo(alvo, mosfet_pin="8"):
+    """SOMENTE LEITURA — audita uma fechadura em campo e emite o laudo.
+    Não escreve absolutamente nada; seguro para rodar em porta de cliente."""
+    addr, achados, _bruto = _auditar(alvo, mosfet_pin)
+    if achados is None:
+        return False
+    mudos = [p for p, _e, lido, _ok, _c, _k in achados if not lido]
+    if len(mudos) == len(achados):
+        LOG("✗ O módulo não respondeu a NENHUMA pergunta. Ou há outro cliente "
+            "conectado nela (feche o app), ou o módulo não está em MODE2.", "err")
+        return False
+    ruins = [a for a in achados if not a[3]]
+    for p, e, lido, ok, _c, k in achados:
+        alvo_txt = f"{p[3:-1]:<7}"
+        if ok:
+            LOG(f"  ✓ {alvo_txt} {lido}")
+        elif not lido:
+            LOG(f"  ? {alvo_txt} (sem resposta)", "warn")
+        else:
+            LOG(f"  ✗ {alvo_txt} {lido}  (esperado {e}){'  ← CRÍTICO' if k else ''}", "err")
+    if not ruins:
+        LOG("✅ LAUDO: configuração do módulo ÍNTEGRA — nada a corrigir.", "ok")
+        return True
+    criticos = [a for a in ruins if a[5]]
+    LOG(f"⚠️ LAUDO: {len(ruins)} divergência(s), {len(criticos)} crítica(s). "
+        f"Use CORRIGIR para aplicar só o que está fora.", "warn")
+    return False
+
+
+def act_corrigir_ar(alvo, mosfet_pin="8"):
+    """Aplica PELO AR apenas os parâmetros divergentes (conserto cirúrgico).
+    Não usa a receita inteira: quanto menos se escreve numa fechadura em campo,
+    menor o risco. Termina com AT+RESET só se algo mudou."""
+    addr, achados, _bruto = _auditar(alvo, mosfet_pin)
+    if achados is None:
+        return False
+    ruins = [a for a in achados if not a[3] and a[2]]   # divergente E respondeu
+    if not ruins:
+        LOG("✅ Nada a corrigir.", "ok")
+        return True
+
+    befc, aftc = calcular_hex_befc_aftc(mosfet_pin)
+    seguro, motivo = _par_mascaras_seguro(befc, aftc, mosfet_pin)
+    mexe_mascara = any(p in ("AT+BEFC?", "AT+AFTC?") for p, *_ in ruins)
+    if mexe_mascara and not seguro:
+        LOG(f"⛔ ABORTADO por segurança: {motivo}", "err")
+        return False
+
+    # PWRM0 primeiro acorda um módulo com herança de sleep; o PWRM definitivo
+    # vai por último, imediatamente antes do RESET.
+    cmds = ["AT+PWRM0"]
+    cmds += [c for p, _e, _l, _ok, c, _k in ruins if p != "AT+PWRM?"]
+    if any(p == "AT+PWRM?" for p, *_ in ruins):
+        cmds.append("AT+PWRM1")
+    cmds.append("AT+RESET")
+
+    LOG(f"🔧 Corrigindo {len(ruins)} parâmetro(s) de '{alvo}' pelo ar:", "hi")
+    ok = BLE.provisionar_at(addr, cmds)
+    if not ok:
+        LOG("⚠️ Algum comando não respondeu — reconfira com o LAUDO.", "warn")
+        return False
+    LOG("✓ Aplicado. Reconferindo…", "ok")
+    time.sleep(3.0)                      # o AT+RESET derruba e o módulo reanuncia
+    return act_laudo(alvo, mosfet_pin)
 
 
 # ADOÇÃO POR CICLO DE ENERGIA — identifica FISICAMENTE a fechadura da bancada
@@ -2261,6 +2455,26 @@ PAGE = r"""<!DOCTYPE html>
     <div class="comp" id="comp"></div>
     <button class="big green" style="margin-top:12px" onclick="finalizar()">✔ FINALIZAR e iniciar a próxima</button>
 
+    <!-- ⭐⭐ v2.24 — CAMPO (PELO AR). Atende as 2.000+ FI já instaladas, que não
+         podem ser abertas. Não usa cabo e não depende do MCU: em AT+MODE2 o
+         módulo aceita comandos AT vindos do celular/bancada, então dá para
+         AUDITAR e CORRIGIR a configuração do rádio à distância. -->
+    <div style="margin-top:18px;padding:12px;border:1px dashed var(--amber);border-radius:10px">
+      <div style="font-weight:600;margin-bottom:6px">📡 Fechadura em campo (pelo ar, sem cabo)</div>
+      <div style="color:var(--muted);font-size:13px;margin-bottom:10px">
+        Para unidades <b>já instaladas</b>. Basta estar perto da fechadura e ter
+        o nome/serial preenchido na tela 1. O <b>Laudo</b> é <b>somente leitura</b>
+        — pode rodar em porta de cliente sem risco. O <b>Corrigir</b> grava
+        apenas os parâmetros que estiverem fora da receita, e se recusa a gravar
+        um par de máscaras que cortaria o trilho para sempre.
+        ⚠️ Feche o app no celular antes: com outro cliente conectado o módulo
+        não responde.</div>
+      <div class="row" style="flex-wrap:wrap;gap:8px">
+        <button id="btn-laudo">🔎 Laudo (só leitura)</button>
+        <button id="btn-corrigir-ar">🔧 Corrigir pelo ar</button>
+      </div>
+    </div>
+
     <!-- ⭐ v2.13: teste de HIBERNAÇÃO visível (validação do MOSFET). Fora do
          fluxo numerado de propósito — é teste de engenharia, sob demanda.
          Usa o campo "Pino MOSFET" da tela 1: 12 = teste por UPTIME (auto,
@@ -2450,6 +2664,8 @@ function renderSteps(){
   if($("#btn-renomear"))  $("#btn-renomear").onclick=doRenomear;
   if($("#btn-hib-on"))    $("#btn-hib-on").onclick=(e)=>runStep("hibernar", e.currentTarget);
   if($("#btn-hib-off"))   $("#btn-hib-off").onclick=(e)=>runStep("hib-off", e.currentTarget);
+  if($("#btn-laudo"))       $("#btn-laudo").onclick=(e)=>runStep("laudo", e.currentTarget);
+  if($("#btn-corrigir-ar")) $("#btn-corrigir-ar").onclick=(e)=>runStep("corrigir-ar", e.currentTarget);
 }
 
 let STEP_STATE={};
@@ -2832,6 +3048,13 @@ class Handler(BaseHTTPRequestHandler):
         if step == "hibernar":
             r = act_hibernar_seguro(serial, mcu, b.get("mosfet", "8"))
             return {"ok": True, "hibernacao": bool(r and r.get("hibernacao"))}
+        # Auditoria/conserto PELO AR — os dois passos que atendem a frota em
+        # campo sem abrir a placa. O LAUDO é somente leitura (seguro em porta de
+        # cliente); o CORRIGIR aplica só o que está divergente.
+        if step == "laudo":
+            return {"ok": bool(act_laudo(serial, b.get("mosfet", "8")))}
+        if step == "corrigir-ar":
+            return {"ok": bool(act_corrigir_ar(serial, b.get("mosfet", "8")))}
         fn = {"gravar": act_gravar, "validar": act_validar, "conectar": act_conectar,
               "autoteste": act_autoteste, "certificar": act_certificar,
               "cadastrar": act_cadastrar,
