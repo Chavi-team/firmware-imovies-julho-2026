@@ -102,7 +102,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.23.1"
+#define FW_VERSION   "2.24.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -1759,6 +1759,29 @@ void setup() {
     // ⭐ v2.19: só segue o boot quando a energia for REAL (ver esperaEnergiaReal)
     if (EEPROM.read(EE_HIBERNA) == 1) esperaEnergiaReal();
 
+    // ⭐⭐⭐ v2.24 — RÁDIO ESCUTANDO O QUANTO ANTES (retrocompatibilidade da
+    // hibernação). ESTE É O PONTO QUE QUEBRAVA O APP DE CAMPO.
+    //
+    // Numa placa que hiberna (BEFC000), quem religa o trilho é a CONEXÃO BLE:
+    // quando o MCU boota, o celular JÁ ESTÁ CONECTADO e começa a escrever. Só
+    // que a interrupção de RX do SoftwareSerial só passa a existir depois do
+    // bluetooth.begin() — que estava lá embaixo, DEPOIS do bipe, dos LEDs, da
+    // EEPROM e do INA219. Tudo que o app escrevesse nessa janela caía no vazio:
+    // não há buffer antes do begin(). O app >=1.7.17 disfarça retransmitindo; o
+    // que está em campo (1.7.16, 343 usuários) escreve UMA vez, não recebe
+    // confirmação e — pior — declarava sucesso assim mesmo (caso Caroline,
+    // 10/08: 5 acionamentos "com sucesso", fechadura parada).
+    //
+    // Subindo o begin() para cá, o buffer de 64 B do SoftwareSerial começa a
+    // guardar imediatamente e o atenderApp() encontra os bytes esperando. A
+    // janela surda cai de centenas de ms para dezenas — a hibernação vira
+    // TRANSPARENTE para qualquer versão de app.
+    //
+    // ⚠️ Tem de ser DEPOIS do esperaEnergiaReal(), nunca antes: armar a UART com
+    // alimentação parasita realimenta o loop de boot (o TX do módulo vazando
+    // pelo diodo do RX é, literalmente, "dado chegando").
+    bluetooth.begin(BAUD_MODULO);
+
     // ⭐ v2.18 TELEMETRIA: conta boots e, separadamente, os que vieram de
     // BROWN-OUT — a métrica que separa "religou pelo mosfet" de "morreu de
     // queda de tensão".
@@ -1865,11 +1888,13 @@ void setup() {
     DBG(F(" seeds=")); DBG((seed01 && seed02) ? F("ok") : F("VAZIAS"));
     DBG(F(" versBLE=")); DBGLN(g_moduloVers);
 
-    // Rádio: 9600 fixo (BAUD_MODULO). 1º boot após gravar = provisionamento completo
-    // (converge baud + config + nome + reset); boots seguintes = config leve.
-    // Boot de WAKE da hibernação = caminho RÁPIDO: o módulo já está configurado
-    // e tem um app conectado ESPERANDO — nada de config/melodia, só atender.
-    bluetooth.begin(BAUD_MODULO);
+    // Rádio: o bluetooth.begin() JÁ FOI FEITO lá em cima, logo após o
+    // esperaEnergiaReal() (v2.24) — a UART precisa estar escutando desde o
+    // primeiro instante numa placa que hiberna. 1º boot após gravar =
+    // provisionamento completo (converge baud + config + nome + reset); boots
+    // seguintes = config leve. Boot de WAKE da hibernação = caminho RÁPIDO: o
+    // módulo já está configurado e tem um app conectado ESPERANDO — nada de
+    // config/melodia, só atender.
     if (g_wakeHib) {
         DBGLN(F("[boot] wake da hibernacao - atendendo direto"));
         return;                              // loop() atende já no 1º giro
