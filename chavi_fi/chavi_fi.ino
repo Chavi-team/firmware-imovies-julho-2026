@@ -102,7 +102,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.26.0"
+#define FW_VERSION   "2.27.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -1693,15 +1693,46 @@ void dormir() {
         // isso repetir não custa nada — a única saída bem-sucedida do laço é
         // deixar de existir. Isso torna a correção robusta mesmo se a minha
         // teoria de timing estiver errada.
-        at("AT+PIO60", 60);       // arma a borda de wake E serve de preâmbulo
-        char pio[12];             // corta pelo PIO do MOSFET (EEPROM 914, default 8)
+        // ⭐⭐⭐ v2.27 — SEQUÊNCIA IDÊNTICA À DO FIRMWARE LEGADO QUE FUNCIONAVA.
+        // Fonte: chavi-firmware-legado/firmware/FI_1_5_400/FI_1_5_400.ino,
+        // função goToSleep():
+        //     disconnectBLE1010();    -> rotinaWriteBluetooth("AT+DROP")
+        //     activeBLE1010Connect(); -> rotinaWriteBluetooth("AT+PIO61")
+        //     rotinaWriteBluetooth("AT+PIO80");
+        // e rotinaWriteBluetooth faz `bluetooth.write(str)` + RespostaBLE(),
+        // que começa com delay(100).
+        //
+        // DUAS DIFERENÇAS que o firmware novo tinha introduzido, e que explicam
+        // o corte ter parado de funcionar:
+        //
+        // 1) TERMINADOR. O legado escreve a string PURA, SEM '\r'. O at() daqui
+        //    manda com '\r'. Confirmado em campo pelo app (v1.7.17: "AT pelo ar
+        //    vai SEM terminador — provado em campo: com \r o módulo ignora") e
+        //    confirmado por mim em 10/08: mandei "AT+PIO80" pelo BLE SEM
+        //    terminador e a placa cortou de primeira (OK+Set:80).
+        //
+        // 2) PIO6 ALTO, não baixo. O legado manda AT+PIO6**1**; o novo mandava
+        //    AT+PIO6**0**, achando que "armava a borda de wake". Como PIO6 vai
+        //    ao PD3, e o at() tem a trava "PD3 alto = não envia", trocar para 0
+        //    foi provavelmente uma adaptação para driblar a própria trava — e
+        //    mudou a semântica da receita.
+        //
+        // Por isso escrevo direto no SoftwareSerial: o at() não serve aqui (põe
+        // '\r' e é bloqueado pelo PD3 que o PIO61 acabou de levantar).
+        char pio[12];
+        bluetooth.write("AT+DROP");  delay(120);
+        while (bluetooth.available()) bluetooth.read();
+        bluetooth.write("AT+PIO61"); delay(120);   // PIO6 ALTO (como o legado)
+        while (bluetooth.available()) bluetooth.read();
         snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
-        for (uint8_t t = 0; t < 6; t++) {
-            bluetooth.print('\r');        // sacrifício: acorda o módulo
-            delay(12);
-            bluetooth.print(pio); bluetooth.print('\r');
-            delay(90);                    // se cortou, não voltamos daqui
+        for (uint8_t t = 0; t < 3; t++) {
+            bluetooth.write(pio);    delay(150);   // se cortou, não voltamos daqui
         }
+        // Sobreviveu = não cortou. Devolve o PIO6 para BAIXO, senão o PD3 fica
+        // alto e o dormir() abaixo escolheria o ramo IDLE (mA) em vez do
+        // PWR_DOWN (µA) — trocaríamos um dreno por outro.
+        bluetooth.write("AT+PIO60"); delay(120);
+        while (bluetooth.available()) bluetooth.read();
         // Chegou aqui = NÃO cortou. Pergunta ao módulo o estado REAL do pino e
         // guarda para o laudo — na próxima leitura o TST-INFO diz, numa letra,
         // de quem é a culpa:
@@ -1712,8 +1743,7 @@ void dormir() {
         //   CUT8:? -> o módulo não respondeu à pergunta.
         snprintf(pio, sizeof(pio), "AT+PIO%X?", g_pinMosfet);
         while (bluetooth.available()) bluetooth.read();
-        bluetooth.print('\r'); delay(12);
-        bluetooth.print(pio); bluetooth.print('\r');
+        bluetooth.write(pio);              // sem terminador, como o legado
         char ult = '?';
         unsigned long tq = millis();
         while (millis() - tq < 400) {
