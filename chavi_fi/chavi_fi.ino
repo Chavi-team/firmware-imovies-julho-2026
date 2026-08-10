@@ -102,7 +102,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.24.0"
+#define FW_VERSION   "2.25.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -182,6 +182,12 @@
 #define JANELA_MS    20000     // ocioso E desconectado: dorme após isso
 #define JANELA_TST   60000     // janela estendida durante testes de bancada
 #define JANELA_MAX   600000UL  // teto absoluto acordada (10 min) — mesmo conectada
+#define OCIOSO_CONECTADO_MS 300000UL  // ⭐ v2.25: conectado e SEM COMANDO por 5
+                               // min = sessão abandonada -> derruba. Conectado o
+                               // MCU fica em IDLE (mA) e o trilho LIGADO, então
+                               // conexão esquecida é dreno contínuo. Conta desde
+                               // o último byte recebido, não desde o connect —
+                               // assim quem está usando de verdade não é cortado.
 
 // Gap entre NOTIFICAÇÕES consecutivas. ⚠️ ESTE lote de módulo ("Soft BLE 5.2")
 // IGNORA o '\n' e fatia as notificações por TEMPO: writes a <~50ms colam numa
@@ -1414,6 +1420,16 @@ void atenderApp() {
     static unsigned long tAbs = 0;
     static bool tAbsArmado = false;
     if (!tAbsArmado || digitalRead(PIN_WAKE) == LOW) { tAbs = millis(); tAbsArmado = true; }
+    // ⭐⭐ v2.25 — OCIOSIDADE CONECTADA. Enquanto há cliente conectado o MCU fica
+    // em SLEEP_MODE_IDLE (mA, não µA) e o trilho segue LIGADO: uma conexão
+    // esquecida em segundo plano custa bateria continuamente. O teto absoluto
+    // JANELA_MAX (10 min) não serve sozinho porque derrubaria também quem está
+    // USANDO a fechadura. Agora conta o tempo desde o ÚLTIMO COMANDO: 5 min sem
+    // nada chegando = a sessão está abandonada, derruba (e a desconexão faz o
+    // BEFC cortar o trilho de novo).
+    static unsigned long tUltimoCmd = 0;
+    static bool cmdArmado = false;
+    if (!cmdArmado || digitalRead(PIN_WAKE) == LOW) { tUltimoCmd = millis(); cmdArmado = true; }
     unsigned long janela = JANELA_MS;
     uint8_t step = 0;
     while (millis() - t0 < janela && millis() - tAbs < JANELA_MAX) {
@@ -1425,9 +1441,15 @@ void atenderApp() {
         // antigo derrubava a sessão no meio (AT+DROP) -> F05 no calibrar.
         // Desconectou -> zera o handshake (rodada nova do app começa do zero)
         // e aí sim os 20s ociosos contam até dormir/hibernar.
-        if (digitalRead(PIN_WAKE) == HIGH) t0 = millis();
+        if (digitalRead(PIN_WAKE) == HIGH) {
+            t0 = millis();
+            // conectado, mas sem nenhum comando há OCIOSO_CONECTADO_MS -> sai
+            // do laço; o bloco pós-laço derruba a conexão à força.
+            if (millis() - tUltimoCmd >= OCIOSO_CONECTADO_MS) break;
+        }
         else if (step != 0) step = 0;
         if (bluetooth.available() <= 0) continue;
+        tUltimoCmd = millis();          // chegou byte = sessão viva
         int pk = bluetooth.peek();
         if (pk == '\n' || pk == '\r' || pk == ' ' || pk == '\t') { bluetooth.read(); continue; }
 
@@ -1503,11 +1525,23 @@ void atenderApp() {
     // força (aqui o AT PRECISA sair com PD3 alto — é exatamente o caso do
     // `forcar`) e, se ainda assim não ceder, reinicia: um reset é infinitamente
     // melhor que uma fechadura acordada para sempre drenando a bateria.
-    if (millis() - tAbs >= JANELA_MAX && digitalRead(PIN_WAKE) == HIGH) {
+    // ⭐ v2.25: além do teto absoluto, derruba também a sessão OCIOSA (5 min sem
+    // nenhum comando). São causas diferentes com o mesmo remédio — o teto pega o
+    // PIO6 latchado; a ociosidade pega a conexão de fundo esquecida, que é o que
+    // drena bateria no dia a dia.
+    bool estourouTeto  = (millis() - tAbs >= JANELA_MAX);
+    bool sessaoOciosa  = (millis() - tUltimoCmd >= OCIOSO_CONECTADO_MS);
+    if ((estourouTeto || sessaoOciosa) && digitalRead(PIN_WAKE) == HIGH) {
+        DBGLN(estourouTeto ? F("[app] teto absoluto - derrubando")
+                           : F("[app] sessao ociosa 5min - derrubando"));
         at("AT+DROP", 300, /*forcar=*/true);
         delay(400);
-        if (digitalRead(PIN_WAKE) == HIGH) resetMCU();
-        tAbsArmado = false;               // rearma a janela para a próxima sessão
+        // Só reseta no caso do teto (PIO6 possivelmente latchado). Sessão ociosa
+        // que não caiu no 1º DROP não justifica reset: a próxima volta tenta de
+        // novo, e resetar à toa custa um ciclo de boot inteiro.
+        if (digitalRead(PIN_WAKE) == HIGH && estourouTeto) resetMCU();
+        tAbsArmado = false;               // rearma as janelas para a próxima sessão
+        cmdArmado  = false;
     }
 }
 
