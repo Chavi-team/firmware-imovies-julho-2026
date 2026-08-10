@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.24.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.25.0"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.27.0"
@@ -190,10 +190,29 @@ def calcular_hex_befc_aftc(mosfet_pin):
             return "020", "028"
         if m_pin == 12:
             return "000", "008"
+        # ⭐⭐⭐ CORREÇÃO 10/08 — o bit do MOSFET tem de estar NO BEFC TAMBÉM.
+        # Fonte: a esteira de produção legada que configurou a frota que
+        # FUNCIONA — Firmware-Antigo/src/at.js, calcularHexBefcAftc():
+        #     if (mosfetBit >= 0 && mosfetBit < 12) {
+        #         bitsBefc[mosfetBit] = 1;      <-- esta linha
+        #         bitsAftc[mosfetBit] = 1;
+        #     }
+        #     bitsBefc[pin6Bit] = 0;  bitsAftc[pin6Bit] = 1;
+        # Para o pino 8 isso dá BEFC020/AFTC028. A nossa versão tinha PERDIDO a
+        # linha do BEFC e gerava BEFC000 — invertendo a lógica:
+        #   BEFC020 = gate ALTO ao energizar  -> placa nasce LIGADA, e o
+        #             AT+PIO80 do firmware é o que a derruba. (legado, correto)
+        #   BEFC000 = gate BAIXO ao energizar -> placa nasce MORTA e só religa
+        #             se alguém conectar. Foi o que matou a CH003FI002910/R0 em
+        #             02/08 e o que está na 2910 hoje (BEFC:000, lido por BLE).
+        # Repare que o próprio fallback "sem mosfet" logo acima já devolvia o
+        # par correto ("020","028") — a intenção estava certa, o caminho
+        # genérico é que regrediu.
         mosfet_bit = m_pin - 3          # PIO3 = bit0
         bits_befc = [0] * 12
         bits_aftc = [0] * 12
         if 0 <= mosfet_bit < 12:
+            bits_befc[mosfet_bit] = 1   # gate ALTO já ao energizar
             bits_aftc[mosfet_bit] = 1
         bits_befc[3] = 0                # PIO6 (wake) BAIXO antes da conexão
         bits_aftc[3] = 1                # PIO6 ALTO depois -> borda de wake
