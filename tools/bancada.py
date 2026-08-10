@@ -80,12 +80,12 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.12.4"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.25.0"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.12.1"
-VERSION_DATE = "2026-07-11"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.12.4 (produção em lote): gravação 2 estágios refinada — fuses+EEPROM no SCK lento (EEPROM é limitada pelo silício: rápido não ganha nada e falhava em parte dos chips), FLASH no rápido (-13s) com fallback automático · retry automático 1x no 'target does not answer' do 1º contato do USBasp · módulo clone com MAC como nome (12 hex, ex. 94DEB80D5852) aceito como VIRGEM no provisionamento e na adoção (guardas: só colado na bancada, perde de SOFT AT) · scan com saída antecipada no serial exato + reuso da sessão BLE entre provisionar/conectar · firmware segue v2.12.1"
+FIRMWARE_VERSION = "2.27.0"
+VERSION_DATE = "2026-08-10"               # data desta versão (ISO; bump a cada release)
+VERSION_NOTES = "Bancada v2.25.0: ⭐ RESTAURA o bit do MOSFET na máscara BEFC — o corte do trilho volta a funcionar. A receita gerava BEFC000 (gate BAIXO ao energizar: a placa nasce morta e o comando de corte manda o pino para o estado em que ele já está) onde a esteira legada gera BEFC020 (gate ALTO: a placa nasce ligada e o AT+PIO80 do firmware é o que a derruba). Provado na CH003FI002910 em 10/08: com BEFC000, 10 min de repouso davam BOOTS:0 CUTS:1 (não cortou); depois do AT+BEFC020 pelo ar, BOOTS e CUTS passaram a subir JUNTOS. ⚠️ Toda placa provisionada por versões anteriores desta bancada saiu com BEFC000 e NÃO corta (bateria muito abaixo do previsto) — corrija cada uma pelo passo 'Corrigir pelo ar', sem abrir nada; o laudo já aponta a divergência de BEFC sozinho. · v2.24.0: auditoria linha a linha com conserto pelo ar. · Firmware v2.27.0 embutido: o corte volta a ser IDÊNTICO ao do legado que funcionava — AT sem terminador '\\r' (com ele o módulo ignora) e PIO6 ALTO (AT+PIO61), não baixo; antes disso, v2.23.0 fechou 17 achados de auditoria, entre eles o motor que podia ficar ligado para sempre (I2C do INA219 sem timeout, agora com watchdog de 8s), a telemetria que só grava EEPROM em modo soak (em campo eram ~480 escritas/dia) e o botão travado que gerava loop de reset."
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -168,18 +168,51 @@ def seeds_de(serial):
     return [get_seed(serial, k) for k in range(1, 5)]
 
 
-# BEFC/AFTC a partir do pino do MOSFET (idêntico ao AT.py do dev): o gate do
-# MOSFET (alimenta periféricos/MCU) fica ALTO antes e depois da conexão; o PIO6
-# (wake) fica BAIXO antes e ALTO depois -> a borda que acorda o MCU.
-#   pino MOSFET 8 -> BEFC020 / AFTC028  (90% das FIs). Campo configurável.
+# ⭐⭐ v2.20 — BEFC do gate = 0 (CORTE PERSISTENTE). PROVADO em bancada 02/08:
+# o módulo RE-APLICA o estado "pré-conexão" (BEFC) algumas dezenas de segundos
+# depois de a conexão cair. Com BEFC020 (gate alto) isso RELIGAVA a placa
+# sozinha (~40s depois do corte, medido) e a economia sumia. Com BEFC000 o
+# mesmo mecanismo MANTÉM o gate baixo: a placa fica desligada até a próxima
+# CONEXÃO, que a religa pelo AFTC (medido: 60s cortada, uptime 4s ao voltar).
+#   AFTC continua com o gate + PIO6 (wake): pino 8 -> AFTC028.
+# ⚠️ Efeito colateral aceito: ao COLOCAR A BATERIA a placa nasce desligada e só
+# acorda na 1ª conexão do app (sem melodia de boot). É o preço do corte real.
 def calcular_hex_befc_aftc(mosfet_pin):
     try:
         m_pin = int(mosfet_pin)
+        # ⭐ v2.13 MOSFET-AUTO (pino físico 12 = PIO2/VCC-EEPROM do módulo): o
+        # gate NÃO cabe nas máscaras (BEFC/AFTC cobrem só PIO3..11) — quem
+        # corta/religa é o auto-sleep (PWRM1). ⭐ v2.13.1 SEGURANÇA: as máscaras
+        # seguram o PIO8 alto mesmo assim (inócuo no pino-12; salva uma GERAÇÃO 1
+        # rotulada errada como 12 — o BEFC000 da v2.13.0 CORTAVA o trilho dessas
+        # placas p/ sempre; caso real CH003FI002910/R0 em 02/08).
+        if m_pin == 0:            # SEM mosfet: nada a chavear; config clássica
+            return "020", "028"
+        if m_pin == 12:
+            return "000", "008"
+        # ⭐⭐⭐ CORREÇÃO 10/08 — o bit do MOSFET tem de estar NO BEFC TAMBÉM.
+        # Fonte: a esteira de produção legada que configurou a frota que
+        # FUNCIONA — Firmware-Antigo/src/at.js, calcularHexBefcAftc():
+        #     if (mosfetBit >= 0 && mosfetBit < 12) {
+        #         bitsBefc[mosfetBit] = 1;      <-- esta linha
+        #         bitsAftc[mosfetBit] = 1;
+        #     }
+        #     bitsBefc[pin6Bit] = 0;  bitsAftc[pin6Bit] = 1;
+        # Para o pino 8 isso dá BEFC020/AFTC028. A nossa versão tinha PERDIDO a
+        # linha do BEFC e gerava BEFC000 — invertendo a lógica:
+        #   BEFC020 = gate ALTO ao energizar  -> placa nasce LIGADA, e o
+        #             AT+PIO80 do firmware é o que a derruba. (legado, correto)
+        #   BEFC000 = gate BAIXO ao energizar -> placa nasce MORTA e só religa
+        #             se alguém conectar. Foi o que matou a CH003FI002910/R0 em
+        #             02/08 e o que está na 2910 hoje (BEFC:000, lido por BLE).
+        # Repare que o próprio fallback "sem mosfet" logo acima já devolvia o
+        # par correto ("020","028") — a intenção estava certa, o caminho
+        # genérico é que regrediu.
         mosfet_bit = m_pin - 3          # PIO3 = bit0
         bits_befc = [0] * 12
         bits_aftc = [0] * 12
         if 0 <= mosfet_bit < 12:
-            bits_befc[mosfet_bit] = 1
+            bits_befc[mosfet_bit] = 1   # gate ALTO já ao energizar
             bits_aftc[mosfet_bit] = 1
         bits_befc[3] = 0                # PIO6 (wake) BAIXO antes da conexão
         bits_aftc[3] = 1                # PIO6 ALTO depois -> borda de wake
@@ -213,7 +246,23 @@ def gerar_seed_bin(serial, placa, caminho, mosfet="8"):
         m = int(mosfet)
     except Exception:
         m = 8
-    eeprom[914] = m if 4 <= m <= 9 else 8
+    eeprom[914] = m if (4 <= m <= 9 or m in (0, 12)) else 8   # 0 = SEM mosfet
+    # ⭐⭐ v2.16.1: HIBERNAÇÃO (913) LIGADA POR PADRÃO nas placas com mosfet.
+    # O corte que SOBREVIVE à desconexão é o do FIRMWARE (dormir): a ordem
+    # AT+DROP -> AT+PIO<x>0 faz o módulo re-aplicar o BEFC ANTES do corte, então
+    # o corte é a última palavra até a próxima conexão (AFTC religa). O corte do
+    # APP, mandado CONECTADO, é desfeito quando o app desconecta (o módulo
+    # re-aplica o BEFC020 nesse evento) — provado em campo 02/08. Isso só é
+    # possível agora porque a 2400-slow o MCU consegue falar com o módulo.
+    # Desligar numa unidade: botão/TST-HIB-OFF na bancada.
+    eeprom[913] = 0x01 if eeprom[914] else 0x00   # corte só com mosfet
+    # ⭐ v2.14: a bancada PROVISIONA O MÓDULO PELO AR logo após gravar — o seed
+    # dela já marca "módulo provisionado" (910=0xC9) p/ o firmware NUNCA rodar o
+    # sweep pesado (os AT+RESET dele cortam a própria placa nos modelos com
+    # mosfet — loop de suicídio do caso 2910). O gerar_seed.py de linha de
+    # comando (gravação manual SEM bancada) continua deixando 0 = o firmware
+    # se auto-provisiona como antes.
+    eeprom[910] = 0xC9
     # 916 QUEIMADO (ex-variante sem MOSFET, removida na v2.11.1): fica 0 —
     # placas sem MOSFET usam a config NORMAL (o MCU delas é sempre alimentado).
     with open(caminho, "wb") as f:
@@ -678,6 +727,48 @@ class Ble:
     def provisionar_at(self, addr, comandos):
         return self._call(self._provisionar_at(addr, comandos), timeout=60)
 
+    # ---- LEITURA da config do módulo PELO AR (somente perguntas) -------------
+    # Espelho do _provisionar_at, mas sem escrever nada: manda "AT+XXX?" e
+    # devolve {pergunta: resposta}. É o que permite AUDITAR uma fechadura em
+    # campo sem abrir a placa — o MCU não participa (em MODE2 o módulo
+    # intercepta o AT vindo do celular e responde ele mesmo).
+    async def _ler_at(self, addr, perguntas):
+        from bleak import BleakClient
+        if self.client and self.client.is_connected:
+            await self.client.disconnect()
+        self.client = BleakClient(addr)
+        await self.client.connect()
+        rx = {"txt": "", "ev": asyncio.Event()}
+
+        def cb(_c, data: bytearray):
+            r = data.decode("utf-8", errors="ignore").strip("\x00\r\n ")
+            if r:
+                rx["txt"] = r
+                rx["ev"].set()
+
+        await self.client.start_notify(CHR_FFE1, cb)
+        await asyncio.sleep(1.2)
+        out = {}
+        for q in perguntas:
+            rx["txt"] = ""; rx["ev"].clear()
+            await self.client.write_gatt_char(CHR_FFE1, q.encode("utf-8"), response=False)
+            try:
+                await asyncio.wait_for(rx["ev"].wait(), timeout=2.0)
+                out[q] = rx["txt"]
+            except asyncio.TimeoutError:
+                out[q] = ""
+            await asyncio.sleep(0.35)
+        for fn in (lambda: self.client.stop_notify(CHR_FFE1), lambda: self.client.disconnect()):
+            try:
+                await fn()
+            except Exception:
+                pass
+        self.client = None
+        return out
+
+    def ler_at(self, addr, perguntas):
+        return self._call(self._ler_at(addr, perguntas), timeout=90)
+
 
 # ---------------------------------------------------------------------------
 # Backend
@@ -984,9 +1075,188 @@ BOOT_ESPERA_S = 30   # boot + provisionamento + melodia levam ~24s; margem p/ 30
 #   Depois: baud 9600 + config de dados/wake + nome + reset.
 def receita_ar(alvo, mosfet_pin):
     befc, aftc = calcular_hex_befc_aftc(mosfet_pin)
-    return ["AT+PWRM0", "AT+BAUD2", "AT+ROLE0", "AT+TYPE0", "AT+DELI3",
+    # ⭐ v2.13 MOSFET-AUTO (pino 12): o PWRM final é 1 — auto-sleep LIGADO de
+    # propósito (módulo ocioso dorme -> PIO2 cai -> mosfet corta a placa; a
+    # conexão BLE acorda e religa). O PWRM0 INICIAL fica: acorda módulos com
+    # herança de sleep p/ o resto da receita entrar; o PWRM definitivo vai por
+    # último, imediatamente antes do RESET.
+    # ⭐ v2.14: a BANCADA é a dona da config do módulo (decisão 02/08 — módulos
+    # R0 são surdos p/ AT do MCU; pelo ar TODOS obedecem). Receita COMPLETA,
+    # espelhando o que o firmware fazia por UART + a esteira legada:
+    #   VERS?   = identificação família/rev no LOG (matriz r0/r2)
+    #   SHIELD1 = 1º comando da esteira de produção legada
+    #   MODE2   = controle remoto — é o que permite app/bancada mandarem AT
+    #   IMME0   = anuncia sozinho ao ligar (IMME1 residual = some do ar)
+    #   ADTY0   = anúncio conectável (ADTY errado = conserto pelo ar impossível)
+    # NÃO mandar pelo ar: AT+PIO60 (derrubaria o PD3 no meio da sessão) e
+    # AT+RENEW (proibido — apaga BEFC/AFTC = mata placa com mosfet).
+    # (sem AT+MODE2: o 5.2 rev05 responde ERRO+CMD_N_PERMITIDO pelo ar —
+    # mudança de modo é bloqueada remotamente por segurança; MODE2 já é o
+    # padrão de fábrica dos dois módulos.)
+    # ⭐⭐ v2.16 — 2400-SLOW (BAUD0) + PWRM1 para TODAS as placas: a config da
+    # esteira legada (at.js), agora entendida. PWRM1 (auto-sleep) mata o
+    # BACKFEED (módulo acordado alimenta parasiticamente o MCU da placa cortada
+    # pelo TX da UART = bipe em loop ~1s) e derruba o rádio de 1,5 p/ 0,65mA;
+    # e o auto-sleep SÓ é utilizável em BAUD0, o único baud com wake-por-dado
+    # na UART (o pino 24/WAKE tem só pull-up na placa). O PWRM0 INICIAL fica:
+    # acorda módulo dormindo p/ o resto da receita entrar.
+    cmds = ["AT+PWRM0", "AT+VERS?", "AT+SHIELD1", "AT+BAUD0", "AT+UART1",
+            "AT+ROLE0", "AT+IMME0", "AT+ADTY0", "AT+TYPE0", "AT+DELI3",
             "AT+NOTI1", "AT+ADVI2", f"AT+BEFC{befc}", f"AT+AFTC{aftc}",
-            f"AT+NAME{alvo}", "AT+RESET"]
+            f"AT+NAME{alvo}", "AT+PWRM1", "AT+RESET"]
+    return cmds
+
+
+# ---------------------------------------------------------------------------
+# AUDITORIA E CONSERTO PELO AR (frota em campo, sem abrir a placa)
+# ---------------------------------------------------------------------------
+# Contexto (09/08/2026): a frota tem 2.000+ FI que NÃO podem ser abertas. Numa
+# placa com BEFC000/AFTC028 o MCU nunca consegue configurar o módulo — ela só
+# tem energia enquanto há cliente conectado, e conectado o PD3 está alto,
+# condição em que o firmware (corretamente) se recusa a mandar AT. A saída é o
+# ar: em AT+MODE2 (padrão de fábrica) o manual garante que o módulo "permite
+# comandos AT vindos do dispositivo remoto".
+
+# O que cada parâmetro TEM de valer, e com que comando se corrige.
+# A ordem desta lista é a ordem de aplicação; PWRM fica por último de propósito
+# (depois dele o módulo dorme e para de ouvir a UART).
+def config_esperada(alvo, mosfet_pin):
+    befc, aftc = calcular_hex_befc_aftc(mosfet_pin)
+    return [
+        # (pergunta,      esperado, comando de correção,  crítico?)
+        ("AT+BAUD?",      "0",      "AT+BAUD0",           True),
+        ("AT+UART?",      "1",      "AT+UART1",           True),
+        ("AT+ROLE?",      "0",      "AT+ROLE0",           True),
+        ("AT+IMME?",      "0",      "AT+IMME0",           False),
+        ("AT+ADTY?",      "0",      "AT+ADTY0",           True),
+        ("AT+TYPE?",      "0",      "AT+TYPE0",           False),
+        ("AT+DELI?",      "3",      "AT+DELI3",           False),
+        ("AT+NOTI?",      "1",      "AT+NOTI1",           False),
+        ("AT+ADVI?",      "2",      "AT+ADVI2",           False),
+        # ⚠️ STATUS: o manual do 5.2 (p.29) AVISA que o AT+STATUS CONFLITA com
+        # BEFC/AFTC e exige AT+RESET depois. O padrão é 0 (desligado). Achado em
+        # campo na 003FI002910: STATUS=A (PIO10) — apontando para um pino sem
+        # trilha, mas em cima justamente do mecanismo que faz o corte funcionar.
+        ("AT+STATUS?",    "0",      "AT+STATUS0",         False),
+        ("AT+BEFC?",      befc,     f"AT+BEFC{befc}",     True),
+        ("AT+AFTC?",      aftc,     f"AT+AFTC{aftc}",     True),
+        ("AT+NAME?",      alvo,     f"AT+NAME{alvo}",     True),
+        ("AT+PWRM?",      "1",      "AT+PWRM1",           True),
+    ]
+
+
+def _valor(resposta):
+    """Extrai o valor de 'OK+Get:XXX' / 'OK+Set:XXX'. Vazio se não reconhecer."""
+    if not resposta:
+        return ""
+    for marca in ("OK+Get:", "OK+Set:", "OK+NAME:", "OK+ADDR:"):
+        i = resposta.find(marca)
+        if i >= 0:
+            return resposta[i + len(marca):].strip()
+    return resposta.strip()
+
+
+# Trava de segurança: nunca gravar um par BEFC/AFTC que deixe o gate SEM
+# caminho de volta. Se o bit do mosfet estiver 0 no AFTC, a placa é cortada e
+# NUNCA MAIS religa ao conectar — foi o que matou a CH003FI002910/R0 em 02/08.
+def _par_mascaras_seguro(befc, aftc, mosfet_pin):
+    try:
+        m = int(mosfet_pin)
+        if m in (0, 12):
+            return True, ""       # sem gate endereçável: máscaras são inócuas
+        bit = 1 << (m - 3)        # PIO3 = bit0
+        if int(aftc, 16) & bit:
+            return True, ""
+        return False, (f"AFTC {aftc} NÃO liga o PIO{m} (bit {bit:#05x}) ao conectar: "
+                       f"gravar isso corta o trilho PARA SEMPRE.")
+    except Exception as e:
+        return False, f"máscaras ilegíveis ({e})"
+
+
+def _auditar(alvo, mosfet_pin):
+    """Lê a config pelo ar e devolve (addr, achados, leitura_bruta).
+    achados = lista de (pergunta, esperado, lido, ok, comando, critico)."""
+    addr = BLE.scan(alvo, timeout=10.0)
+    if not addr:
+        LOG(f"✗ '{alvo}' não apareceu no ar. Aproxime-se e tente de novo.", "err")
+        return None, None, None
+    esperado = config_esperada(alvo, mosfet_pin)
+    perguntas = ["AT+VERS?"] + [p for p, _e, _c, _k in esperado]
+    LOG(f"🔎 Lendo a configuração de '{alvo}' pelo ar ({len(perguntas)} perguntas)…", "hi")
+    bruto = BLE.ler_at(addr, perguntas)
+    vers = _valor(bruto.get("AT+VERS?", ""))
+    LOG(f"  módulo: {vers or '(não respondeu ao AT+VERS?)'}")
+    achados = []
+    for p, e, c, k in esperado:
+        lido = _valor(bruto.get(p, ""))
+        achados.append((p, e, lido, lido.upper() == e.upper(), c, k))
+    return addr, achados, bruto
+
+
+def act_laudo(alvo, mosfet_pin="8"):
+    """SOMENTE LEITURA — audita uma fechadura em campo e emite o laudo.
+    Não escreve absolutamente nada; seguro para rodar em porta de cliente."""
+    addr, achados, _bruto = _auditar(alvo, mosfet_pin)
+    if achados is None:
+        return False
+    mudos = [p for p, _e, lido, _ok, _c, _k in achados if not lido]
+    if len(mudos) == len(achados):
+        LOG("✗ O módulo não respondeu a NENHUMA pergunta. Ou há outro cliente "
+            "conectado nela (feche o app), ou o módulo não está em MODE2.", "err")
+        return False
+    ruins = [a for a in achados if not a[3]]
+    for p, e, lido, ok, _c, k in achados:
+        alvo_txt = f"{p[3:-1]:<7}"
+        if ok:
+            LOG(f"  ✓ {alvo_txt} {lido}")
+        elif not lido:
+            LOG(f"  ? {alvo_txt} (sem resposta)", "warn")
+        else:
+            LOG(f"  ✗ {alvo_txt} {lido}  (esperado {e}){'  ← CRÍTICO' if k else ''}", "err")
+    if not ruins:
+        LOG("✅ LAUDO: configuração do módulo ÍNTEGRA — nada a corrigir.", "ok")
+        return True
+    criticos = [a for a in ruins if a[5]]
+    LOG(f"⚠️ LAUDO: {len(ruins)} divergência(s), {len(criticos)} crítica(s). "
+        f"Use CORRIGIR para aplicar só o que está fora.", "warn")
+    return False
+
+
+def act_corrigir_ar(alvo, mosfet_pin="8"):
+    """Aplica PELO AR apenas os parâmetros divergentes (conserto cirúrgico).
+    Não usa a receita inteira: quanto menos se escreve numa fechadura em campo,
+    menor o risco. Termina com AT+RESET só se algo mudou."""
+    addr, achados, _bruto = _auditar(alvo, mosfet_pin)
+    if achados is None:
+        return False
+    ruins = [a for a in achados if not a[3] and a[2]]   # divergente E respondeu
+    if not ruins:
+        LOG("✅ Nada a corrigir.", "ok")
+        return True
+
+    befc, aftc = calcular_hex_befc_aftc(mosfet_pin)
+    seguro, motivo = _par_mascaras_seguro(befc, aftc, mosfet_pin)
+    mexe_mascara = any(p in ("AT+BEFC?", "AT+AFTC?") for p, *_ in ruins)
+    if mexe_mascara and not seguro:
+        LOG(f"⛔ ABORTADO por segurança: {motivo}", "err")
+        return False
+
+    # PWRM0 primeiro acorda um módulo com herança de sleep; o PWRM definitivo
+    # vai por último, imediatamente antes do RESET.
+    cmds = ["AT+PWRM0"]
+    cmds += [c for p, _e, _l, _ok, c, _k in ruins if p != "AT+PWRM?"]
+    if any(p == "AT+PWRM?" for p, *_ in ruins):
+        cmds.append("AT+PWRM1")
+    cmds.append("AT+RESET")
+
+    LOG(f"🔧 Corrigindo {len(ruins)} parâmetro(s) de '{alvo}' pelo ar:", "hi")
+    ok = BLE.provisionar_at(addr, cmds)
+    if not ok:
+        LOG("⚠️ Algum comando não respondeu — reconfira com o LAUDO.", "warn")
+        return False
+    LOG("✓ Aplicado. Reconferindo…", "ok")
+    time.sleep(3.0)                      # o AT+RESET derruba e o módulo reanuncia
+    return act_laudo(alvo, mosfet_pin)
 
 
 # ADOÇÃO POR CICLO DE ENERGIA — identifica FISICAMENTE a fechadura da bancada
@@ -1060,7 +1330,9 @@ def act_provisionar(serial, mcu, mosfet_pin):
             BLE.connect(addr)
         except Exception:
             return False
-        for _ in range(4):
+        # 2 tentativas bastam: fechadura viva responde na 1ª (o boot já
+        # terminou quando chegamos aqui). Mais tentativas só alongavam a falha.
+        for _ in range(2):
             ok, _r = BLE.cmd("TST-PING", ["PONG"], timeout=3)
             if ok:
                 return True
@@ -1073,12 +1345,8 @@ def act_provisionar(serial, mcu, mosfet_pin):
         except Exception as e:
             LOG(f"✗ Erro ao provisionar pelo ar: {e}", "err"); return False
         if not ok:
-            LOG("⚠️ Algum AT ficou sem resposta — repetindo uma vez...", "warn")
-            time.sleep(3)
-            try:
-                ok = BLE.provisionar_at(addr, receita_ar(alvo, mosfet_pin))
-            except Exception:
-                ok = False
+            LOG("⚠️ Algum AT ficou sem resposta (o RESET final não responde por "
+                "design). Sigo — o PONG é o juiz.", "warn")
         # ⭐ CRÍTICO (aprendido na 002FI001767): depois do AT+RESET, o MÓDULO já
         # está 100% configurado (todos OK+Set acima) — mas o MCU faz o PRÓPRIO
         # provisionamento no boot, e enquanto NÓS estivermos conectados o módulo
@@ -1086,26 +1354,44 @@ def act_provisionar(serial, mcu, mosfet_pin):
         # "AT+VERS?" que vazam pro túnel são ELE tentando) e nunca chega a
         # responder PONG. A cura é DESCONECTAR e deixar o MCU terminar SOZINHO.
         # Foi exatamente o "esperei e reconectei" que resolveu na mão.
+        # Desconecta e deixa o MCU terminar sozinho: conectados, o módulo fica
+        # em túnel e não responde ao MCU. UMA espera (a 2ª nunca salvou um caso
+        # real — quando falha, falha pelas duas).
         BLE.disconnect()
-        for tentativa in (1, 2):
-            LOG(f"Módulo configurado. Deixando o MCU terminar sozinho "
-                f"(desconectado, ~30s — tentativa {tentativa}/2)...", "hi")
-            time.sleep(30)   # DESCONECTADO de propósito: não competir com o MCU
-            if _pong():
-                LOG("✓ Rádio provisionado pelo ar (PWRM0 + 9600 + wake + nome) e "
-                    "respondendo (PONG).", "ok")
-                return True
-        # 2 tentativas sem PONG: o rádio está OK (provado pelos OK+Set), o MCU não
+        LOG("Módulo configurado. Deixando o MCU terminar sozinho (desconectado, ~30s)...", "hi")
+        time.sleep(30)
+        if _pong():
+            LOG("✓ Rádio provisionado pelo ar (2400-slow + PWRM1 + wake + nome) "
+                "e respondendo (PONG).", "ok")
+            return True
         _GRAVA_TS = time.time()
-        LOG("⚠️ Rádio configurado pelo ar, mas sem PONG do MCU após ~60s. "
-            "DIAGNÓSTICO PELO SOM ao religar a bateria: SILÊNCIO = sem energia "
-            "(bateria/fuses) · 1 bipe + 4 GRAVES = MCU vivo mas UART módulo→MCU "
-            "marginal (solda) · MELODIA = pronto, é só conectar de novo.", "warn")
+        LOG("⚠️ Rádio configurado pelo ar, mas sem PONG do MCU. DIAGNÓSTICO PELO "
+            "SOM ao religar a bateria: SILÊNCIO = sem energia (bateria/fuses) · "
+            "1 bipe + 4 GRAVES = MCU vivo mas UART módulo→MCU marginal (solda) · "
+            "MELODIA = pronto, é só conectar de novo.", "warn")
         return bool(ok)
 
     LOG("Verificando o rádio BLE (o firmware se auto-provisiona no boot)...", "hi")
+    recem_gravada = bool(_GRAVA_TS) and (time.time() - _GRAVA_TS) < 300
     if _pong():
-        LOG("✓ Rádio provisionado e respondendo (PONG). Reforço por BLE dispensado.", "ok")
+        if not recem_gravada:
+            LOG("✓ Rádio provisionado e respondendo (PONG). Reforço por BLE dispensado.", "ok")
+            STATUS("provisionar", "ok"); return True
+        # ⭐ v2.14.1: placa RECÉM-GRAVADA responde PONG, mas a receita roda MESMO
+        # ASSIM — a bancada é a dona da config do módulo (MODE2/IMME0/ADTY0/
+        # VERS?/máscaras). Pular no PONG deixava drift antigo na NVM: na 2910 a
+        # receita nova nunca chegou a rodar porque o PONG a dispensava.
+        LOG("PONG ok — placa recém-gravada: aplicando a receita COMPLETA pelo ar "
+            "mesmo assim (a bancada é a dona da config do módulo).", "hi")
+        try:
+            BLE.disconnect(); time.sleep(1.2)
+            addr = BLE.scan(alvo, timeout=8.0)
+        except Exception:
+            addr = None
+        if addr and _reforcar(addr):
+            STATUS("provisionar", "ok"); return True
+        LOG("⚠️ Não consegui aplicar a receita agora — a fechadura responde (PONG); "
+            "sigo em frente. Rode o passo de novo p/ forçar a receita.", "warn")
         STATUS("provisionar", "ok"); return True
 
     # Sem PONG → acha o módulo: alvo exato, virgem ou garble (scan blindado)...
@@ -1216,6 +1502,72 @@ def act_autoteste(serial, mcu):
     if todos_ok:
         LOG("✓✓ AUTO-TESTE PASSOU.", "ok"); STATUS("autoteste", "ok"); return True
     LOG("✗ Auto-teste com falha(s).", "err"); STATUS("autoteste", "fail"); return False
+
+
+def act_certificar(serial, mcu, ciclos=8):
+    """Burn-in de APROVAÇÃO antes do campo: N ciclos REAIS de acionamento
+    (ABRIR/FECHAR alternados) com reconexão fria e repouso sorteado entre os
+    ciclos — o pior-caso de uso condensado, como o app faria. Critério duro:
+    TODO ciclo precisa de PONG + 2 confirmações (chegada do comando e fim do
+    giro). Qualquer falha REPROVA a unidade — é exatamente o defeito
+    intermitente (UART marginal, módulo surdo, motor fraco) que hoje só
+    aparece na casa do cliente."""
+    STATUS("certificar", "run")
+    alvo = serial[2:] if serial.startswith("CH") else serial
+    import random as _rnd
+    falhas, bats = [], []
+    LOG(f"🏋️ CERTIFICAR: {ciclos} ciclos reais de acionamento (burn-in ~5 min). "
+        "Deixe a fechadura parada e NÃO conecte o app do celular.", "hi")
+    for i in range(1, ciclos + 1):
+        verbo = "ABRIR" if i % 2 == 1 else "FECHAR"
+        # Reconexão FRIA a cada ciclo — replica o app (e exercita o religamento
+        # nas placas com corte por mosfet).
+        if BLE.conectado():
+            BLE.disconnect()
+            time.sleep(1.0)
+        if i > 1:
+            repouso = _rnd.choice([3, 8, 15])
+            LOG(f"  ciclo {i}/{ciclos}: repouso de {repouso}s…")
+            time.sleep(repouso)
+        try:
+            addr = BLE.scan(alvo, timeout=8.0)
+            if not addr:
+                falhas.append((i, "não apareceu no scan"))
+                LOG(f"  ✗ ciclo {i}: fechadura fora do ar", "err"); continue
+            BLE.connect(addr)
+        except Exception as e:
+            falhas.append((i, f"conexão: {e}"))
+            LOG(f"  ✗ ciclo {i}: erro de conexão ({e})", "err"); continue
+        ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=6)
+        if not ok:
+            falhas.append((i, "sem PONG"))
+            LOG(f"  ✗ ciclo {i}: conectou mas sem PONG", "err"); continue
+        # Verbo + 2 confirmações: o alvo impossível nunca casa — o cmd roda o
+        # teto inteiro acumulando o buffer, e o veredito sai da contagem de
+        # confirmações "[12]0xx" (1ª = comando chegou, 2ª = motor PAROU).
+        _, buf = BLE.cmd(verbo, ["\x00nunca\x00"], timeout=18)
+        n = len(re.findall(r"[12]0\d{2}", buf))
+        m = re.findall(r"[12]0(\d\.\d\d)", buf)
+        if m:
+            try: bats.append(float(m[-1]))
+            except ValueError: pass
+        if n >= 2:
+            LOG(f"  ✓ ciclo {i}/{ciclos}: {verbo} completo (giro confirmado)", "ok")
+        elif n == 1:
+            falhas.append((i, f"{verbo}: motor não confirmou o fim do giro"))
+            LOG(f"  ✗ ciclo {i}: só 1 confirmação — o giro não concluiu", "err")
+        else:
+            falhas.append((i, f"{verbo}: sem nenhuma confirmação"))
+            LOG(f"  ✗ ciclo {i}: verbo sem confirmação", "err")
+    if bats:
+        LOG(f"  bateria durante o burn-in: {min(bats):.2f}–{max(bats):.2f}V", "hi")
+    if not falhas:
+        LOG(f"✓✓ CERTIFICADA: {ciclos}/{ciclos} ciclos perfeitos — liberada p/ campo.", "ok")
+        STATUS("certificar", "ok"); return True
+    LOG(f"✗✗ REPROVADA: {len(falhas)} falha(s) em {ciclos} ciclos — NÃO instalar em campo:", "err")
+    for c, msg in falhas:
+        LOG(f"    ciclo {c}: {msg}", "err")
+    STATUS("certificar", "fail"); return False
 
 
 def act_teste1(serial, cmd):
@@ -1340,10 +1692,13 @@ def act_consertar_modulo(serial):
             "refaça o passo 1.", "ok")
         time.sleep(4)
         return True
-    LOG("Aplicando o padrão v2.10.1 pelo ar: PWRM0 (acorda a UART) + 9600 + reset...", "hi")
+    LOG("Aplicando o padrão v2.16 pelo ar: PWRM0 (acorda a UART) + 2400-slow "
+        "+ PWRM1 + reset...", "hi")
     BLE.cmd("AT+PWRM0", ["OK", "+"], timeout=2)
     time.sleep(0.4)
-    BLE.cmd("AT+BAUD2", ["OK", "+"], timeout=2)
+    BLE.cmd("AT+BAUD0", ["OK", "+"], timeout=2)
+    time.sleep(0.4)
+    BLE.cmd("AT+PWRM1", ["OK", "+"], timeout=2)
     time.sleep(0.4)
     BLE.cmd("AT+RESET", ["OK", "+"], timeout=2)
     BLE.disconnect()
@@ -1363,7 +1718,7 @@ def act_consertar_modulo(serial):
             LOG("✓✓ PONG! O módulo estava dormindo (PWRM1 legado) ou em baud "
                 "errado — PLACA RECUPERADA. Rode o auto-teste completo.", "ok")
             return True
-    LOG("✗ Sem PONG mesmo com o módulo acordado (PWRM0) a 9600 e comprovadamente "
+    LOG("✗ Sem PONG mesmo com o módulo reconfigurado (2400-slow) e comprovadamente "
         "bom pelo ar → solda/trilha TX-RX entre módulo e MCU = DEFEITO FÍSICO "
         "(laudo fechado).", "err")
     return False
@@ -1377,7 +1732,190 @@ def act_consertar_modulo(serial):
 # MOSFET; se cortou, o MCU some do ar e depois RELIGA sozinho (Rocky). Re-scan +
 # PONG = ciclo provado seguro nesta fechadura.
 # ---------------------------------------------------------------------------
-def act_testar_hibernacao(serial, mcu):
+# ⭐ v2.13.5 — PLANO C: corte REMOTO pelo ar (p/ módulos surdos ao AT do MCU,
+# caso 2910/R0). Em MODE2 o lado remoto controla os PIOs; a bancada manda
+# AT+PIO<x>0 pela MESMA conexão de dados:
+#   FASE 1 — corte comandado: AT+PIO<x>0 -> o MCU tem que CALAR (TST-PING mudo
+#            com o módulo ainda conectado = prova em tempo real de corte);
+#            desconecta/reconecta -> AFTC religa -> uptime voltou p/ trás.
+#   FASE 2 — experimento NVM: AT+BEFC000 + desconectar -> se o módulo reaplica
+#            o estado pré-conexão na desconexão, a placa corta SOZINHA sempre
+#            que o app sai (arquitetura 100% hardware, nem o app comanda).
+#            Restaura BEFC020 no fim (estado seguro conhecido).
+# Se a FASE 1 passar, o corte em produção é comandável PELO APP (mesmo canal).
+def _pong_paciente(alvo, tentativas=5):
+    """PONG com paciência de BOOT FRIO: a placa recém-religada fica ~5-8s surda
+    (bipe + config-leve + identificação antes do atenderApp) — um PING único se
+    perde nesse meio (falso "não religou", caso real da 2910 em 02/08).
+    Reconecta se a sessão cair entre as tentativas."""
+    for _ in range(tentativas):
+        if not BLE.conectado():
+            try:
+                addr = BLE.scan(alvo, timeout=8)
+                if addr:
+                    BLE.connect(addr)
+            except Exception:
+                pass
+        if BLE.conectado():
+            try:
+                ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=4)
+                if ok:
+                    return True
+            except Exception:
+                pass
+        time.sleep(3)
+    return False
+
+
+def _testar_corte_remoto(alvo, mosfet, u1):
+    try:
+        pio = int(str(mosfet).strip())
+    except Exception:
+        pio = 8
+    if not 5 <= pio <= 11:
+        pio = 8                         # MODE2 só controla PIO5..11 remotamente
+    # ---- FASE 1: corte comandado pelo ar ----
+    ok, _ = BLE.cmd(f"AT+PIO{pio}0", ["OK+Set"], timeout=5)
+    if not ok:
+        LOG(f"✗ O módulo não aceitou AT+PIO{pio}0 pelo ar (sem OK+Set) — nem o "
+            "remoto controla os PIOs deste módulo. Sem caminho de corte.", "err")
+        STATUS("hibernar", "fail"); return False
+    ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=5)
+    if ok:
+        LOG(f"✗ O MCU AINDA RESPONDE após o corte remoto — o gate não é PIO{pio} "
+            "(ou o módulo não executou de verdade). Religando por garantia.", "err")
+        BLE.cmd(f"AT+PIO{pio}1", ["OK+Set"], timeout=5)
+        STATUS("hibernar", "fail"); return False
+    LOG(f"✓ CORTOU: o MCU calou após AT+PIO{pio}0 (módulo segue conectado, placa "
+        "sem energia). Agora o religamento pela conexão (AFTC)...", "ok")
+    try:
+        BLE.disconnect()
+    except Exception:
+        pass
+    time.sleep(3)
+    addr = None
+    for _ in range(3):
+        try:
+            addr = BLE.scan(alvo, timeout=10)
+        except Exception:
+            addr = None
+        if addr:
+            break
+    if not addr:
+        LOG("✗ Não reapareceu no scan após o corte — religue a bateria e me avise.", "err")
+        STATUS("hibernar", "fail"); return False
+    try:
+        BLE.connect(addr)
+    except Exception as e:
+        LOG(f"✗ Erro ao reconectar: {e}", "err")
+        STATUS("hibernar", "fail"); return False
+    # v2.14.1: PONG com paciência de boot frio (o falso "AFTC não religou" da
+    # 1ª rodada foi um PING único disparado ~2s após o GATT, no meio do boot).
+    if not _pong_paciente(alvo):
+        LOG("✗ Reconectou mas o MCU não voltou mesmo com paciência (~20s). "
+            "Se o botão físico estiver mudo, o AFTC não religou — ciclo de "
+            "bateria religa (BEFC020 no power-on). Regrave/reteste.", "err")
+        STATUS("hibernar", "fail"); return False
+    u2, _ = _uptime_via_info()
+    if u2 is None or (u2 + 5) >= u1:
+        LOG(f"✗ Inconclusivo: uptime {u1}s → {u2}s (esperava reboot).", "err")
+        STATUS("hibernar", "fail"); return False
+    LOG(f"✅ CORTE REMOTO PROVADO: uptime {u1}s → {u2}s (o MCU rebootou). O corte "
+        f"pelo ar (AT+PIO{pio}0) funciona e a CONEXÃO religa — este é o caminho "
+        "que o APP pode usar em produção nesta geração de placa.", "ok")
+    # ---- FASE 2 (⭐ v2.15.2, o experimento DE VERDADE): BEFC000 + AT+RESET.
+    # Descoberta do run 10:42 (2910/5.2 ver.05): o módulo re-aplica na
+    # DESCONEXÃO o BEFC que carregou no BOOT (cache) — máscara escrita pelo ar
+    # só vale após RESET (mesmo padrão do BAUD/NAME). A fase 2 antiga escrevia
+    # BEFC000 e testava com o 020 ainda em cache: inconclusiva. Sequência real:
+    #   BEFC000 + RESET -> módulo reboota e aplica 000 (placa CORTA já aqui)
+    #   -> conectar religa (AFTC028) -> desconectar -> esperar -> reconectar:
+    #   uptime PEQUENO = ficou cortada DESCONECTADA = corte automático por
+    #   hardware em toda desconexão (gap zero, sem app nem firmware).
+    LOG("Experimento BEFC000+RESET (máscaras deste módulo só valem após reset): "
+        "a placa deve CORTAR já no reboot do módulo e ficar cortada sempre que "
+        "desconectada.", "hi")
+    befc_corta = False
+    u3 = u4 = None
+    if BLE.cmd("AT+BEFC000", ["OK+Set"], timeout=5)[0]:
+        try:
+            BLE.cmd("AT+RESET", ["OK+RESET"], timeout=4)
+        except Exception:
+            pass
+        try:
+            BLE.disconnect()
+        except Exception:
+            pass
+        time.sleep(6)                       # módulo reboota; BEFC000 corta a placa
+        addr = None
+        for _ in range(3):
+            try:
+                addr = BLE.scan(alvo, timeout=10)
+            except Exception:
+                addr = None
+            if addr:
+                break
+        if addr:
+            try:
+                BLE.connect(addr)
+            except Exception:
+                addr = None
+        if addr and _pong_paciente(alvo, tentativas=4):
+            u3, _ = _uptime_via_info()      # religou na conexão -> deve ser pequeno
+            try:
+                BLE.disconnect()
+            except Exception:
+                pass
+            time.sleep(20)                  # desconectada: deve FICAR cortada
+            addr = None
+            try:
+                addr = BLE.scan(alvo, timeout=10)
+            except Exception:
+                addr = None
+            if addr:
+                try:
+                    BLE.connect(addr)
+                    if _pong_paciente(alvo, tentativas=4):
+                        u4, _ = _uptime_via_info()
+                        befc_corta = (u4 is not None and u4 <= 15)
+                except Exception:
+                    pass
+            LOG(f"BEFC000 valendo: religou com uptime {u3}s; após 20s desconectada, "
+                f"reconectar deu uptime {u4}s "
+                f"({'FICOU CORTADA desconectada ✓' if befc_corta else 'seguiu LIGADA ✗'}).",
+                "ok" if befc_corta else "warn")
+    if befc_corta:
+        LOG("✅✅ MELHOR CENÁRIO CONFIRMADO: com BEFC000 valendo, a placa corta "
+            "SOZINHA em toda desconexão e religa em qualquer conexão — corte por "
+            "hardware, gap ZERO, sem app nem firmware comandando nada.", "ok")
+    else:
+        LOG("ℹ️ BEFC000 não sustentou o corte desconectada — o corte fica por "
+            "comando do APP (fase 1, provado).", "hi")
+    # estado seguro conhecido: BEFC020 + RESET (power-on volta a ligar a placa).
+    # Adotar BEFC000 como config de PRODUÇÃO é decisão à parte (receita+app).
+    if not BLE.conectado():
+        try:
+            addr = BLE.scan(alvo, timeout=10)
+            if addr:
+                BLE.connect(addr)
+        except Exception:
+            pass
+    if BLE.conectado():
+        BLE.cmd("AT+BEFC020", ["OK+Set"], timeout=5)
+        try:
+            BLE.cmd("AT+RESET", ["OK+RESET"], timeout=4)
+        except Exception:
+            pass
+        LOG("(BEFC020+RESET restaurado — power-on volta a ligar a placa)", "hi")
+    else:
+        LOG("⚠️ Não consegui restaurar o BEFC020 — a placa ficou com BEFC000: "
+            "cortada sempre que desconectada, religa ao conectar (app/bancada). "
+            "Rode o teste de novo p/ restaurar, ou me avise.", "warn")
+    STATUS("hibernar", "ok")
+    return {"ok": True, "ja_ativada": False, "modo": "remoto", "befc_corta": befc_corta}
+
+
+def act_testar_hibernacao(serial, mcu, mosfet="8"):
     STATUS("hibernar", "run")
     alvo = serial[2:] if serial.startswith("CH") else serial
     # 1) garante conexão (o teste precisa mandar TST-HIB por BLE)
@@ -1391,46 +1929,236 @@ def act_testar_hibernacao(serial, mcu):
         except Exception as e:
             LOG(f"✗ Erro ao conectar por BLE: {e}", "err")
             STATUS("hibernar", "fail"); return False
-    # 2) explica e pede p/ o operador OUVIR o corte + o religamento
-    LOG("🔋 Testando o ciclo da hibernação: vou CORTAR a energia do MCU pelo MOSFET "
-        "e depois verificar se ela RELIGA sozinha.", "hi")
-    LOG("👂 OUÇA a fechadura agora: ao cortar deve ficar em SILÊNCIO (cortou) e, ao "
-        "religar, deve tocar a MELODIA (Rocky). Se ficar muda pra sempre, o corte "
-        "funcionou mas o religamento não — aí é regravar pelo cabo.", "hi")
-    # 3) manda TST-HIB. OK-HIB = vai cortar (e derrubar o BLE); HIB-FALHOU-DROP =
-    #    não conseguiu nem derrubar a conexão (config/hardware).
-    ok, buf = BLE.cmd("TST-HIB", ["OK-HIB", "HIB-FALHOU-DROP"], timeout=6)
-    if "HIB-FALHOU-DROP" in buf:
-        LOG("⚠️ Não derrubou a conexão — não dá pra cortar (config/hardware).", "err")
+    # ⭐ v2.13.2: veredito por UPTIME (TST-INFO) — à prova de falso-positivo.
+    # CASO REAL (2910/R0, 02/08): o OK-HIB chegava 1s ANTES do HIB-FALHOU-DROP,
+    # a bancada retornava no OK-HIB, nunca via o FALHOU, reconectava, recebia
+    # PONG de um MCU que NUNCA desligou e declarava "religou" — e ATIVAVA a
+    # hibernação sem prova. Agora: uptime ANTES e DEPOIS; corte real = uptime
+    # voltou p/ trás (o MCU rebootou). E módulo que tunela o AT+DROP do MCU
+    # (comum nos antigos) ganha PLANO B: liga a hibernação e deixa o próprio
+    # dormir() cortar DESCONECTADO (aí o módulo interpreta AT), mesmo veredito.
+    u1, buf1 = _uptime_via_info()
+    if u1 is None:
+        LOG("✗ TST-INFO sem UPTIME — o firmware é anterior à 2.13. Regrave antes "
+            "de testar a hibernação.", "err")
         STATUS("hibernar", "fail"); return False
-    if not ok:
-        LOG("Não veio OK-HIB — sigo assim mesmo (a conexão pode ter caído junto com o corte).", "warn")
-    # 4) a conexão VAI CAIR (o firmware corta). Espera, limpa a sessão.
-    time.sleep(6)
-    BLE.disconnect()
-    time.sleep(2)
-    # 5) re-scan: se cortou e religou, ela reaparece anunciando
+    # módulo surdo p/ AT vindo do MCU (caso 2910/R0): o MCU não consegue
+    # comandar DROP/PIO80 — nem o TST-HIB nem o plano B (dormir) funcionam.
+    # ⭐ v2.13.5 PLANO C: o MODE2 permite que o lado REMOTO controle os PIOs
+    # ("dispositivo remoto controla as saídas PIO5..11") — a BANCADA manda o
+    # corte pelo ar, prova em tempo real (TST-PING tem que CALAR) e religa
+    # pela conexão (AFTC). É o mesmo caminho que o APP usará em produção.
+    sem_at = "MOD:SEM-AT" in (buf1 or "")
+    if sem_at:
+        # ⭐ v2.15: NÃO pula mais direto ao plano C — o firmware 2.15 tenta o
+        # corte também a 2400 (hipótese: o parser de AT da UART dos módulos
+        # antigos é fixo em 2400, o baud da esteira legada, mesmo com dados a
+        # 9600). Se o autodesligamento funcionar, a placa ganha a camada de
+        # BACKUP (gap do app fechado); o plano C fica como último recurso.
+        LOG("⚠️ MOD:SEM-AT — o MCU não conseguiu falar com o módulo neste boot. "
+            "Com o padrão 2400-slow+PWRM1 (v2.16) isso deve desaparecer; se "
+            "persistir, o corte fica com o app (PLANO C).", "warn")
+    # ⚠️ millis() CONGELA no power-down: sem corte, u2 fica entre u1 e
+    # u1+decorrido (relógio parado enquanto dorme); com corte real, u2 volta p/
+    # TRÁS (~segundos desde o religamento). O veredito é "andou para trás", e
+    # p/ ser inequívoco o uptime inicial precisa de gordura (>=40s).
+    if u1 < 40:
+        LOG(f"uptime inicial baixo ({u1}s) — deixo a fechadura acumular relógio "
+            "por 40s antes do corte (veredito inequívoco).", "hi")
+        time.sleep(40)
+        u1, _ = _uptime_via_info()
+        if u1 is None:
+            LOG("✗ TST-INFO parou de responder na 2ª leitura.", "err")
+            STATUS("hibernar", "fail"); return False
+    t0 = time.time()
+    LOG(f"🔋 Corte comandado (TST-HIB); uptime atual = {u1}s. O veredito sai pelo "
+        "UPTIME após religar — silêncio no corte é esperado.", "hi")
+    falhou_drop = False
     try:
-        addr = BLE.scan(alvo, timeout=10)
-    except Exception as e:
-        LOG(f"✗ Erro no re-scan BLE: {e}", "err")
-        STATUS("hibernar", "fail"); return False
+        ok, buf = BLE.cmd("TST-HIB", ["HIB-FALHOU-DROP"], timeout=6)
+        falhou_drop = bool(ok)          # só casa se o FALHOU chegou
+        if not ok and "OK-HIB" not in (buf or ""):
+            LOG("Sem OK-HIB — sigo (a conexão pode ter caído junto com o corte).", "warn")
+    except Exception:
+        pass                            # conexão caiu no meio = DROP funcionou
+    if falhou_drop:
+        LOG("⚠️ O módulo TUNELOU o AT+DROP (não derruba a conexão a pedido do MCU — "
+            "comum nos módulos antigos). PLANO B: ativo a hibernação e deixo o "
+            "firmware cortar SOZINHO no ocioso; veredito por UPTIME em ~90s.", "warn")
+        ok, _ = BLE.cmd("TST-HIB-ON", ["OK-HIB-ON"], timeout=5)
+        if not ok:
+            LOG("✗ Não confirmou o TST-HIB-ON do plano B.", "err")
+            STATUS("hibernar", "fail"); return False
+        BLE.disconnect()
+        time.sleep(90)                  # janela de teste (60s) + corte + folga
+    else:
+        time.sleep(6)                   # o corte vem ~1s após o OK-HIB
+        try:
+            BLE.disconnect()
+        except Exception:
+            pass
+        time.sleep(2)
+    # religa pela CONEXÃO e tira o veredito pelo UPTIME
+    addr = None
+    for _ in range(3):
+        try:
+            addr = BLE.scan(alvo, timeout=10)
+        except Exception:
+            addr = None
+        if addr:
+            break
     if not addr:
         LOG("⚠️ Não reapareceu no scan — se cortou e não religou, regrave pelo cabo.", "err")
         STATUS("hibernar", "fail"); return False
-    # 6) reconecta e confirma que o MCU está vivo (PONG)
     try:
         BLE.connect(addr)
     except Exception as e:
         LOG(f"✗ Erro ao reconectar: {e}", "err")
         STATUS("hibernar", "fail"); return False
-    ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=6)
-    if ok:
-        LOG("✅ RELIGOU e respondeu PONG! O ciclo corta→religa funciona nesta fechadura. "
-            "Se você ouviu silêncio no corte + Rocky ao religar, a hibernação é segura aqui. "
-            "Clique 'Ativar hibernação' para ligar de vez.", "ok")
+    ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=8)
+    if not ok:
+        time.sleep(3)                   # boot frio pode estar terminando
+        ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=8)
+    if not ok:
+        LOG("⚠️ Reconectou mas SEM PONG — o MCU pode não ter religado. Regrave pelo cabo por segurança.", "err")
+        STATUS("hibernar", "fail"); return False
+    u2, _ = _uptime_via_info()
+    elapsed = time.time() - t0
+    # ⭐ v2.13.4: rebootou <=> o uptime ANDOU PARA TRÁS (u2 < u1) — imune ao
+    # millis congelado no power-down (falso-positivo anterior).
+    # ⭐⭐ v2.15.1: rebootar NÃO basta — o corte precisa ser SUSTENTADO. Caso
+    # real 2910 (5.2 rev05): 42s→36s = cortou no dormir() (a 2400! hipótese do
+    # baud confirmada) mas RELIGOU SOZINHA na hora — o módulo re-aplica o
+    # BEFC020 continuamente quando desconectado. Isso é um POWER-CYCLE (loop
+    # corta-religa com bipe a cada ~25s, ZERO economia), não hibernação.
+    # Sustentado de verdade = a placa ficou MORTA até a nossa reconexão =>
+    # uptime pequeno (<15s = segundos desde o religamento pela conexão).
+    rebootou = u2 is not None and (u2 + 5) < u1
+    if rebootou and u2 <= 15:
+        LOG(f"✅ CORTOU, FICOU CORTADA e religou NA CONEXÃO: uptime {u1}s → {u2}s "
+            f"em {int(elapsed)}s (rebootou E estava recém-religada). Hibernação "
+            "sustentada PROVADA.", "ok")
+        STATUS("hibernar", "ok")
+        return {"ok": True, "ja_ativada": falhou_drop}
+    if rebootou:
+        LOG(f"⚠️ PSEUDO-CORTE: uptime {u1}s → {u2}s — o MCU rebootou, mas estava "
+            f"ligado há {u2}s na reconexão = o corte foi DESFEITO na hora (o "
+            "módulo re-aplica o BEFC020 desconectado). Vira loop corta-religa "
+            "(bipe a cada ~25s) sem NENHUMA economia — desativando.", "err")
+    else:
+        LOG(f"✗ NÃO CORTOU: uptime {u1}s → {u2}s em {int(elapsed)}s (o uptime "
+            "nunca voltou p/ trás; a diferença p/ o relógio é só o millis "
+            "congelado no sono). Autodesligamento NÃO validado.", "err")
+    BLE.cmd("TST-HIB-OFF", ["OK-HIB-OFF"], timeout=5)   # deixa em estado seguro
+    LOG("(hibernação por firmware desativada — modo IDLE seguro)", "warn")
+    # ⭐ v2.15: ÚLTIMO RECURSO — PLANO C (corte remoto pelo ar, o canal do app),
+    # que inclui a FASE 2 (experimento BEFC000-na-desconexão): nos módulos que
+    # re-aplicam o BEFC, o BEFC000 é justamente o corte automático por hardware.
+    if u2 is not None and u2 >= 20:
+        LOG("Último recurso: PLANO C — corte remoto pelo ar + experimento BEFC000.", "hi")
+        return _testar_corte_remoto(alvo, mosfet, u2)
+    STATUS("hibernar", "fail"); return False
+
+
+# ⭐ v2.13 — MOSFET-AUTO (pino físico 12 = PIO2/VCC-EEPROM do módulo): o corte
+# NÃO é comandável (PIO2 fora do AT) — o módulo corta a placa SOZINHO ao entrar
+# em auto-sleep (PWRM1) e religa ao acordar por CONEXÃO BLE. A prova do ciclo é
+# o UPTIME do TST-INFO (firmware 2.13+): desconecta, espera o auto-sleep cortar,
+# reconecta (a conexão religa) e lê o UPTIME — pequeno = o MCU REBOOTOU = cortou
+# e religou (PASS); grande (~uptime1+espera) = nunca cortou (FAIL).
+def _uptime_via_info():
+    ok, buf = BLE.cmd("TST-INFO", ["FIM-INFO"], timeout=10)
+    m = re.search(r"UPTIME:(\d+)", buf or "")
+    return (int(m.group(1)) if m else None), buf
+
+
+def act_testar_hibernacao_auto(serial, mcu, espera=180):
+    STATUS("hibernar", "run")
+    alvo = serial[2:] if serial.startswith("CH") else serial
+    if not BLE.conectado():
+        try:
+            addr = BLE.scan(alvo, timeout=8.0)
+            if not addr:
+                LOG("✗ Fechadura não encontrada por BLE — religue a bateria e tente de novo.", "err")
+                STATUS("hibernar", "fail"); return False
+            BLE.connect(addr)
+        except Exception as e:
+            LOG(f"✗ Erro ao conectar por BLE: {e}", "err")
+            STATUS("hibernar", "fail"); return False
+    u1, _ = _uptime_via_info()
+    if u1 is None:
+        LOG("✗ TST-INFO sem UPTIME — o firmware desta fechadura é anterior à 2.13. "
+            "Regrave com o firmware novo antes de testar a hibernação automática.", "err")
+        STATUS("hibernar", "fail"); return False
+    # v2.13.4: mesmo racional do teste G1 — millis() congela no power-down, o
+    # veredito é "uptime voltou p/ trás"; garante gordura no u1 primeiro.
+    if u1 < 40:
+        LOG(f"uptime inicial baixo ({u1}s) — deixo acumular 40s de relógio antes "
+            "do teste (veredito inequívoco).", "hi")
+        time.sleep(40)
+        u1, _ = _uptime_via_info()
+        if u1 is None:
+            LOG("✗ TST-INFO parou de responder na 2ª leitura.", "err")
+            STATUS("hibernar", "fail"); return False
+    LOG(f"🔋 MOSFET-AUTO: uptime atual = {u1}s. Vou DESCONECTAR e esperar {espera}s "
+        "pelo auto-sleep do módulo (PWRM1) — ele deve CORTAR a placa sozinho.", "hi")
+    LOG("👂 Durante a espera a fechadura deve ficar em silêncio e SEM luz; o anúncio "
+        "BLE continua (é o módulo, que fica ligado). NÃO conecte nada nela.", "hi")
+    BLE.disconnect()
+    t0 = time.time()
+    prox_log = espera - 30
+    while time.time() - t0 < espera:
+        rest = espera - (time.time() - t0)
+        if rest <= prox_log:
+            LOG(f"  … aguardando o auto-sleep ({int(rest)}s restantes)")
+            prox_log -= 30
+        time.sleep(1)
+    # Reconecta — a PRÓPRIA conexão é o religamento (módulo acorda -> PIO2 sobe).
+    addr = None
+    for _ in range(3):
+        try:
+            addr = BLE.scan(alvo, timeout=10)
+        except Exception:
+            addr = None
+        if addr:
+            break
+    if not addr:
+        LOG("✗ Fechadura NÃO reapareceu no scan — o módulo deveria seguir anunciando "
+            "mesmo dormindo. Módulo/energia suspeitos; regrave pelo cabo.", "err")
+        STATUS("hibernar", "fail"); return False
+    try:
+        BLE.connect(addr)
+    except Exception as e:
+        LOG(f"✗ Erro ao reconectar: {e}", "err")
+        STATUS("hibernar", "fail"); return False
+    ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=10)
+    if not ok:
+        # dá uma 2ª chance: o MCU pode ainda estar terminando o boot frio
+        time.sleep(3)
+        ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=10)
+    if not ok:
+        LOG("✗ Reconectou mas SEM PONG — a placa pode não ter religado. Regrave pelo cabo.", "err")
+        STATUS("hibernar", "fail"); return False
+    u2, _ = _uptime_via_info()
+    if u2 is None:
+        LOG("⚠️ PONG ok mas TST-INFO sem UPTIME na volta — inconclusivo.", "warn")
+        STATUS("hibernar", "fail"); return False
+    # v2.13.4: reboot real <=> uptime voltou p/ trás (millis congela no sono).
+    # v2.15.1: sustentado <=> u2 pequeno (recém-religada NA conexão; u2 grande
+    # com reboot = religou sozinha = power-cycle sem economia, caso 2910).
+    if (u2 + 5) < u1 and u2 <= 15:
+        LOG(f"✅ CORTOU, FICOU CORTADA e religou NA CONEXÃO! uptime {u1}s → {u2}s "
+            f"após {espera}s de espera. A hibernação automática (PWRM1) está "
+            "ATIVA por hardware — nada a ativar.", "ok")
         STATUS("hibernar", "ok"); return True
-    LOG("⚠️ Reconectou mas SEM PONG — o MCU pode não ter religado. Regrave pelo cabo por segurança.", "err")
+    if (u2 + 5) < u1:
+        LOG(f"⚠️ PSEUDO-CORTE: uptime {u1}s → {u2}s — rebootou mas religou SOZINHA "
+            "(sem ficar cortada). Sem economia real nesta placa.", "err")
+        STATUS("hibernar", "fail"); return False
+    LOG(f"⚠️ NÃO CORTOU: uptime {u1}s → {u2}s (nunca voltou p/ trás). Ou o auto-sleep "
+        f"demora mais que {espera}s (teste de novo com espera maior), ou o gate não "
+        "está no pino 12 desta placa, ou o PWRM1 não pegou (reprovisione). A fechadura "
+        "funciona 100% — só não está hibernando (consumo como hoje).", "warn")
     STATUS("hibernar", "fail"); return False
 
 
@@ -1456,18 +2184,39 @@ def act_desativar_hibernacao(serial, mcu):
     return ok
 
 
-def act_hibernar_seguro(serial, mcu):
+def act_hibernar_seguro(serial, mcu, mosfet="8"):
     """HIBERNAÇÃO (Avançado) — segura. VALIDA o ciclo (corta a energia do MCU pelo
     MOSFET e confere se RELIGA sozinha) e SÓ ATIVA a hibernação se o corte→religa
     passar; senão deixa em IDLE seguro (a fechadura funciona 100%, só não hiberna).
     NUNCA liga às cegas — ativar é irreversível-por-cabo se o hardware não religar,
-    então o teste é o portão anti-brick. Requer o passo 1 (rádio conectado) feito."""
-    if not act_testar_hibernacao(serial, mcu):
+    então o teste é o portão anti-brick. Requer o passo 1 (rádio conectado) feito.
+    ⭐ v2.13 pino MOSFET = 12 (AUTO): valida por UPTIME (o corte é do auto-sleep
+    PWRM1; não há comando nem 'ativar' — passa no teste = já está ativa)."""
+    if str(mosfet).strip() == "12":
+        ok = act_testar_hibernacao_auto(serial, mcu)
+        if not ok:
+            LOG("⚠️ Ciclo automático NÃO comprovado — a fechadura funciona 100%, só "
+                "segue sem hibernar (consumo de hoje). Reteste com espera maior ou "
+                "confira o pino do gate.", "warn")
+            STATUS("hibernar", "ok")   # decisão segura tomada
+        return {"hibernacao": bool(ok)}
+    r = act_testar_hibernacao(serial, mcu, mosfet)
+    if not r:
         LOG("⚠️ Hibernação NÃO validada nesta fechadura — mantida DESLIGADA (IDLE "
             "seguro). A fechadura está pronta e funciona 100%; apenas não hiberna.", "warn")
         STATUS("hibernar", "ok")   # o passo cumpriu seu papel: decisão segura tomada
         return {"hibernacao": False}
-    on = act_ativar_hibernacao(serial, mcu)
+    # modo REMOTO (plano C): o MCU não comanda o corte — ativar EE_HIBERNA seria
+    # inútil (dormir() mandaria AT p/ um módulo surdo). O corte é pelo AR (app).
+    if isinstance(r, dict) and r.get("modo") == "remoto":
+        LOG("📌 Corte validado no modo REMOTO: em produção, quem corta é o APP "
+            "(AT+PIO<x>0 pelo ar ao final do uso)" +
+            (" — ou o próprio módulo na desconexão (BEFC000), que também passou."
+             if r.get("befc_corta") else "."), "ok")
+        STATUS("hibernar", "ok")
+        return {"hibernacao": True, "modo": "remoto", "befc_corta": bool(r.get("befc_corta"))}
+    # plano B do teste já ativou (TST-HIB-ON) — não repetir
+    on = True if (isinstance(r, dict) and r.get("ja_ativada")) else act_ativar_hibernacao(serial, mcu)
     if on:
         LOG("✅ Hibernação ATIVADA e validada (corta→religa OK).", "ok")
     else:
@@ -1692,10 +2441,19 @@ PAGE = r"""<!DOCTYPE html>
           <option value="m328p">FI 1.0</option></select>
       </div>
       <div class="row center" style="margin-top:12px">
-        <label style="color:var(--muted);font-size:14px">Pino MOSFET</label>
-        <input id="mosfet" inputmode="numeric" maxlength="2" value="8"
-          style="width:60px;text-align:center"
-          title="Pino do MOSFET do módulo BLE. 90% das FIs = 8. Só mude se a placa usar outro.">
+        <label style="color:var(--muted);font-size:14px">Chave de energia</label>
+        <select id="mosfet" style="padding:6px 10px;border-radius:8px">
+          <option value="8" selected>Com MOSFET — pino 13 (PIO8) · padrão</option>
+          <option value="0">Sem MOSFET (placa não corta a energia)</option>
+          <option value="7">Com MOSFET — pino 11 (PIO7)</option>
+          <option value="9">Com MOSFET — pino 14 (PIO9)</option>
+        </select>
+      </div>
+      <div class="row center" style="margin-top:4px">
+        <span style="color:var(--muted);font-size:12px">
+          A plaquinha verde emendada no cabo da bateria = tem MOSFET. Quase todas
+          usam o pino 13; as opções 11 e 14 existem para placas FI 1.0 antigas.
+        </span>
       </div>
     </div>
     <button class="big" id="btn-next" style="margin-top:20px" disabled>PRÓXIMO ▶</button>
@@ -1716,6 +2474,43 @@ PAGE = r"""<!DOCTYPE html>
     <div class="comp" id="comp"></div>
     <button class="big green" style="margin-top:12px" onclick="finalizar()">✔ FINALIZAR e iniciar a próxima</button>
 
+    <!-- ⭐⭐ v2.24 — CAMPO (PELO AR). Atende as 2.000+ FI já instaladas, que não
+         podem ser abertas. Não usa cabo e não depende do MCU: em AT+MODE2 o
+         módulo aceita comandos AT vindos do celular/bancada, então dá para
+         AUDITAR e CORRIGIR a configuração do rádio à distância. -->
+    <div style="margin-top:18px;padding:12px;border:1px dashed var(--amber);border-radius:10px">
+      <div style="font-weight:600;margin-bottom:6px">📡 Fechadura em campo (pelo ar, sem cabo)</div>
+      <div style="color:var(--muted);font-size:13px;margin-bottom:10px">
+        Para unidades <b>já instaladas</b>. Basta estar perto da fechadura e ter
+        o nome/serial preenchido na tela 1. O <b>Laudo</b> é <b>somente leitura</b>
+        — pode rodar em porta de cliente sem risco. O <b>Corrigir</b> grava
+        apenas os parâmetros que estiverem fora da receita, e se recusa a gravar
+        um par de máscaras que cortaria o trilho para sempre.
+        ⚠️ Feche o app no celular antes: com outro cliente conectado o módulo
+        não responde.</div>
+      <div class="row" style="flex-wrap:wrap;gap:8px">
+        <button id="btn-laudo">🔎 Laudo (só leitura)</button>
+        <button id="btn-corrigir-ar">🔧 Corrigir pelo ar</button>
+      </div>
+    </div>
+
+    <!-- ⭐ v2.13: teste de HIBERNAÇÃO visível (validação do MOSFET). Fora do
+         fluxo numerado de propósito — é teste de engenharia, sob demanda.
+         Usa o campo "Pino MOSFET" da tela 1: 12 = teste por UPTIME (auto,
+         ~3,5 min); 4..9 = teste clássico TST-HIB (corte comandado). -->
+    <!-- Teste de hibernação OCULTO (02/08): o corte agora é automático (app +
+         BEFC000 + firmware). Para reativar em diagnóstico, tire os comentários.
+    <div style="margin-top:18px;padding:12px;border:1px dashed var(--muted);border-radius:10px">
+      <div style="font-weight:600;margin-bottom:6px">🔋 Hibernação (mosfet) — validação</div>
+      <div style="color:var(--muted);font-size:13px;margin-bottom:10px">
+        Requer o rádio conectado (passo 1 feito). Pino MOSFET <b>12</b> (AUTO):
+        desconecta, espera ~3 min o auto-sleep cortar e reconecta conferindo o
+        <b>UPTIME</b> — acompanhe no REGISTRO e <b>não mexa na fechadura</b>
+        durante a espera. Pinos 4..9: corte comandado (TST-HIB).</div>
+      <button id="btn-hibernar" onclick="runStep('hibernar', this)">🔋 Testar hibernação</button>
+    </div>
+    FIM DO TESTE DE HIBERNAÇÃO OCULTO -->
+
     <!-- RECUPERAÇÃO: OCULTA a pedido do Leonardo (09/07/2026). Para reativar,
          descomente este bloco INTEIRO e a fiação JS dos botões (procurar por
          "RECUPERAÇÃO (botões estáticos"). O backend (/api/renomear,
@@ -1725,7 +2520,7 @@ PAGE = r"""<!DOCTYPE html>
       <div class="rec-sub">No fluxo NORMAL você <b>não precisa</b> destes botões — basta seguir os passos numerados acima. Use um destes só quando o problema abaixo acontecer:</div>
       <div class="rec-item">
         <button id="btn-consertar">🩺 Consertar módulo</button>
-        <div class="rec-desc">Diagnóstico completo pelo ar (VERS/BAUD/MODE/PWRM/NAME) + conserto: <b>acorda módulo dormindo</b> (PWRM1 legado) e força 9600. Use se a comunicação estiver <b>muda/saindo com lixo</b>.</div>
+        <div class="rec-desc">Diagnóstico completo pelo ar (VERS/BAUD/MODE/PWRM/NAME) + conserto: <b>acorda módulo dormindo</b> (PWRM0) e aplica o padrão 2400-slow + PWRM1. Use se a comunicação estiver <b>muda/saindo com lixo</b>.</div>
       </div>
       <div class="rec-item">
         <button id="btn-renomear">🔧 Renomear módulo</button>
@@ -1792,7 +2587,8 @@ PAGE = r"""<!DOCTYPE html>
 const PASSOS = [
   ["gravar","1 · Gravar e preparar","Grava o firmware e as seeds (cabo USBasp), valida, e já PREPARA o rádio + CONECTA por Bluetooth — tudo de uma vez. Só este passo usa o cabo."],
   ["autoteste","2 · Testar","Testa cada peça e PERGUNTA se funcionou de verdade (buzzer, LEDs, motor, bateria)."],
-  ["cadastrar","3 · Cadastrar no sistema","Registra só o serial no backend."],
+  ["certificar","3 · Certificar (burn-in)","Roda 8 ciclos REAIS de abrir/fechar pelo Bluetooth, com reconexão e repouso entre eles (~5 min). Pega defeito intermitente que o teste rápido não vê. Falhou 1 ciclo = NÃO vai a campo."],
+  ["cadastrar","4 · Cadastrar no sistema","Registra só o serial no backend."],
 ];
 // Testes com a PERGUNTA física (o firmware pode dizer OK e a peça não funcionar).
 // Ordem: os leves primeiro; os MOTORES por ÚLTIMO (puxam corrente e podem dar
@@ -1887,6 +2683,8 @@ function renderSteps(){
   if($("#btn-renomear"))  $("#btn-renomear").onclick=doRenomear;
   if($("#btn-hib-on"))    $("#btn-hib-on").onclick=(e)=>runStep("hibernar", e.currentTarget);
   if($("#btn-hib-off"))   $("#btn-hib-off").onclick=(e)=>runStep("hib-off", e.currentTarget);
+  if($("#btn-laudo"))       $("#btn-laudo").onclick=(e)=>runStep("laudo", e.currentTarget);
+  if($("#btn-corrigir-ar")) $("#btn-corrigir-ar").onclick=(e)=>runStep("corrigir-ar", e.currentTarget);
 }
 
 let STEP_STATE={};
@@ -2267,10 +3065,18 @@ class Handler(BaseHTTPRequestHandler):
             r = act_gravar(serial, mcu, b.get("mosfet", "8"))
             return {"ok": bool(r)}
         if step == "hibernar":
-            r = act_hibernar_seguro(serial, mcu)
+            r = act_hibernar_seguro(serial, mcu, b.get("mosfet", "8"))
             return {"ok": True, "hibernacao": bool(r and r.get("hibernacao"))}
+        # Auditoria/conserto PELO AR — os dois passos que atendem a frota em
+        # campo sem abrir a placa. O LAUDO é somente leitura (seguro em porta de
+        # cliente); o CORRIGIR aplica só o que está divergente.
+        if step == "laudo":
+            return {"ok": bool(act_laudo(serial, b.get("mosfet", "8")))}
+        if step == "corrigir-ar":
+            return {"ok": bool(act_corrigir_ar(serial, b.get("mosfet", "8")))}
         fn = {"gravar": act_gravar, "validar": act_validar, "conectar": act_conectar,
-              "autoteste": act_autoteste, "cadastrar": act_cadastrar,
+              "autoteste": act_autoteste, "certificar": act_certificar,
+              "cadastrar": act_cadastrar,
               "hib-on": act_ativar_hibernacao,
               "hib-off": act_desativar_hibernacao}.get(step)
         if not fn:

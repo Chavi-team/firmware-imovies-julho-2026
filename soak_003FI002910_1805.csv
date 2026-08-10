@@ -1,0 +1,3 @@
+t,verbo,rajada,religa_s,conf1_s,conf2_s,bat,vcc,vccmin,rst,boots,bods,cuts,erro,repouso
+18:05:47,ABRIR,0,0.28,0.41,11.94,,4979VCCMIN,4979VER,BBOOTS,0BODS,0CUTS,0VCC,,5
+18:06:10,FECHAR,0,0.28,0.41,11.95,,4979VCCMIN,4979VER,BBOOTS,0BODS,0CUTS,0VCC,,70
