@@ -102,7 +102,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.23.0"
+#define FW_VERSION   "2.23.1"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -933,12 +933,14 @@ void bleProvisionar() {
 // `initReset()`. MCUSR guarda o MOTIVO do último reset e precisa ser lido ANTES
 // do init do core, porque o core o zera.)
 
-// ⭐⭐ v2.19 — ESPERA PELA ENERGIA REAL (o número que motivou esta função —
-// "203 de 204 boots por BROWN-OUT" — veio do classificador ERRADO corrigido na
-// v2.23: PORF nunca era testado, então TODO religamento pelo mosfet era contado
-// como brown-out. Provavelmente eram 203 religamentos normais. A função foi
-// mantida porque o cenário parasita é real, mas o teto caiu de 300s p/ 30s e
-// agora ela acorda no botão.) Com a placa cortada, o TX do
+// ⭐⭐ v2.19 — ESPERA PELA ENERGIA REAL.
+// ⚠️ v2.23.1: a v2.23.0 anotou aqui que o "203 de 204 boots por BROWN-OUT"
+// seria artefato do classificador (PORF não testado). MEDIDO DEPOIS, com o
+// campo MCUSR cru: a 2910 devolve MCUSR:04 = BORF puro, SEM PORF — são
+// brown-outs de VERDADE. Motivo: o gate corta o NEGATIVO, mas os ~17 capacitores
+// de desacoplamento seguram o trilho, o VCC nunca chega a 0 e na volta só o BOD
+// acusa. A medição original estava certa e esta função é necessária.
+// Com a placa cortada, o TX do
 // módulo vaza pelo diodo do pino RX e alimenta o MCU o suficiente para ele
 // COMEÇAR a bootar; o consumo do boot derruba essa fonte fraquíssima, o BOD
 // dispara e tudo recomeça ~3x por segundo — bipes, bateria drenando à toa e o
@@ -969,26 +971,36 @@ void esperaEnergiaReal() {
         pinMode(PIN_LEDS, OUTPUT);
         digitalWrite(PIN_LEDS, LOW);
     }
-    // ⭐⭐ v2.23 — O BOTÃO ACORDA DAQUI, E O TETO CAIU DE 300s PARA 30s.
-    // Antes: até 5 MINUTOS dormindo sem NENHUMA interrupção armada (o
-    // attachInterrupt só acontece dentro de dormir(), e o bluetooth.begin() —
-    // que arma o PCINT do RX — só roda bem mais adiante no setup). O MCU ficava
-    // vivo, alimentado e SURDO a tudo: botão, BLE, cabo. E como o gerar_seed.py
-    // grava EE_HIBERNA=1 incondicionalmente, isto roda em TODO boot de TODA
-    // fechadura da frota — é uma das causas do "apertei o botão e não fez nada".
-    // O teto de 30s continua cobrindo o cenário parasita real sem sequestrar a
-    // fechadura por 5 minutos.
-    acordouBtn = false;
-    attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), isrBtn, LOW);
-    for (uint16_t i = 0; i < 30; i++) {           // teto 30s, nunca infinito
+    // ⛔⛔ v2.23.1 — NÃO ARMAR O BOTÃO AQUI. NÃO REDUZIR O TETO. (revertido)
+    //
+    // A v2.23.0 armou o INT0 e saía do laço quando o botão fosse apertado,
+    // "para o botão deixar de ficar surdo". Era uma leitura ERRADA do código, e
+    // causou um sintoma real em campo (2910, 10/08): com a placa cortada e o
+    // botão MANTIDO PRESSIONADO, ouvia-se um "tec tec tec" rápido e baixo.
+    //
+    // O raciocínio correto: este laço SÓ executa quando o VCC está ABAIXO de
+    // VCC_MIN_BOOT_MV — se a energia fosse real, a 1ª leitura já teria saído da
+    // função. Ou seja, aqui dentro a alimentação é sempre PARASITA (o TX do
+    // módulo vazando pelo diodo do pino RX). Sair do laço nessa condição é
+    // exatamente o que a v2.19 existe para IMPEDIR: o boot segue, chega no
+    // beep(70,2600) do "ESTOU VIVO", o consumo derruba a fonte fraquíssima, o
+    // BOD dispara e tudo recomeça — o bipe sai truncado ("tec") e o ciclo se
+    // repete várias vezes por segundo. Com o botão preso, isso vira um loop.
+    //
+    // E o botão NÃO tem o que fazer aqui de qualquer forma: sem energia real
+    // não há como girar o motor. O botão estar "surdo" durante a espera é o
+    // comportamento CORRETO — o que ele não pode é ficar surdo com a placa
+    // ALIMENTADA, e isso já é tratado no polling do atenderApp().
+    //
+    // O teto também volta a 300s: encurtá-lo para 30s só faz o ciclo parasita
+    // recomeçar 10x mais vezes, gastando bateria à toa.
+    for (uint16_t i = 0; i < 300; i++) {          // teto ~5 min, nunca infinito
         uint16_t v = lerVccMv();
-        if (!v || v >= VCC_MIN_BOOT_MV) break;    // energia real (ou inconclusivo)
-        if (acordouBtn) break;                    // alguém apertou o botão: segue o boot
+        if (!v || v >= VCC_MIN_BOOT_MV) return;   // energia real (ou inconclusivo)
         // sono de 1s com ADC e BOD desligados (a lib cuida do watchdog; definir
         // um ISR(WDT_vect) próprio colide com o vetor dela)
         LowPower.powerDown(SLEEP_1S, ADC_OFF, BOD_OFF);
     }
-    detachInterrupt(digitalPinToInterrupt(PIN_BUTTON));
 }
 
 void isrBtn() { acordouBtn = true; }
