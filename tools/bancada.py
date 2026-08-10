@@ -83,7 +83,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 BANCADA_VERSION = "2.24.0"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.25.0"
+FIRMWARE_VERSION = "2.26.0"
 VERSION_DATE = "2026-08-03"               # data desta versão (ISO; bump a cada release)
 VERSION_NOTES = "Bancada v2.23.0: passo 3 CERTIFICAR (burn-in de 8 ciclos reais ABRIR/FECHAR com reconexão fria e repouso sorteado — reprova defeito intermitente antes do campo) ·  campo do pino MOSFET vira SELECT (8=placa 1.5 · 12=v2.7/retrofit 2024 via PIO2/VCC-EEPROM com AT+PWRM1) · AT+UART1 entra na receita de provisionamento · teste de hibernação oculto da UI (endpoints vivos) · at() resiliente ao DESPERTAR do módulo + diagnóstico ATOK (v2.21) · soak_test interpreta brown-out esperado do corte por MOSFET · firmware v2.21.0 embutido (apaga LEDs antes de perder energia; espera pela ENERGIA REAL no boot — fim do loop parasita)"
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"

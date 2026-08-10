@@ -102,7 +102,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.25.0"
+#define FW_VERSION   "2.26.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -234,6 +234,11 @@
                                // (CUTS ~ BOOTS = o corte está funcionando;
                                //  CUTS subindo e BOOTS parado = o módulo
                                //  ignorou o comando de corte)
+#define EE_CUTDIAG      925    // ⭐ v2.26: último veredito do corte que FALHOU —
+                               // '0'/'1' = estado lido do PIO do gate logo após
+                               // a tentativa; '?' = módulo mudo. Só é escrito
+                               // quando o corte NÃO pegou (se pegar, o MCU morre
+                               // antes). EEPROM.update: não regrava valor igual.
 #define EE_SOAK         924    // ⭐ v2.23: 1 = MODO SOAK (bancada) — só então a
                                // telemetria BOOTS/BODS/CUTS grava EEPROM. Em
                                // campo fica 0 e NENHUMA escrita acontece, senão
@@ -1268,6 +1273,10 @@ void enviaInfo() {
     // ATOK: o módulo respondeu ao MCU na última tentativa de corte (medido
     // DESCONECTADO, que é a condição real). 2 = ainda não houve tentativa.
     snprintf_P(buf, sizeof(buf), PSTR("ATOK:%u"), g_atOk);          enviaLinha(buf);
+    // ⭐ v2.26: veredito do último corte que FALHOU (ver EE_CUTDIAG).
+    { uint8_t d = EEPROM.read(EE_CUTDIAG);
+      if (d != '0' && d != '1') d = '?';
+      snprintf_P(buf, sizeof(buf), PSTR("CUT8:%c"), d);             enviaLinha(buf); }
     enviaLinha("VER:" FW_VERSION);
     enviaLinha("FIM-INFO");
 }
@@ -1665,16 +1674,55 @@ void dormir() {
         }
         g_atOk = bleVivo() ? 1 : 0;   // ⭐ v2.23: ATOK era telemetria MORTA
                                       // (nunca atribuída, sempre "2").
-        at("AT+DROP", 200);
-        delay(120);               // curto: pausa longa deixava o módulo readormecer
-                                  // (o re-apply do BEFC da desconexão acontece aqui)
-        at("AT+PIO60", 100);      // arma a borda de wake (PIO6 baixo)
+        // ⭐⭐⭐ v2.26 — SEM AT+DROP, CORTE EM LAÇO, E DIAGNÓSTICO SE FALHAR.
+        //
+        // MEDIDO na 003FI002910 (10/08, 24 min em repouso): CUTS:3 com BOOTS:0
+        // — o firmware mandou cortar 3x e o MCU nunca morreu. E `AT+PIO80`
+        // MANDADO PELO AR cortou de primeira (OK+Set:80; UPTIME 300s -> 1s).
+        // Portanto o hardware está bom: gate no PIO8 responde. O defeito estava
+        // aqui, na sequência.
+        //
+        // O AT+DROP saiu: este bloco só roda com PD3 LOW, ou seja **já
+        // desconectado** — não há conexão para derrubar. Ele existia porque se
+        // acreditava que "o módulo RE-APLICA o BEFC na desconexão"; a medição
+        // desmente (24 min desconectada sem nunca cortar). Na prática o DROP só
+        // deixava o módulo ocioso, ele readormecia (PWRM1) e engolia o comando
+        // seguinte.
+        //
+        // O corte é AUTO-VERIFICÁVEL: se pegar, o MCU morre NESTA LINHA. Por
+        // isso repetir não custa nada — a única saída bem-sucedida do laço é
+        // deixar de existir. Isso torna a correção robusta mesmo se a minha
+        // teoria de timing estiver errada.
+        at("AT+PIO60", 60);       // arma a borda de wake E serve de preâmbulo
         char pio[12];             // corta pelo PIO do MOSFET (EEPROM 914, default 8)
         snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
-        at(pio, 60);              // corta o MOSFET -> MCU morre aqui se cortou
-        delay(200);
-        at(pio, 60);              // 2ª ordem: cobre o caso do 1º comando ter
-        delay(200);               // acordado o módulo em vez de ser executado
+        for (uint8_t t = 0; t < 6; t++) {
+            bluetooth.print('\r');        // sacrifício: acorda o módulo
+            delay(12);
+            bluetooth.print(pio); bluetooth.print('\r');
+            delay(90);                    // se cortou, não voltamos daqui
+        }
+        // Chegou aqui = NÃO cortou. Pergunta ao módulo o estado REAL do pino e
+        // guarda para o laudo — na próxima leitura o TST-INFO diz, numa letra,
+        // de quem é a culpa:
+        //   CUT8:0 -> o módulo ACEITOU (pino baixo) e mesmo assim não cortou
+        //             => hardware (gate/solda/fio), não firmware.
+        //   CUT8:1 -> o pino continua ALTO => o comando não chegou/não pegou
+        //             => ainda é software (timing/sono do módulo).
+        //   CUT8:? -> o módulo não respondeu à pergunta.
+        snprintf(pio, sizeof(pio), "AT+PIO%X?", g_pinMosfet);
+        while (bluetooth.available()) bluetooth.read();
+        bluetooth.print('\r'); delay(12);
+        bluetooth.print(pio); bluetooth.print('\r');
+        char ult = '?';
+        unsigned long tq = millis();
+        while (millis() - tq < 400) {
+            while (bluetooth.available()) {
+                char ch = bluetooth.read();
+                if (ch == '0' || ch == '1') ult = ch;   // "OK+Get:81" -> '1'
+            }
+        }
+        EEPROM.update(EE_CUTDIAG, (uint8_t)ult);        // update: só grava se mudou
     }
     acordouBLE = false; acordouBtn = false;
     g_sessaoConectada = false;   // sessão encerrou -> melodia toca de novo no próximo OK+CONN
