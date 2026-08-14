@@ -80,12 +80,12 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.26.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.26.1"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.27.0"
 VERSION_DATE = "2026-08-14"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.26.0: ⭐ REGISTRO NO SISTEMA AGORA É AUTOMÁTICO. O antigo passo 4 (Cadastrar no sistema) saiu da lista: gravar já registra a fechadura no backend no fim do passo 1. Motivo real de campo (CH003FI002804, do Gustavo, 14/08/2026): a placa foi gravada e o passo 4 não foi clicado — o chip ficou novo e o banco seguiu com a versão antiga, o que estraga o diagnóstico e ainda faz o painel escolher a fórmula ERRADA de bateria (devices.firmware_version é o que decide entre a curva linear do firmware novo e a exponencial do legado). Como registrar exige sessão de admin, a tela agora NASCE BLOQUEADA pedindo login, antes até do número de série — perguntar isso só no fim seria descobrir o problema com a placa já gravada na mão. Se o registro falhar (token expirado, rede, backend fora), o passo 1 fica VERMELHO e aparece o botão 'Registrar de novo no sistema', que repete só o registro sem regravar o chip; antes essa falha era engolida com um aviso no log e ninguém via. ⚠️ Efeito aceito: sem internet não se grava mais — antes dava para gravar offline e registrar depois. · Firmware v2.27.0 embutido (inalterado nesta versão): corte idêntico ao do legado, e a receita pelo ar grava BEFC020/AFTC028 — toda placa provisionada por bancada anterior à 2.25.0 saiu com BEFC000 e NÃO corta."
+VERSION_NOTES = "Bancada v2.26.1: 🔒 O GATE DE LOGIN AGORA CONFERE A SESSÃO DE VERDADE. Na 2.26.0 a tela só olhava se EXISTIA um token salvo no .bancada.json — e ele fica lá para sempre. Token vencido passava batido: o gate abria, o operador gravava a placa e o registro morria com 401 no fim, exatamente o desfecho que a trava veio impedir (caso CH003FI002804). Agora a bancada pergunta ao backend (GET /me, ~60ms) e distingue quatro situações, cada uma com seu texto: sem sessão, sessão vencida, conta SEM PERFIL DE ADMIN (loga mas não registra fechadura — antes só se descobria no 401) e backend inalcançável (aí o botão é 'Tentar de novo', não 'Entrar': login nenhum resolve falta de rede). O nome de quem está conectado aparece no header. Se a sessão cair no meio do trabalho, o 401 do registro derruba o token e re-arma o gate na hora. · Firmware v2.27.0 embutido (inalterado): corte idêntico ao do legado, e a receita pelo ar grava BEFC020/AFTC028 — toda placa provisionada por bancada anterior à 2.25.0 saiu com BEFC000 e NÃO corta."
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -786,6 +786,42 @@ class Backend:
 
     def tem_token(self):
         return bool(self.token)
+
+    # ⭐ 14/08/2026 — o gate de login checava só se EXISTIA token salvo, e o
+    # token fica no .bancada.json para sempre. Token vencido passava batido: a
+    # tela liberava, o operador gravava a placa e o registro morria com 401 no
+    # fim — o mesmo desfecho que a trava veio impedir. Agora perguntamos ao
+    # backend. /me custa ~60ms, devolve 401 quando a sessão morreu e ainda traz
+    # o role_id (1 = admin Chavi), que é o que /admin/devices exige.
+    def verificar_sessao(self):
+        if not self.token:
+            return {"logged": False, "motivo": "sem_sessao"}
+        try:
+            r = self._req("GET", "/me", timeout=8,
+                          headers={"Accept": "application/json",
+                                   "Authorization": f"Bearer {self.token}"})
+        except Exception as e:
+            # Rede fora: NÃO invalidamos o token (ele pode estar ótimo). Mas
+            # também não liberamos — sem backend não há registro, e gravar sem
+            # registrar é justamente o caso da CH003FI002804.
+            LOG(f"não consegui falar com o backend para checar a sessão: {e}", "warn")
+            return {"logged": False, "motivo": "offline"}
+        if r.status_code in (401, 403):
+            self.token = None
+            self.cfg.pop("token", None)
+            save_cfg(self.cfg)
+            LOG("sessão expirada — é preciso entrar de novo.", "warn")
+            return {"logged": False, "motivo": "expirado"}
+        if not r.ok:
+            LOG(f"backend respondeu {r.status_code} ao checar a sessão", "warn")
+            return {"logged": False, "motivo": "offline"}
+        u = (r.json() or {}).get("user") or {}
+        if u.get("role_id") != 1:
+            # Loga, mas não é admin Chavi: o POST /admin/devices vai recusar.
+            # Melhor dizer agora do que depois da placa gravada.
+            return {"logged": False, "motivo": "sem_permissao",
+                    "nome": u.get("name") or ""}
+        return {"logged": True, "motivo": "ok", "nome": u.get("name") or ""}
 
     def solicitar_otp(self, phone, country="55"):
         r = self._req("POST", "/otp/generate",
@@ -1597,6 +1633,9 @@ def act_cadastrar(serial, mcu):
     r = BACKEND.cadastrar(serial)
     if r == "auth":
         BACKEND.token = None
+        BACKEND.cfg.pop("token", None)
+        save_cfg(BACKEND.cfg)
+        BUS.publish({"kind": "login", "on": False})   # re-arma o gate na tela
         LOG("Sessão expirada — faça login de novo.", "warn")
         STATUS("cadastrar", "fail"); return {"need_login": True}
     if r in ("ok", "existe", "atualizado"):
@@ -2873,9 +2912,13 @@ async function otpVerificar(){ const otp=$("#in-otp").value.replace(/\D/g,"");
   const phone=$("#in-phone").value.replace(/\D/g,"");
   const r=await fetch("/api/login/verify",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({phone,otp})}).then(r=>r.json());
-  if(r.ok){ fecharModal(); atualizaLoginState(true); liberarFluxo(); } }
-function atualizaLoginState(on){ $("#login-state").textContent=on?"conectado ✓":"não conectado";
-  $("#login-state").style.color=on?"#DCFCE7":"#fff"; }
+  /* Não liberamos por conta do "ok" do OTP: quem decide é o /me. Conta sem
+     perfil de admin loga e mesmo assim não registra fechadura — o gate tem de
+     continuar de pé, dizendo isso. */
+  if(r.ok){ fecharModal(); conferirSessao(); } }
+function atualizaLoginState(on, nome){
+  $("#login-state").textContent = on ? (nome ? nome + " ✓" : "conectado ✓") : "não conectado";
+  $("#login-state").style.color = on ? "#DCFCE7" : "#fff"; }
 
 /* botão Entrar sempre acessível: clique no canto */
 $("#login-state").onclick=abrirLogin; $("#login-state").style.cursor="pointer";
@@ -2891,7 +2934,8 @@ const ev=new EventSource("/events");
 ev.onmessage=e=>{ const o=JSON.parse(e.data);
   if(o.kind==="log") addLog(o);
   else if(o.kind==="status") setChip(o.step,o.state);
-  else if(o.kind==="login") atualizaLoginState(o.on); };
+  else if(o.kind==="login"){ atualizaLoginState(o.on);
+    if(!o.on) bloquearFluxo("expirado"); } };
 
 /* ⭐ GATE DE LOGIN (14/08/2026) — a tela nasce BLOQUEADA.
    Motivo: o registro no sistema virou automático no fim do passo 1, e ele exige
@@ -2901,22 +2945,42 @@ ev.onmessage=e=>{ const o=JSON.parse(e.data);
    ⚠️ Efeito conhecido: sem internet não se grava mais nada (antes dava para
    gravar offline e registrar depois). Aceito porque gravar sem registrar foi
    exatamente o que gerou o caso da CH003FI002804. */
-function bloquearFluxo(){
-  const p = $("#painel") || document.body;
+/* O texto muda conforme o MOTIVO: "entre" e "sua sessão venceu" são situações
+   diferentes para quem está na bancada, e "sem internet" não se resolve com
+   login nenhum — mandar clicar em Entrar ali só faria o operador rodar em
+   círculo. Por isso o /api/state devolve motivo, não um booleano. */
+const GATE_TXT = {
+  sem_sessao:    ["Entre para começar",
+                  "A bancada registra cada fechadura no sistema assim que grava. Para isso, é preciso estar conectado.", true],
+  expirado:      ["Sua sessão venceu",
+                  "Entre de novo antes de gravar — o registro no sistema acontece automaticamente no fim da gravação e precisa da sessão válida.", true],
+  sem_permissao: ["Esta conta não pode registrar fechaduras",
+                  "O registro exige um usuário admin da Chavi. Entre com outra conta.", true],
+  offline:       ["Sem conexão com o sistema",
+                  "A bancada não conseguiu falar com o backend. Como toda gravação é registrada no sistema, o fluxo fica parado até a conexão voltar.", false],
+};
+
+function bloquearFluxo(motivo, nome){
+  const [titulo, texto, temBotao] = GATE_TXT[motivo] || GATE_TXT.sem_sessao;
   if(!$("#gate")){
     const d = document.createElement("div");
     d.id = "gate";
     d.style.cssText = "position:fixed;inset:0;background:rgba(15,23,42,.92);z-index:900;"
       + "display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:#fff;text-align:center;padding:24px";
-    d.innerHTML = "<div style='font-size:22px;font-weight:700'>Entre para começar</div>"
-      + "<div style='max-width:420px;opacity:.85;line-height:1.5'>A bancada registra cada fechadura no sistema "
-      + "assim que grava. Para isso, é preciso estar conectado.</div>"
-      + "<button id='gate-btn' style='padding:12px 22px;font-size:16px;border:0;border-radius:8px;"
-      + "background:#E86628;color:#fff;cursor:pointer'>Entrar</button>";
     document.body.appendChild(d);
-    $("#gate-btn").onclick = abrirLogin;
   }
-  $("#gate").style.display = "flex";
+  const g = $("#gate");
+  g.innerHTML = "<div style='font-size:22px;font-weight:700'>" + titulo + "</div>"
+    + "<div style='max-width:420px;opacity:.85;line-height:1.5'>" + texto
+    + (nome ? " (conectado como " + nome + ")" : "") + "</div>"
+    + (temBotao
+        ? "<button id='gate-btn' style='padding:12px 22px;font-size:16px;border:0;border-radius:8px;"
+          + "background:#E86628;color:#fff;cursor:pointer'>Entrar</button>"
+        : "<button id='gate-retry' style='padding:12px 22px;font-size:16px;border:0;border-radius:8px;"
+          + "background:#E86628;color:#fff;cursor:pointer'>Tentar de novo</button>");
+  if($("#gate-btn"))   $("#gate-btn").onclick   = abrirLogin;
+  if($("#gate-retry")) $("#gate-retry").onclick = conferirSessao;
+  g.style.display = "flex";
 }
 function liberarFluxo(){ const g = $("#gate"); if(g) g.style.display = "none"; }
 
@@ -2938,10 +3002,13 @@ function mostrarRetryRegistro(){
   }
 }
 
-fetch("/api/state").then(r=>r.json()).then(s=>{
-  atualizaLoginState(s.logged);
-  if(s.logged) liberarFluxo(); else bloquearFluxo();
-});
+async function conferirSessao(){
+  const s = await fetch("/api/state").then(r=>r.json()).catch(()=>({logged:false,motivo:"offline"}));
+  atualizaLoginState(s.logged, s.nome);
+  if(s.logged) liberarFluxo(); else bloquearFluxo(s.motivo, s.nome);
+  return s;
+}
+conferirSessao();
 
 /* aviso de atualização (não-bloqueante; falha de rede = silêncio) */
 function fmtData(iso){ const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(iso||""); return m?`${m[3]}/${m[2]}/${m[1]}`:(iso||"—"); }
@@ -3042,7 +3109,7 @@ class Handler(BaseHTTPRequestHandler):
             s = (m.group(1) if m else "").upper()
             self._send(200, {"serial": s, "seeds": seeds_de(s) if len(s) >= 5 else []}); return
         if self.path == "/api/state":
-            self._send(200, {"logged": BACKEND.tem_token()}); return
+            self._send(200, BACKEND.verificar_sessao()); return
         if self.path == "/api/update-check":
             self._send(200, {**_UPDATE, "dev": DEV_MODE}); return
         if self.path == "/events":
