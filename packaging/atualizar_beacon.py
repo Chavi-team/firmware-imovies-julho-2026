@@ -40,6 +40,32 @@ def _api(method, url, token, payload=None):
         return json.loads(r.read().decode())
 
 
+def _release_tem_binarios(tag, token):
+    """A release da tag já tem os pacotes Mac e Windows anexados?
+
+    ⚠️ Isto virou CRÍTICO em 14/08/2026, quando a bancada passou a TRAVAR o
+    fluxo em versão desatualizada: anunciar no beacon uma versão cujos binários
+    ainda não subiram (build em andamento, job de upload quebrado) travaria a
+    produção inteira SEM que houvesse o que baixar — todo mundo parado por uma
+    falha nossa de publicação. Na dúvida (sem token, erro de API), devolve False
+    e o beacon não é escrito: melhor a frota seguir na versão anterior do que
+    travada numa tela pedindo um download que não existe."""
+    if not token or not tag:
+        return False
+    try:
+        rel = _api("GET", f"https://api.github.com/repos/{FW_REPO}/releases/tags/{tag}", token)
+    except Exception as e:
+        print(f"beacon: não consegui ler a release {tag} ({e}).")
+        return False
+    nomes = [a.get("name", "") for a in (rel.get("assets") or [])]
+    tem_mac = any(n.endswith("-mac.zip") for n in nomes)
+    tem_win = any(n.endswith("-win.zip") for n in nomes)
+    if not (tem_mac and tem_win):
+        print(f"beacon: release {tag} sem os dois pacotes (mac={tem_mac}, win={tem_win}) "
+              f"— assets: {nomes or 'nenhum'}")
+    return tem_mac and tem_win
+
+
 def main():
     token = os.environ.get("BEACON_PAT", "").strip()
     # versão vem da tag (bancada-vX.Y.Z); fallback = BANCADA_VERSION do fonte
@@ -64,6 +90,14 @@ def main():
         print("⚠️ BEACON_PAT não configurado — pulei a atualização do beacon "
               "(o build da release segue normal). Configure o secret p/ automatizar.")
         return 0
+
+    tag = ref or ("bancada-v" + version)
+    if not _release_tem_binarios(tag, token):
+        print(f"✗ beacon NÃO atualizado: a release {tag} ainda não tem os pacotes "
+              "Mac e Windows. Com a trava de versão ligada, anunciar uma versão "
+              "sem binário deixaria a produção parada sem ter o que baixar. "
+              "Rode de novo quando o build terminar.")
+        return 1
 
     base = f"https://api.github.com/repos/{BEACON_REPO}/contents/{BEACON_FILE}"
     sha = None

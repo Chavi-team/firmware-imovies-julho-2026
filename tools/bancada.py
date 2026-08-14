@@ -80,12 +80,12 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.26.1"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.27.0"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.27.0"
 VERSION_DATE = "2026-08-14"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.26.1: 🔒 O GATE DE LOGIN AGORA CONFERE A SESSÃO DE VERDADE. Na 2.26.0 a tela só olhava se EXISTIA um token salvo no .bancada.json — e ele fica lá para sempre. Token vencido passava batido: o gate abria, o operador gravava a placa e o registro morria com 401 no fim, exatamente o desfecho que a trava veio impedir (caso CH003FI002804). Agora a bancada pergunta ao backend (GET /me, ~60ms) e distingue quatro situações, cada uma com seu texto: sem sessão, sessão vencida, conta SEM PERFIL DE ADMIN (loga mas não registra fechadura — antes só se descobria no 401) e backend inalcançável (aí o botão é 'Tentar de novo', não 'Entrar': login nenhum resolve falta de rede). O nome de quem está conectado aparece no header. Se a sessão cair no meio do trabalho, o 401 do registro derruba o token e re-arma o gate na hora. · Firmware v2.27.0 embutido (inalterado): corte idêntico ao do legado, e a receita pelo ar grava BEFC020/AFTC028 — toda placa provisionada por bancada anterior à 2.25.0 saiu com BEFC000 e NÃO corta."
+VERSION_NOTES = "Bancada v2.27.0: 🔒 VERSÃO DESATUALIZADA AGORA TRAVA O FLUXO. Antes o aviso de atualização era só um banner que dava para ignorar — e dava para gravar a frota inteira com uma bancada velha, sem os fixes que já existiam (foi assim que placas saíram com BEFC000, sem cortar). A trava mora NO SERVIDOR, não só na tela: /api/step recusa qualquer passo, então F5, aba antiga ou POST direto não passam por baixo. Ela só age quando temos CERTEZA de que a versão é velha — beacon fora do ar ou checagem em andamento NÃO travam nada, senão uma falha nossa de publicação pararia a produção sem ter o que baixar. Nunca cobre a tela no meio de um passo, e login novo não destrava versão velha. O programa aberto o dia inteiro relê o beacon a cada 15 min (antes lia só no boot), então release do meio do turno vale no mesmo dia. ⚠️ Contrapartida do pacote: atualizar_beacon.py agora RECUSA anunciar uma versão cuja release ainda não tem os pacotes Mac E Windows — com a trava ligada, anunciar versão sem binário deixaria todo mundo travado numa tela pedindo um download inexistente. · Firmware v2.27.0 embutido (inalterado)."
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -155,6 +155,27 @@ def _checar_atualizacao():
         pass                             # silêncio total: rede/timeout/JSON
     finally:
         _UPDATE["checado"] = True        # marca que a tentativa terminou
+        _UPDATE["ts"] = time.time()      # quando foi a última tentativa
+
+
+def _rechecar_se_velho(idade=900):
+    """Redispara a checagem se o snapshot passou da idade (default 15 min).
+    Chamado pelo /api/update-check: sem isso o programa aberto o dia inteiro
+    ficaria preso no beacon lido no boot, e uma release do meio do turno só
+    valeria no dia seguinte. Roda em thread — nunca segura a resposta."""
+    if _UPDATE.get("checando"):
+        return
+    if time.time() - _UPDATE.get("ts", 0) < idade:
+        return
+    _UPDATE["checando"] = True
+
+    def _alvo():
+        try:
+            _checar_atualizacao()
+        finally:
+            _UPDATE["checando"] = False
+
+    threading.Thread(target=_alvo, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -2788,6 +2809,9 @@ async function runStep(step, btn){
   const r=await fetch("/api/step",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({step,serial:SERIAL,mcu:MCU,mosfet})}).then(r=>r.json()).catch(()=>({ok:false}));
   setBusy(false);
+  /* O servidor é quem manda: se ele recusou por versão, a tela acompanha na
+     hora — sem esperar o próximo ciclo da checagem. */
+  if(r && r.desatualizada){ VERSAO_VELHA = true; updateCheck(); return r; }
   if(r && r.need_login){ abrirLogin(); return r; }
   // AUTO-FLUXO do passo 1 ("Gravar e preparar"): grava → valida → prepara
   // rádio → conecta, tudo SOZINHO — o operador vê só 1 passo. Para em qualquer
@@ -2949,7 +2973,11 @@ ev.onmessage=e=>{ const o=JSON.parse(e.data);
    diferentes para quem está na bancada, e "sem internet" não se resolve com
    login nenhum — mandar clicar em Entrar ali só faria o operador rodar em
    círculo. Por isso o /api/state devolve motivo, não um booleano. */
+let VERSAO_VELHA = false;
+
 const GATE_TXT = {
+  desatualizada: ["Atualize a bancada para continuar",
+                  "Esta versão está desatualizada. Baixe a nova, feche esta janela e abra o programa atualizado.", false],
   sem_sessao:    ["Entre para começar",
                   "A bancada registra cada fechadura no sistema assim que grava. Para isso, é preciso estar conectado.", true],
   expirado:      ["Sua sessão venceu",
@@ -2960,7 +2988,10 @@ const GATE_TXT = {
                   "A bancada não conseguiu falar com o backend. Como toda gravação é registrada no sistema, o fluxo fica parado até a conexão voltar.", false],
 };
 
-function bloquearFluxo(motivo, nome){
+function bloquearFluxo(motivo, nome, upd){
+  /* Versão velha é o motivo mais forte: entrar de novo não conserta bancada
+     antiga, então ele passa na frente de qualquer pendência de login. */
+  if(VERSAO_VELHA && motivo !== "desatualizada") motivo = "desatualizada";
   const [titulo, texto, temBotao] = GATE_TXT[motivo] || GATE_TXT.sem_sessao;
   if(!$("#gate")){
     const d = document.createElement("div");
@@ -2969,20 +3000,34 @@ function bloquearFluxo(motivo, nome){
       + "display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:#fff;text-align:center;padding:24px";
     document.body.appendChild(d);
   }
+  const BTN = "padding:12px 22px;font-size:16px;border:0;border-radius:8px;"
+            + "background:#E86628;color:#fff;cursor:pointer";
+  let acao;
+  if(motivo === "desatualizada"){
+    acao = "<div style='font-size:14px;opacity:.7'>instalada v" + (upd&&upd.current||"?")
+         + " · atual v" + (upd&&upd.latest||"?") + "</div>"
+         + "<button id='gate-baixar' style='" + BTN + "'>Baixar a versão nova</button>";
+  } else if(temBotao){
+    acao = "<button id='gate-btn' style='" + BTN + "'>Entrar</button>";
+  } else {
+    acao = "<button id='gate-retry' style='" + BTN + "'>Tentar de novo</button>";
+  }
   const g = $("#gate");
   g.innerHTML = "<div style='font-size:22px;font-weight:700'>" + titulo + "</div>"
     + "<div style='max-width:420px;opacity:.85;line-height:1.5'>" + texto
-    + (nome ? " (conectado como " + nome + ")" : "") + "</div>"
-    + (temBotao
-        ? "<button id='gate-btn' style='padding:12px 22px;font-size:16px;border:0;border-radius:8px;"
-          + "background:#E86628;color:#fff;cursor:pointer'>Entrar</button>"
-        : "<button id='gate-retry' style='padding:12px 22px;font-size:16px;border:0;border-radius:8px;"
-          + "background:#E86628;color:#fff;cursor:pointer'>Tentar de novo</button>");
-  if($("#gate-btn"))   $("#gate-btn").onclick   = abrirLogin;
-  if($("#gate-retry")) $("#gate-retry").onclick = conferirSessao;
+    + (nome ? " (conectado como " + nome + ")" : "") + "</div>" + acao;
+  if($("#gate-btn"))    $("#gate-btn").onclick    = abrirLogin;
+  if($("#gate-retry"))  $("#gate-retry").onclick  = conferirSessao;
+  if($("#gate-baixar")) $("#gate-baixar").onclick = () =>
+    fetch("/api/open-update",{method:"POST"}).catch(()=>{});
   g.style.display = "flex";
 }
-function liberarFluxo(){ const g = $("#gate"); if(g) g.style.display = "none"; }
+/* Um login bem-sucedido NÃO destrava versão velha — por isso a guarda mora aqui
+   dentro, e não em cada chamador. */
+function liberarFluxo(){
+  if(VERSAO_VELHA) return;
+  const g = $("#gate"); if(g) g.style.display = "none";
+}
 
 /* Botão que aparece quando o registro falha: repete SÓ o registro, sem regravar
    o chip (a gravação já terminou; o que faltou foi o backend saber dela). */
@@ -3062,6 +3107,11 @@ async function updateCheck(tent){
     document.body.classList.add("has-update");
     if(st){ st.className="bv-old"; st.textContent="⚠ v"+d.latest+" disponível — baixar";
       st.onclick=()=>fetch("/api/open-update",{method:"POST"}).catch(()=>{}); }
+    /* 🔒 versão velha TRAVA o fluxo. Nunca no meio de um passo (busy): cobrir a
+       tela com a placa sendo gravada não impede nada — o servidor já recusou o
+       próximo passo — e só assustaria o operador. */
+    VERSAO_VELHA = true;
+    if(!busy) bloquearFluxo("desatualizada", null, d);
   } else if(d.latest){                        // está na última
     if(st){ st.className="bv-ok"; st.textContent="✓ atualizado"; st.onclick=null; }
   } else {                                    // checou mas não obteve a última (ex.: repo privado sem token)
@@ -3072,6 +3122,10 @@ $("#ub-btn").onclick=()=>{
   fetch("/api/open-update",{method:"POST"}).catch(()=>{});
 };
 updateCheck(0);
+/* Uma release publicada no meio do turno não pode ficar valendo só na próxima
+   vez que alguém abrir o programa. Re-checa de 30 em 30 min; o servidor relê o
+   beacon a cada chamada, e a trava só cai sobre a tela com o fluxo parado. */
+setInterval(() => { if(!busy) updateCheck(0); }, 30*60*1000);
 
 prev();
 </script>
@@ -3111,6 +3165,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/state":
             self._send(200, BACKEND.verificar_sessao()); return
         if self.path == "/api/update-check":
+            _rechecar_se_velho()
             self._send(200, {**_UPDATE, "dev": DEV_MODE}); return
         if self.path == "/events":
             self._sse(); return
@@ -3175,6 +3230,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _step(self, b):
         step, serial, mcu = b.get("step"), b.get("serial", ""), b.get("mcu", "m328pb")
+        # 🔒 TRAVA DE VERSÃO (14/08/2026, pedido do Leonardo). Mora AQUI, no
+        # servidor, e não só no gate da tela: o gate é uma cortina em cima da
+        # página — F5, aba velha ou um POST direto passariam por baixo dela.
+        # Só trava quando temos CERTEZA de que a versão é velha (beacon lido e
+        # maior que a local). Beacon fora do ar ou checagem ainda em andamento
+        # NÃO travam nada — senão uma falha nossa de publicação pararia a
+        # produção inteira sem que ninguém tivesse o que baixar.
+        if _UPDATE.get("outdated") and not DEV_MODE:
+            LOG(f"🔒 bancada desatualizada (v{BANCADA_VERSION}; a atual é "
+                f"v{_UPDATE.get('latest')}) — atualize antes de gravar.", "err")
+            return {"ok": False, "desatualizada": True,
+                    "erro": f"bancada v{BANCADA_VERSION} desatualizada — baixe a v{_UPDATE.get('latest')}"}
         # ⚡ MODO DEV: só Gravar/Validar rodam de verdade. Os demais passos são
         # PULADOS com aviso (nunca "aprovados" em silêncio) e Cadastrar é
         # BLOQUEADO — fechadura de iteração não entra no backend.
