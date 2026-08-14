@@ -80,12 +80,12 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.25.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.26.0"                # versão desta bancada (bump a cada release)
 # Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
 # cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
 FIRMWARE_VERSION = "2.27.0"
-VERSION_DATE = "2026-08-10"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.25.0: ⭐ RESTAURA o bit do MOSFET na máscara BEFC — o corte do trilho volta a funcionar. A receita gerava BEFC000 (gate BAIXO ao energizar: a placa nasce morta e o comando de corte manda o pino para o estado em que ele já está) onde a esteira legada gera BEFC020 (gate ALTO: a placa nasce ligada e o AT+PIO80 do firmware é o que a derruba). Provado na CH003FI002910 em 10/08: com BEFC000, 10 min de repouso davam BOOTS:0 CUTS:1 (não cortou); depois do AT+BEFC020 pelo ar, BOOTS e CUTS passaram a subir JUNTOS. ⚠️ Toda placa provisionada por versões anteriores desta bancada saiu com BEFC000 e NÃO corta (bateria muito abaixo do previsto) — corrija cada uma pelo passo 'Corrigir pelo ar', sem abrir nada; o laudo já aponta a divergência de BEFC sozinho. · v2.24.0: auditoria linha a linha com conserto pelo ar. · Firmware v2.27.0 embutido: o corte volta a ser IDÊNTICO ao do legado que funcionava — AT sem terminador '\\r' (com ele o módulo ignora) e PIO6 ALTO (AT+PIO61), não baixo; antes disso, v2.23.0 fechou 17 achados de auditoria, entre eles o motor que podia ficar ligado para sempre (I2C do INA219 sem timeout, agora com watchdog de 8s), a telemetria que só grava EEPROM em modo soak (em campo eram ~480 escritas/dia) e o botão travado que gerava loop de reset."
+VERSION_DATE = "2026-08-14"               # data desta versão (ISO; bump a cada release)
+VERSION_NOTES = "Bancada v2.26.0: ⭐ REGISTRO NO SISTEMA AGORA É AUTOMÁTICO. O antigo passo 4 (Cadastrar no sistema) saiu da lista: gravar já registra a fechadura no backend no fim do passo 1. Motivo real de campo (CH003FI002804, do Gustavo, 14/08/2026): a placa foi gravada e o passo 4 não foi clicado — o chip ficou novo e o banco seguiu com a versão antiga, o que estraga o diagnóstico e ainda faz o painel escolher a fórmula ERRADA de bateria (devices.firmware_version é o que decide entre a curva linear do firmware novo e a exponencial do legado). Como registrar exige sessão de admin, a tela agora NASCE BLOQUEADA pedindo login, antes até do número de série — perguntar isso só no fim seria descobrir o problema com a placa já gravada na mão. Se o registro falhar (token expirado, rede, backend fora), o passo 1 fica VERMELHO e aparece o botão 'Registrar de novo no sistema', que repete só o registro sem regravar o chip; antes essa falha era engolida com um aviso no log e ninguém via. ⚠️ Efeito aceito: sem internet não se grava mais — antes dava para gravar offline e registrar depois. · Firmware v2.27.0 embutido (inalterado nesta versão): corte idêntico ao do legado, e a receita pelo ar grava BEFC020/AFTC028 — toda placa provisionada por bancada anterior à 2.25.0 saiu com BEFC000 e NÃO corta."
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -2588,8 +2588,13 @@ const PASSOS = [
   ["gravar","1 · Gravar e preparar","Grava o firmware e as seeds (cabo USBasp), valida, e já PREPARA o rádio + CONECTA por Bluetooth — tudo de uma vez. Só este passo usa o cabo."],
   ["autoteste","2 · Testar","Testa cada peça e PERGUNTA se funcionou de verdade (buzzer, LEDs, motor, bateria)."],
   ["certificar","3 · Certificar (burn-in)","Roda 8 ciclos REAIS de abrir/fechar pelo Bluetooth, com reconexão e repouso entre eles (~5 min). Pega defeito intermitente que o teste rápido não vê. Falhou 1 ciclo = NÃO vai a campo."],
-  ["cadastrar","4 · Cadastrar no sistema","Registra só o serial no backend."],
 ];
+// O antigo passo "4 · Cadastrar no sistema" SAIU da lista: registrar virou parte
+// do passo 1, automática. Motivo (14/08/2026): em campo a fechadura era gravada
+// e o operador esquecia de clicar aqui — o chip ficava novo e o banco com a
+// versão antiga, o que estraga o diagnóstico (o `firmware_version` também é o
+// que decide qual fórmula de bateria o painel usa). A ação continua existindo
+// no backend e pode ser repetida sozinha quando falha.
 // Testes com a PERGUNTA física (o firmware pode dizer OK e a peça não funcionar).
 // Ordem: os leves primeiro; os MOTORES por ÚLTIMO (puxam corrente e podem dar
 // brownout que derruba o BLE — assim o resto já passou). motor=true -> pausa
@@ -2754,6 +2759,13 @@ async function runStep(step, btn){
     setChip("gravar","run");
     const v = await runStep("validar");   if(!(v&&v.ok)){ setChip("gravar","fail"); return r; }
     if(!(await prepararRadio())){ setChip("gravar","fail"); return {ok:false}; }
+    // REGISTRO NO SISTEMA — automático, e reprova o passo se falhar. Antes isto
+    // era um passo separado que dependia de alguém lembrar de clicar; agora, se
+    // não registrar, o passo 1 fica vermelho e aparece "Registrar de novo".
+    // Falhar aqui NÃO desfaz a gravação: o chip já está pronto, só o backend não
+    // soube — por isso o retry é do registro apenas, sem regravar nada.
+    const c = await runStep("cadastrar");
+    if(!(c&&c.ok)){ setChip("gravar","fail"); mostrarRetryRegistro(); return {ok:false}; }
     setChip("gravar","ok");
   }
   return r;
@@ -2861,7 +2873,7 @@ async function otpVerificar(){ const otp=$("#in-otp").value.replace(/\D/g,"");
   const phone=$("#in-phone").value.replace(/\D/g,"");
   const r=await fetch("/api/login/verify",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({phone,otp})}).then(r=>r.json());
-  if(r.ok){ fecharModal(); atualizaLoginState(true); runStep("cadastrar"); } }
+  if(r.ok){ fecharModal(); atualizaLoginState(true); liberarFluxo(); } }
 function atualizaLoginState(on){ $("#login-state").textContent=on?"conectado ✓":"não conectado";
   $("#login-state").style.color=on?"#DCFCE7":"#fff"; }
 
@@ -2881,7 +2893,55 @@ ev.onmessage=e=>{ const o=JSON.parse(e.data);
   else if(o.kind==="status") setChip(o.step,o.state);
   else if(o.kind==="login") atualizaLoginState(o.on); };
 
-fetch("/api/state").then(r=>r.json()).then(s=>atualizaLoginState(s.logged));
+/* ⭐ GATE DE LOGIN (14/08/2026) — a tela nasce BLOQUEADA.
+   Motivo: o registro no sistema virou automático no fim do passo 1, e ele exige
+   sessão de admin. Pedir o login só lá no fim seria pior: a fechadura já estaria
+   gravada e o operador descobriria o problema com a placa na mão. Então
+   perguntamos ANTES de qualquer coisa — inclusive antes do número de série.
+   ⚠️ Efeito conhecido: sem internet não se grava mais nada (antes dava para
+   gravar offline e registrar depois). Aceito porque gravar sem registrar foi
+   exatamente o que gerou o caso da CH003FI002804. */
+function bloquearFluxo(){
+  const p = $("#painel") || document.body;
+  if(!$("#gate")){
+    const d = document.createElement("div");
+    d.id = "gate";
+    d.style.cssText = "position:fixed;inset:0;background:rgba(15,23,42,.92);z-index:900;"
+      + "display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:#fff;text-align:center;padding:24px";
+    d.innerHTML = "<div style='font-size:22px;font-weight:700'>Entre para começar</div>"
+      + "<div style='max-width:420px;opacity:.85;line-height:1.5'>A bancada registra cada fechadura no sistema "
+      + "assim que grava. Para isso, é preciso estar conectado.</div>"
+      + "<button id='gate-btn' style='padding:12px 22px;font-size:16px;border:0;border-radius:8px;"
+      + "background:#E86628;color:#fff;cursor:pointer'>Entrar</button>";
+    document.body.appendChild(d);
+    $("#gate-btn").onclick = abrirLogin;
+  }
+  $("#gate").style.display = "flex";
+}
+function liberarFluxo(){ const g = $("#gate"); if(g) g.style.display = "none"; }
+
+/* Botão que aparece quando o registro falha: repete SÓ o registro, sem regravar
+   o chip (a gravação já terminou; o que faltou foi o backend saber dela). */
+function mostrarRetryRegistro(){
+  let b = $("#retry-registro");
+  if(!b){
+    b = document.createElement("button");
+    b.id = "retry-registro";
+    b.textContent = "Registrar de novo no sistema";
+    b.style.cssText = "margin:8px 0;padding:10px 16px;border:0;border-radius:8px;background:#E12E1D;color:#fff;cursor:pointer";
+    b.onclick = async () => {
+      const c = await runStep("cadastrar");
+      if(c && c.ok){ b.remove(); setChip("gravar","ok"); }
+    };
+    const alvo = $("#btn-gravar") && $("#btn-gravar").parentNode;
+    (alvo || document.body).appendChild(b);
+  }
+}
+
+fetch("/api/state").then(r=>r.json()).then(s=>{
+  atualizaLoginState(s.logged);
+  if(s.logged) liberarFluxo(); else bloquearFluxo();
+});
 
 /* aviso de atualização (não-bloqueante; falha de rede = silêncio) */
 function fmtData(iso){ const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(iso||""); return m?`${m[3]}/${m[2]}/${m[1]}`:(iso||"—"); }
