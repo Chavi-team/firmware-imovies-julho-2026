@@ -24,6 +24,30 @@ if os.path.exists(hexf):
 else:
     raise SystemExit("chavi_fi.ino.hex não encontrado (bin/ nem packaging/firmware/)")
 
+# ⭐ 21/08/2026 — TRAVA: o .hex tem de ser o do FW_VERSION atual.
+# O bin/ é gitignorado, então no CI só existe o packaging/firmware/ versionado.
+# Ele ficou parado na v2.21.0 enquanto o fonte foi até a 2.27.0, e por ~3
+# semanas TODA bancada publicada gravou 2.21.0 sem ninguém perceber (a versão
+# no cabeçalho é a DA BANCADA, não a do firmware). Agora o build quebra aqui.
+import re as _re
+_ino = os.path.join(ROOT, "chavi_fi", "chavi_fi.ino")
+if os.path.exists(_ino):
+    with open(_ino, encoding="utf-8", errors="replace") as _f:
+        _m = _re.search(r'#define\s+FW_VERSION\s+"([^"]+)"', _f.read())
+    if _m:
+        _esperada = _m.group(1)
+        _dados = bytearray()
+        with open(hexf, encoding="ascii", errors="replace") as _f:
+            for _l in _f:
+                _l = _l.strip()
+                if _l.startswith(":") and int(_l[7:9], 16) == 0:
+                    _dados += bytes.fromhex(_l[9:9 + int(_l[1:3], 16) * 2])
+        if _esperada not in _re.findall(r"\b\d+\.\d+\.\d+\b", _dados.decode("latin1")):
+            raise SystemExit(
+                f"ABORTADO: {hexf} nao contem FW_VERSION {_esperada} do fonte.\n"
+                "Recompile e rode: cp bin/chavi_fi.ino.hex packaging/firmware/chavi_fi.ino.hex"
+            )
+
 # avrdude standalone + avrdude.conf, se preparado em packaging/avrdude/<plat>/
 plat = "win" if sys.platform.startswith("win") else ("mac" if sys.platform == "darwin" else "linux")
 avr_dir = os.path.join(PKG, "avrdude", plat)

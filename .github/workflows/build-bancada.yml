@@ -40,6 +40,9 @@ jobs:
       - name: Baixar avrdude standalone
         run: python packaging/baixar_avrdude.py
 
+      - name: Conferir que o .hex empacotado e o do fonte
+        run: python3 packaging/verificar_hex.py
+
       - name: Empacotar (PyInstaller)
         run: pyinstaller --clean --distpath packaging/dist --workpath packaging/build packaging/chavi_fi_setup.spec
 

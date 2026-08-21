@@ -80,12 +80,46 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.27.0"                # versão desta bancada (bump a cada release)
-# Versão do FIRMWARE que esta bancada grava (bake junto do .hex). Enviada no
-# cadastro do device (devices.firmware_version). Bumpar junto do FW_VERSION do .ino.
-FIRMWARE_VERSION = "2.27.0"
-VERSION_DATE = "2026-08-14"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.27.0: 🔒 VERSÃO DESATUALIZADA AGORA TRAVA O FLUXO. Antes o aviso de atualização era só um banner que dava para ignorar — e dava para gravar a frota inteira com uma bancada velha, sem os fixes que já existiam (foi assim que placas saíram com BEFC000, sem cortar). A trava mora NO SERVIDOR, não só na tela: /api/step recusa qualquer passo, então F5, aba antiga ou POST direto não passam por baixo. Ela só age quando temos CERTEZA de que a versão é velha — beacon fora do ar ou checagem em andamento NÃO travam nada, senão uma falha nossa de publicação pararia a produção sem ter o que baixar. Nunca cobre a tela no meio de um passo, e login novo não destrava versão velha. O programa aberto o dia inteiro relê o beacon a cada 15 min (antes lia só no boot), então release do meio do turno vale no mesmo dia. ⚠️ Contrapartida do pacote: atualizar_beacon.py agora RECUSA anunciar uma versão cuja release ainda não tem os pacotes Mac E Windows — com a trava ligada, anunciar versão sem binário deixaria todo mundo travado numa tela pedindo um download inexistente. · Firmware v2.27.0 embutido (inalterado)."
+BANCADA_VERSION = "2.28.0"                # versão desta bancada (bump a cada release)
+
+
+def _versao_do_hex(caminho: str) -> str:
+    """Lê a versão gravada DENTRO do .hex que esta bancada vai queimar.
+
+    ⭐ 21/08/2026 — ANTES ISSO ERA UMA CONSTANTE ESCRITA À MÃO, e foi o centro
+    de um incidente: o `bin/` é gitignorado, então o pacote leva o
+    `packaging/firmware/chavi_fi.ino.hex` versionado. Esse arquivo ficou parado
+    na v2.21.0 enquanto o fonte foi até a 2.27.0 — e a bancada seguia
+    ANUNCIANDO "2.27.0" para o backend. Resultado: o painel mostrava 2.27.0 em
+    placas rodando 2.21.0 (sem o fix do LED preso, ~0,144 V/dia), e ninguém
+    tinha como perceber, porque a única fonte da informação era esta constante.
+
+    Agora a versão é MEDIDA no binário. Se um .hex velho escapar, o sistema
+    registra a verdade em vez de repetir a mentira. A trava que impede o .hex
+    velho de ser empacotado está em packaging/verificar_hex.py (roda no CI).
+    """
+    try:
+        dados = bytearray()
+        with open(caminho, encoding="ascii", errors="replace") as f:
+            for linha in f:
+                linha = linha.strip()
+                if linha.startswith(":") and int(linha[7:9], 16) == 0:
+                    dados += bytes.fromhex(linha[9:9 + int(linha[1:3], 16) * 2])
+        achadas = re.findall(r"\b\d+\.\d+\.\d+\b", dados.decode("latin1"))
+        # O firmware embute só a própria versão como x.y.z; se vier mais de uma,
+        # a maior é a do FW_VERSION (as outras seriam de libs).
+        if achadas:
+            return max(achadas, key=lambda v: [int(x) for x in v.split(".")])
+    except Exception:
+        pass
+    return "?"
+
+
+# Versão do FIRMWARE que esta bancada grava — LIDA do próprio .hex, nunca
+# digitada. É o que vai para devices.firmware_version.
+FIRMWARE_VERSION = _versao_do_hex(HEX)
+VERSION_DATE = "2026-08-21"               # data desta versão (ISO; bump a cada release)
+VERSION_NOTES = "Bancada v2.28.0: 🔥 CORRIGE O BUG QUE FEZ TODA RELEASE DESDE 02/08 GRAVAR FIRMWARE 2.21.0. O instalador não compila: ele queima o .hex que viaja no repositório. Como bin/ é gitignorado, o pacote levava packaging/firmware/chavi_fi.ino.hex — commitado uma vez na v2.21.0 e nunca mais atualizado, enquanto o fonte foi até a 2.27.0. Nada acusava, porque a versão no cabeçalho é a DA BANCADA (que por coincidência também era 2.27.0) e a versão enviada ao backend era uma constante escrita à mão. Placas saíam rodando 2.21.0 — sem o fix do LED preso (v2.22.0), que sozinho drena ~0,144 V/dia e zera a bateria em ~7 dias — e o painel jurava 2.27.0. O que mudou: (1) o .hex empacotado agora É o 2.27.0; (2) FIRMWARE_VERSION deixou de ser constante e passa a ser LIDA de dentro do binário, então o banco registra o que foi realmente gravado; (3) packaging/verificar_hex.py roda no CI e QUEBRA o build se o .hex divergir do FW_VERSION do fonte, para o erro aparecer em quem empacota e não no cliente semanas depois. ⚠️ Quem gravou fechadura com bancada anterior precisa REGRAVAR: aquelas placas estão em 2.21.0."
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
