@@ -465,3 +465,74 @@ RENEW), `EE_BOARD=1` no seed.bin (canal 001 já cai em fi10), validar
 - **RENEW/DEFAULT/IMME/ADTY**: não existem em nenhum código/esteira legada — pós-RENEW é território sem mapa; o observado (anúncio anônimo não-conectável) aponta p/ auto-sleep (PWRM default) e/ou semi-brick.
 - **Clock**: produção 16 MHz cristal (lfuse 0xFF); novo 8 MHz interno (0xE2) — 2400 seguro, 9600 marginal no RC; p/ regravar firmware antigo, restaurar lfuse 0xFF.
 - **EEPROM**: layout 1/2/3/4/5/15/25/35/45/67/100-107/150/200-205/768/769-779 confirmado (§7).
+
+---
+
+## 9. Ativação do MOSFET na FI 1.0 — firmware v2.28.0 / bancada v2.29.0 (02/09/2026)
+
+Até aqui o firmware novo mantinha o trilho da 1.0 **sempre ligado de propósito**:
+`configModuloLeve` erguia todos os gates candidatos (`AT+PIO41/51/71/81/91`) com
+`BEFCFF7`/`AFTCFFF`, e o `dormir()` tinha `!placa10` na condição do corte. O motivo
+está no §1 deste relatório: o retrofit da 1.0 foi feito **placa a placa** e o gate
+ficou em PIOs diferentes ({7,8,9} no `upload`; {4,5,6,7} na esteira `at.js`).
+Presumir o pino é o caminho das 0718/0629 — placa que não liga na bateria.
+
+**A saída não é adivinhar, é medir.** O gate agora é DESCOBERTO pelo ar, com o
+mesmo mecanismo que provou o gate da CH003FI002910 em 02/08/2026: corta um pino
+por vez e vê qual deles cala o MCU. O corte é auto-evidente — a placa sem energia
+não responde ao `TST-PING`, e o módulo (alimentado direto da bateria, fora da
+chave) continua ali para receber o comando que a religa.
+
+### O que mudou
+
+| Onde | O quê |
+|---|---|
+| `chavi_fi.ino` | `EE_GATE10` (byte **926**): gate CONFIRMADO desta unidade (4,5,7,8,9). 0/0xFF = desconhecido → não corta |
+| | `dormir()`: a 1.0 entra no corte **só** com `gate10Ok()`; a 1.5 mantém a condição de sempre |
+| | `TST-GATE<n>` / `TST-GATE?`: grava/consulta o gate (responde `GATE10:NA` numa 1.5) |
+| | `TST-INFO`: linha `GATE10:<n>` **só** na 1.0 |
+| | `TST-HIB`: na 1.0 recusa sem gate (`HIB-SEM-GATE`) e **não** zera o BEFC |
+| `bancada.py` | passo **"Descobrir e ativar (FI 1.0)"**: varre 8→7→9→5 pelo ar, religa, confirma o retorno do MCU, grava com `TST-GATE` e liga a hibernação |
+| | `corrigir-ar` recusa mexer nas máscaras de uma 1.0 |
+| `tools/at_ar.py` | AT pelo ar sem cabo e sem bancada: lê a config, ergue pino a pino até o MCU voltar (`--achar-gate`) e restaura máscaras (`--mascaras`) |
+
+### ⛔ O que NÃO fazer: máscara "de segurança" para a 1.0 (erro de 02/09/2026)
+
+A primeira versão desta entrega dava à 1.0 uma máscara própria — `BEFCFF7`/
+`AFTCFFF`, "todos os candidatos altos, assim o gate errado não brica". Parecia
+conservador. **Quebrou a primeira placa gravada com ela** (CH001FI001000): o
+módulo truncou para `3F7`/`3FF`, o power-on passou a erguer PIO3,4,5,7,9,10,11
+além do 8 — pinos que ninguém garantiu estarem livres numa 1.0 — e a placa
+passou a estalar, com o MCU mudo em todos os testes.
+
+A lição que fica: **placa gravada pela bancada faz boot silencioso** (o seed
+marca `EE_MOD_CFG=0xC9`, e o `configModuloLeve` — que é quem mandaria `FF7` pela
+UART — nunca roda). Quem define o estado elétrico do power-on de uma placa da
+esteira é a receita da bancada, e só ela. Mexer ali não é "precaução": é mudar a
+eletricidade da placa sem evidência.
+
+As duas placas voltaram a receber o mesmo par (`BEFC020`/`AFTC028`, o que a frota
+inteira roda). O corte da 1.0 **não depende de máscara**: é o `AT+PIO<x>0` no
+gate confirmado.
+
+### Por que um byte novo, e não o 914
+
+A frota 1.0 já gravada tem `914 = 8` por **default** (a UI da bancada sempre mandou
+8, com ou sem mosfet). Reinterpretar aquele byte faria placas em campo começarem a
+cortar sozinhas só por atualizar o firmware, sem ninguém ter conferido onde está o
+gate delas. O byte 926 nasce zerado: **1.0 só corta depois de alguém provar o pino**.
+
+### As redes de segurança que ficaram
+
+- A varredura só **ergue** pinos (`AT+PIO<x>1`); nunca corta às cegas.
+- A varredura **não grava nada** enquanto o pino não se prova, e não grava se o
+  MCU não voltar depois do religamento.
+- PIO6 fica fora (é o wake/PD3) e PIO4 não é testável pelo ar (em `AT+MODE2` o
+  remoto só controla PIO5..11) — uma 1.0 com gate no PIO4 segue sem corte.
+
+### O que NÃO mudou
+
+Nada da FI 1.5. A condição do corte dela é a mesma da v2.27.0 (`!placa10` continua
+verdadeiro), as máscaras `BEFC020`/`AFTC028` saem idênticas do mesmo cálculo, o
+byte 926 nunca é lido numa 1.5 e a ação nova recusa qualquer placa que não se
+declare `PLACA:1.0` no `TST-INFO`.

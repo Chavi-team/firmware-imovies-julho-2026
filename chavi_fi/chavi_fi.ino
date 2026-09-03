@@ -102,7 +102,7 @@
 #include "LowPower.h"
 #include <FastLED.h>
 
-#define FW_VERSION   "2.27.0"
+#define FW_VERSION   "2.28.0"
 
 // ---- HIBERNAÇÃO PROFUNDA via MOSFET — DUAS GERAÇÕES de hardware --------------
 // GERAÇÃO 1 — gate em PIO ENDEREÇÁVEL (retrofit _400 da era FI 1.0, at.js;
@@ -245,6 +245,21 @@
                                // são ~480 escritas/dia (100k = fim de vida da
                                // célula em ~7 meses). Liga/desliga por TST-SOAK.
                                // (925 fica livre: EE_SOAK é 1 byte)
+#define EE_GATE10       926    // ⭐ v2.28 — SÓ FI 1.0: o PIO do gate do MOSFET
+                               // CONFIRMADO nesta unidade (4,5,7,8,9). 0/0xFF =
+                               // desconhecido -> corte DESLIGADO, que é como
+                               // toda 1.0 se comportou até aqui.
+                               // Byte PRÓPRIO, e não o 914, de propósito: a frota
+                               // 1.0 já gravada tem 914=8 por DEFAULT (a UI da
+                               // bancada sempre mandou 8), e reinterpretar aquele
+                               // byte faria placas em campo começarem a cortar
+                               // sozinhas só por atualizar o firmware — sem
+                               // ninguém ter conferido onde está o gate delas.
+                               // O retrofit da 1.0 foi feito placa a placa: o
+                               // `upload` antigo usava 7/8/9 e a esteira at.js
+                               // oferecia 4/5/6/7. Por isso este valor é
+                               // DESCOBERTO (bancada corta pelo ar e vê qual pino
+                               // cala o MCU), nunca presumido.
 #define EE_PROV_TENT    917    // ⭐ v2.13.3: tentativas de provisionamento pesado
                                // (anti-loop-de-suicídio: nas placas com mosfet, o
                                // AT+RESET do provisionamento reinicia o módulo,
@@ -295,6 +310,14 @@ uint8_t g_pinMosfet = 8;       // gate do MOSFET (EEPROM 914; default 8 = frota;
 // MOSFET-AUTO (geração 2): gate no pino físico 12 = PIO2 = VCC da EEPROM do
 // módulo. Inendereçável por AT — o corte é o auto-sleep do módulo (PWRM1).
 bool mosfetAuto() { return g_pinMosfet == 12; }
+// ⭐ v2.28 — FI 1.0: gate do MOSFET confirmado NESTA unidade (EEPROM 926).
+// PIO6 fica de fora de propósito: ele é a linha de wake (PD3), e cortar por ele
+// brigaria com o próprio religamento.
+uint8_t g_gate10 = 0;
+bool gate10Ok() { return placa10 && g_gate10 >= 4 && g_gate10 <= 9 && g_gate10 != 6; }
+// Pino que o corte usa. Na FI 1.5 é exatamente o de sempre (EEPROM 914) — este
+// helper não muda nada lá; existe para a 1.0 ter um gate próprio, confirmado.
+uint8_t pinoCorte() { return placa10 ? g_gate10 : g_pinMosfet; }
 char serialFech[12] = {0};
 volatile bool acordouBLE = false, acordouBtn = false;
 bool moduloOk = false;
@@ -1225,6 +1248,12 @@ void enviaInfo() {
     if (mosfetAuto()) snprintf_P(buf, sizeof(buf), PSTR("MOSFET:12-AUTO"));
     else              snprintf_P(buf, sizeof(buf), PSTR("MOSFET:%u"), g_pinMosfet);
     enviaLinha(buf);
+    // ⭐ v2.28 — FI 1.0: qual PIO corta a energia nesta unidade (0 = nenhum, a
+    // placa nunca corta). Linha exclusiva da 1.0: a saída da 1.5 não muda.
+    if (placa10) {
+        snprintf_P(buf, sizeof(buf), PSTR("GATE10:%u"), g_gate10);
+        enviaLinha(buf);
+    }
     snprintf(buf, sizeof(buf), "WAKE:v%02u", g_moduloVers);   // rev do módulo (00 = não leu)
     enviaLinha(buf);
     // Segundos desde o boot — a PROVA DE CORTE do teste de hibernação da
@@ -1349,6 +1378,12 @@ void testeBancada(const String& t) {
         // módulo corta sozinho ao dormir (PWRM1). A bancada valida por UPTIME
         // (TST-INFO): derruba, espera o auto-sleep e confere se o MCU REBOOTOU.
         if (mosfetAuto()) { enviaLinha("HIB-AUTO"); return; }
+        // ⭐ v2.28 — FI 1.0 sem gate confirmado: não há o que cortar (e chutar um
+        // PIO aqui é o caminho para deixar a placa muda). A bancada descobre o
+        // gate pelo ar e grava com TST-GATE<n>.
+        if (placa10 && !gate10Ok()) {
+            char b[14]; snprintf_P(b, sizeof(b), PSTR("HIB-SEM-GATE")); enviaLinha(b); return;
+        }
         enviaLinha("OK-HIB");
         delay(400);                          // a resposta sai antes do DROP
         // ⭐⭐ v2.23 — `forcar=true`. Este teste chega POR BLE, logo PD3 está
@@ -1364,15 +1399,47 @@ void testeBancada(const String& t) {
             enviaLinha("HIB-FALHOU-DROP");
             return;
         }
-        atMascara("AT+BEFC", 0);             // ⭐ libera o gate (senão o BEFC re-liga)
+        // ⭐ v2.28 — na FI 1.0 as máscaras ficam como estão (BEFCFF7/AFTCFFF:
+        // TODOS os candidatos altos). É a rede de segurança daquela placa — se
+        // o gate confirmado estiver errado, o corte simplesmente não pega, em
+        // vez de deixar a unidade sem caminho de volta. Zerar o BEFC ali seria
+        // apostar que o pino está certo.
+        if (!placa10) atMascara("AT+BEFC", 0);   // ⭐ libera o gate (senão o BEFC re-liga)
         at("AT+PIO60", 200);                 // arma a borda de wake (PIO6 baixo)
         EEPROM.update(EE_HIB, 1);            // marca "desligou hibernando" p/ o wake
-        char pio[12];                        // corta pelo PIO do MOSFET (EEPROM 914)
-        snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
+        char pio[12];                        // corta pelo PIO do MOSFET (EEPROM 914;
+                                             // na FI 1.0, o confirmado em 926)
+        snprintf(pio, sizeof(pio), "AT+PIO%X0", pinoCorte());
         at(pio, 60);                         // CORTA o MOSFET -> MCU morre se cortou
         delay(3000);                         // se cortou, nunca passa daqui
         EEPROM.update(EE_HIB, 0);
         beep(160, 400); beep(160, 400); beep(160, 400);   // 3 graves = NÃO cortou
+        return;
+    }
+    // ⭐ v2.28 — SÓ FI 1.0: a chave de energia DESTA unidade.
+    // O retrofit da 1.0 foi feito placa a placa e o gate ficou em PIOs
+    // diferentes (7/8/9 no `upload` antigo; 4/5/6/7 na esteira at.js). Por isso
+    // ele é DESCOBERTO — a bancada corta pelo ar e vê qual pino cala o MCU — e
+    // gravado aqui, em vez de presumido na gravação.
+    //   TST-GATE?  -> GATE10:<n>  (0 = nenhum: a placa nunca corta)
+    //   TST-GATE8  -> grava 8 e liga o corte por PIO8
+    //   TST-GATE0  -> apaga (volta ao seguro)
+    if (t.startsWith("TST-GATE")) {
+        char b[14];
+        if (!placa10) {                                      // a 1.5 não usa este byte
+            snprintf_P(b, sizeof(b), PSTR("GATE10:NA")); enviaLinha(b); return;
+        }
+        char c = t.length() > 8 ? t.charAt(8) : '?';
+        if (c >= '0' && c <= '9') {
+            uint8_t n = (uint8_t)(c - '0');
+            if (n != 0 && (n < 4 || n > 9 || n == 6)) {
+                snprintf_P(b, sizeof(b), PSTR("GATE10:ERR")); enviaLinha(b); return;
+            }
+            EEPROM.update(EE_GATE10, n);
+            g_gate10 = n;
+        }
+        snprintf_P(b, sizeof(b), PSTR("GATE10:%u"), g_gate10);
+        enviaLinha(b);
         return;
     }
     // ⭐ v2.18: zera a telemetria (início de uma bateria de testes)
@@ -1658,7 +1725,10 @@ void dormir() {
     // corta a placa SOZINHO quando o auto-sleep (PWRM1) o derrubar. O MCU só
     // segue pro powerDown abaixo e morre quando o corte vier (seguro: dormindo
     // não há escrita de EEPROM em andamento).
-    if (g_hiberna && !placa10 && !mosfetAuto() && digitalRead(PIN_WAKE) == LOW) {
+    // ⭐ v2.28 — a FI 1.0 entra aqui SÓ com o gate confirmado (EE_GATE10). Sem
+    // confirmação, `gate10Ok()` é falso e o caminho é o de sempre: não corta.
+    // Para a FI 1.5 a condição é idêntica à anterior (`!placa10` é verdadeiro).
+    if (g_hiberna && (!placa10 || gate10Ok()) && !mosfetAuto() && digitalRead(PIN_WAKE) == LOW) {
         // ⭐⭐ v2.16.1 — A ORDEM É O SEGREDO (receita do goToSleep legado):
         // este módulo RE-APLICA a máscara BEFC no evento de DESCONEXÃO. Por
         // isso o corte tem de ser a ÚLTIMA palavra: primeiro AT+DROP (deixa o
@@ -1724,7 +1794,7 @@ void dormir() {
         while (bluetooth.available()) bluetooth.read();
         bluetooth.write("AT+PIO61"); delay(120);   // PIO6 ALTO (como o legado)
         while (bluetooth.available()) bluetooth.read();
-        snprintf(pio, sizeof(pio), "AT+PIO%X0", g_pinMosfet);
+        snprintf(pio, sizeof(pio), "AT+PIO%X0", pinoCorte());
         for (uint8_t t = 0; t < 3; t++) {
             bluetooth.write(pio);    delay(150);   // se cortou, não voltamos daqui
         }
@@ -1741,7 +1811,7 @@ void dormir() {
         //   CUT8:1 -> o pino continua ALTO => o comando não chegou/não pegou
         //             => ainda é software (timing/sono do módulo).
         //   CUT8:? -> o módulo não respondeu à pergunta.
-        snprintf(pio, sizeof(pio), "AT+PIO%X?", g_pinMosfet);
+        snprintf(pio, sizeof(pio), "AT+PIO%X?", pinoCorte());
         while (bluetooth.available()) bluetooth.read();
         bluetooth.write(pio);              // sem terminador, como o legado
         char ult = '?';
@@ -1982,6 +2052,12 @@ void setup() {
     // Pino do MOSFET (gravado pelo gravar.sh/bancada; 90% da frota = 8).
     g_pinMosfet = EEPROM.read(EE_MOSFET);
     if ((g_pinMosfet < 4 || g_pinMosfet > 9) && g_pinMosfet != 12) g_pinMosfet = 8;
+    // FI 1.0: gate confirmado por unidade. Sem confirmação (0/0xFF/valor torto)
+    // a placa segue como sempre foi — trilho sempre ligado, nunca corta.
+    if (placa10) {
+        g_gate10 = EEPROM.read(EE_GATE10);
+        if (g_gate10 < 4 || g_gate10 > 9 || g_gate10 == 6) g_gate10 = 0;
+    }
     g_wakeHib = (EEPROM.read(EE_HIB) == 1);
     if (g_wakeHib) EEPROM.update(EE_HIB, 0);
     // ⭐ v2.14.1 (generalizado; era só mosfet-auto): MCU nascendo com a CONEXÃO

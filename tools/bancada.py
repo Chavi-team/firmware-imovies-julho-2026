@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.28.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.29.0"                # versão desta bancada (bump a cada release)
 
 
 def _versao_do_hex(caminho: str) -> str:
@@ -118,8 +118,8 @@ def _versao_do_hex(caminho: str) -> str:
 # Versão do FIRMWARE que esta bancada grava — LIDA do próprio .hex, nunca
 # digitada. É o que vai para devices.firmware_version.
 FIRMWARE_VERSION = _versao_do_hex(HEX)
-VERSION_DATE = "2026-08-21"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.28.0: 🔥 CORRIGE O BUG QUE FEZ TODA RELEASE DESDE 02/08 GRAVAR FIRMWARE 2.21.0. O instalador não compila: ele queima o .hex que viaja no repositório. Como bin/ é gitignorado, o pacote levava packaging/firmware/chavi_fi.ino.hex — commitado uma vez na v2.21.0 e nunca mais atualizado, enquanto o fonte foi até a 2.27.0. Nada acusava, porque a versão no cabeçalho é a DA BANCADA (que por coincidência também era 2.27.0) e a versão enviada ao backend era uma constante escrita à mão. Placas saíam rodando 2.21.0 — sem o fix do LED preso (v2.22.0), que sozinho drena ~0,144 V/dia e zera a bateria em ~7 dias — e o painel jurava 2.27.0. O que mudou: (1) o .hex empacotado agora É o 2.27.0; (2) FIRMWARE_VERSION deixou de ser constante e passa a ser LIDA de dentro do binário, então o banco registra o que foi realmente gravado; (3) packaging/verificar_hex.py roda no CI e QUEBRA o build se o .hex divergir do FW_VERSION do fonte, para o erro aparecer em quem empacota e não no cliente semanas depois. ⚠️ Quem gravou fechadura com bancada anterior precisa REGRAVAR: aquelas placas estão em 2.21.0."
+VERSION_DATE = "2026-09-02"               # data desta versão (ISO; bump a cada release)
+VERSION_NOTES = "Bancada v2.29.0 + firmware v2.28.0: a FI 1.0 passa a usar o MOSFET. Até aqui o firmware novo mantinha o trilho da 1.0 SEMPRE LIGADO de propósito — o retrofit dela foi feito placa a placa e o gate ficou em PIOs diferentes (7/8/9 no upload antigo, 4/5/6/7 na esteira at.js), e uma máscara com o pino errado deixa a placa sem caminho de volta. Agora o gate é DESCOBERTO em vez de presumido: o novo passo \"Descobrir e ativar (FI 1.0)\" corta pelo ar um pino por vez e vê qual deles cala o MCU (o mesmo mecanismo que provou o gate da CH003FI002910 em 02/08); ao encontrar, religa, confirma que a placa volta, grava o pino na própria fechadura (EEPROM 926, byte novo) e liga a hibernação. Tentativa errada é inofensiva e nada é gravado sem prova. As máscaras da 1.0 seguem como estão (todos os candidatos altos) — é a rede de segurança dela: gate errado simplesmente não corta, em vez de brickar. ⚠️ NADA da FI 1.5 mudou: a ação recusa qualquer placa que não se declare 1.0 no TST-INFO, o byte 926 só é lido quando a placa é 1.0, e o caminho de corte da 1.5 continua o mesmo da v2.27.0. Placas 1.0 já em campo continuam sem cortar até alguém rodar o passo novo — o byte nasce zerado de propósito."
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -232,7 +232,27 @@ def seeds_de(serial):
 #   AFTC continua com o gate + PIO6 (wake): pino 8 -> AFTC028.
 # ⚠️ Efeito colateral aceito: ao COLOCAR A BATERIA a placa nasce desligada e só
 # acorda na 1ª conexão do app (sem melodia de boot). É o preço do corte real.
-def calcular_hex_befc_aftc(mosfet_pin):
+def calcular_hex_befc_aftc(mosfet_pin, placa=None):
+    # ⛔ 02/09/2026 — NÃO dê máscara própria à FI 1.0 aqui. Foi tentado
+    # (v2.29.0, BEFCFF7/AFTCFFF = "todos os candidatos altos, o gate errado não
+    # brica") e QUEBROU a primeira placa gravada com ela, a CH001FI001000: o
+    # módulo truncou para 3F7/3FF, o power-on passou a erguer PIO3,4,5,7,9,10,11
+    # além do 8 — pinos que ninguém garantiu estarem livres numa 1.0 — e a placa
+    # veio a estalar, com o MCU mudo em todos os testes.
+    #
+    # A lição: placa gravada pela bancada faz BOOT SILENCIOSO (o seed marca
+    # EE_MOD_CFG=0xC9), então o firmware NUNCA reaplica máscara nenhuma — quem
+    # define o estado elétrico do power-on é ESTA função, e só ela. Mudar isso
+    # não é "mais seguro por precaução": é mudar a eletricidade da placa.
+    #
+    # O parâmetro `placa` fica porque a chamada já o passa e ele documenta a
+    # decisão — mas as duas placas recebem o MESMO par, que é o que a frota
+    # inteira roda. O corte da 1.0 não depende de máscara: é o AT+PIO<x>0 no
+    # gate confirmado (EEPROM 926), descoberto pelo passo "Descobrir e ativar".
+    return _calcular_hex_befc_aftc_comum(mosfet_pin)
+
+
+def _calcular_hex_befc_aftc_comum(mosfet_pin):
     try:
         m_pin = int(mosfet_pin)
         # ⭐ v2.13 MOSFET-AUTO (pino físico 12 = PIO2/VCC-EEPROM do módulo): o
@@ -318,6 +338,13 @@ def gerar_seed_bin(serial, placa, caminho, mosfet="8"):
     # comando (gravação manual SEM bancada) continua deixando 0 = o firmware
     # se auto-provisiona como antes.
     eeprom[910] = 0xC9
+    # ⭐ v2.29 — byte 926 = chave de energia CONFIRMADA da FI 1.0. Nasce 0 de
+    # propósito, inclusive nas 1.0: o gate delas foi retrofit feito placa a
+    # placa e não se descobre na gravação. Quem o preenche é o passo "Descobrir
+    # e ativar (FI 1.0)", depois de PROVAR pelo ar qual pino corta. Com 0 a
+    # placa se comporta como sempre: trilho sempre ligado.
+    # ⚠️ Não confundir com o byte 914 (FI 1.5) — aquele segue intocado.
+    eeprom[926] = 0x00
     # 916 QUEIMADO (ex-variante sem MOSFET, removida na v2.11.1): fica 0 —
     # placas sem MOSFET usam a config NORMAL (o MCU delas é sempre alimentado).
     with open(caminho, "wb") as f:
@@ -1164,8 +1191,8 @@ BOOT_ESPERA_S = 30   # boot + provisionamento + melodia levam ~24s; margem p/ 30
 #   PWRM0 PRIMEIRO: mata o auto-sleep herdado da esteira legada (PWRM1), que
 #   deixava a UART do módulo DORMINDO — em 9600 nada a acorda pela serial.
 #   Depois: baud 9600 + config de dados/wake + nome + reset.
-def receita_ar(alvo, mosfet_pin):
-    befc, aftc = calcular_hex_befc_aftc(mosfet_pin)
+def receita_ar(alvo, mosfet_pin, placa=None):
+    befc, aftc = calcular_hex_befc_aftc(mosfet_pin, placa)
     # ⭐ v2.13 MOSFET-AUTO (pino 12): o PWRM final é 1 — auto-sleep LIGADO de
     # propósito (módulo ocioso dorme -> PIO2 cai -> mosfet corta a placa; a
     # conexão BLE acorda e religa). O PWRM0 INICIAL fica: acorda módulos com
@@ -1325,6 +1352,21 @@ def act_corrigir_ar(alvo, mosfet_pin="8"):
         LOG("✅ Nada a corrigir.", "ok")
         return True
 
+    # ⭐ v2.29 — trava para a FI 1.0. Este conserto foi feito para a frota 1.5 e
+    # aplica as máscaras DELA. Numa 1.0 o gate do MOSFET varia por unidade: se
+    # ele não for o PIO8, gravar BEFC020/AFTC028 deixa a placa sem caminho de
+    # volta (nem o power-on nem a conexão a religam). Enquanto o pino não está
+    # provado, mexer nas máscaras de uma 1.0 é aposta — e aposta em fechadura
+    # instalada é o tipo de erro que só se descobre com a porta fechada.
+    if any(p in ("AT+BEFC?", "AT+AFTC?") for p, *_ in ruins):
+        ok_info, info = BLE.cmd("TST-INFO", ["FIM-INFO"], timeout=8)
+        if ok_info and info and "PLACA:1.0" in info:
+            LOG("⛔ Esta é uma FI 1.0 e a correção mexeria nas máscaras do "
+                "módulo. Não faço isso às cegas: use o passo \"Descobrir e "
+                "ativar (FI 1.0)\", que prova qual pino corta antes de gravar "
+                "qualquer coisa.", "err")
+            return False
+
     befc, aftc = calcular_hex_befc_aftc(mosfet_pin)
     seguro, motivo = _par_mascaras_seguro(befc, aftc, mosfet_pin)
     mexe_mascara = any(p in ("AT+BEFC?", "AT+AFTC?") for p, *_ in ruins)
@@ -1432,7 +1474,11 @@ def act_provisionar(serial, mcu, mosfet_pin):
     def _reforcar(addr):
         global _GRAVA_TS
         try:
-            ok = BLE.provisionar_at(addr, receita_ar(alvo, mosfet_pin))
+            # ⭐ v2.29: a placa entra na conta — numa FI 1.0 as máscaras da
+            # 1.5 seriam aplicadas pelo ar por cima do que o firmware acabou
+            # de configurar, e numa unidade com gate fora do PIO8 isso a
+            # deixaria muda na bateria.
+            ok = BLE.provisionar_at(addr, receita_ar(alvo, mosfet_pin, _placa_de(mcu)))
         except Exception as e:
             LOG(f"✗ Erro ao provisionar pelo ar: {e}", "err"); return False
         if not ok:
@@ -2007,6 +2053,119 @@ def _testar_corte_remoto(alvo, mosfet, u1):
             "Rode o teste de novo p/ restaurar, ou me avise.", "warn")
     STATUS("hibernar", "ok")
     return {"ok": True, "ja_ativada": False, "modo": "remoto", "befc_corta": befc_corta}
+
+
+# ---------------------------------------------------------------------------
+# ⭐ v2.29 — FI 1.0: DESCOBRIR A CHAVE DE ENERGIA (só esta placa)
+# ---------------------------------------------------------------------------
+# Por que existe: na FI 1.0 o MOSFET foi um RETROFIT feito placa a placa, e o
+# gate ficou em PIOs diferentes conforme quem montou (o `upload` antigo usava
+# 7/8/9; a esteira at.js oferecia 4/5/6/7). Não há como saber pelo cadastro —
+# e chutar é caro: uma máscara com o pino errado deixa a placa sem caminho de
+# volta. Então a bancada DESCOBRE, com o mesmo mecanismo que provou o gate da
+# CH003FI002910 em 02/08: corta pelo ar e vê qual pino faz o MCU calar.
+#
+# O corte é auto-evidente — a placa sem energia não responde ao TST-PING, e o
+# módulo (que é alimentado direto da bateria, fora da chave) continua ali para
+# receber o comando que a religa. Nada é gravado enquanto o pino não se prova.
+#
+# ⚠️ NÃO MEXE EM NADA DA FI 1.5: a função recusa qualquer placa que não se
+# declare 1.0 no TST-INFO, e o byte que ela grava (EEPROM 926) só é lido pelo
+# firmware quando a placa é 1.0.
+#
+# PIO6 fica fora: é a linha de wake (PD3). PIO4 também: em AT+MODE2 o lado
+# remoto só controla PIO5..11, então um gate no PIO4 não pode ser testado pelo
+# ar (essa unidade continua sem corte, o que é o comportamento de hoje).
+CANDIDATOS_GATE10 = (8, 7, 9, 5)
+
+
+def _conectar_ble(alvo, passo):
+    """Garante sessão BLE com a fechadura. Devolve True/False."""
+    if BLE.conectado():
+        return True
+    try:
+        addr = BLE.scan(alvo, timeout=8.0)
+        if not addr:
+            LOG("✗ Fechadura não encontrada por BLE — religue a bateria e tente de novo.", "err")
+            STATUS(passo, "fail"); return False
+        BLE.connect(addr)
+        return True
+    except Exception as e:
+        LOG(f"✗ Erro ao conectar por BLE: {e}", "err")
+        STATUS(passo, "fail"); return False
+
+
+def act_descobrir_gate10(serial, mcu=None):
+    """Descobre e grava o PIO do MOSFET de uma FI 1.0, testando pelo ar."""
+    STATUS("gate10", "run")
+    # Primeira barreira, antes de qualquer rádio: o chip selecionado na tela. A
+    # segunda (a que vale) é o PLACA:1.0 lido da própria fechadura, logo abaixo.
+    if mcu and _placa_de(mcu) != "fi10":
+        LOG("✋ O chip selecionado é o da FI 1.5 (328PB). Esta ação é só para a "
+            "FI 1.0 — a 1.5 já tem a chave de energia configurada e testada.", "warn")
+        STATUS("gate10", "fail"); return False
+    alvo = serial[2:] if serial.startswith("CH") else serial
+    if not _conectar_ble(alvo, "gate10"):
+        return False
+
+    ok, info = BLE.cmd("TST-INFO", ["FIM-INFO"], timeout=8)
+    if not ok or not info:
+        LOG("✗ A fechadura não respondeu ao TST-INFO. Feche o app no celular "
+            "(outro cliente conectado deixa o módulo mudo) e tente de novo.", "err")
+        STATUS("gate10", "fail"); return False
+    if "PLACA:1.0" not in info:
+        LOG("✋ Esta fechadura NÃO é uma FI 1.0 — nada a fazer aqui. A chave de "
+            "energia da FI 1.5 já está configurada e testada; esta ação não "
+            "toca nela.", "warn")
+        STATUS("gate10", "fail"); return False
+    if "GATE10:" not in info:
+        LOG("✗ O firmware desta placa é anterior à v2.28 (não conhece a chave de "
+            "energia da 1.0). Regrave antes de descobrir o gate.", "err")
+        STATUS("gate10", "fail"); return False
+
+    LOG("Procurando a chave de energia: vou cortar pelo ar, um pino por vez, e "
+        "ver qual deles cala o MCU. Cada tentativa que não for o gate é "
+        "inofensiva.", "hi")
+    for pio in CANDIDATOS_GATE10:
+        if not _conectar_ble(alvo, "gate10"):
+            return False
+        aceitou, _ = BLE.cmd(f"AT+PIO{pio}0", ["OK+Set"], timeout=5)
+        if not aceitou:
+            LOG(f"  · PIO{pio}: o módulo não aceitou o comando — pulo.", "warn")
+            continue
+        respondeu, _ = BLE.cmd("TST-PING", ["PONG"], timeout=5)
+        if respondeu:
+            LOG(f"  · PIO{pio}: o MCU continua respondendo — não é o gate.")
+            BLE.cmd(f"AT+PIO{pio}1", ["OK+Set"], timeout=5)   # devolve como estava
+            continue
+        # Calou = a placa perdeu energia. Religa e confirma que ela volta.
+        LOG(f"✓ PIO{pio}: o MCU CALOU — é a chave de energia desta placa. "
+            "Religando para confirmar o caminho de volta...", "ok")
+        BLE.cmd(f"AT+PIO{pio}1", ["OK+Set"], timeout=5)
+        if not _pong_paciente(alvo):
+            LOG(f"✗ Cortou no PIO{pio} mas o MCU não voltou (nem com ~20s de "
+                "paciência). NÃO vou gravar este pino: uma placa que corta e "
+                "não religa é pior do que uma que nunca corta. Religue a "
+                "bateria e me chame.", "err")
+            STATUS("gate10", "fail"); return False
+        gravou, resp = BLE.cmd(f"TST-GATE{pio}", [f"GATE10:{pio}"], timeout=6)
+        if not gravou:
+            LOG(f"✗ O firmware não confirmou a gravação do gate ({resp}).", "err")
+            STATUS("gate10", "fail"); return False
+        # Chave achada e gravada: liga a hibernação, que é o objetivo de tudo
+        # isto. Sem ela o firmware sabe cortar e nunca corta.
+        BLE.cmd("TST-HIB-ON", ["OK-HIB-ON"], timeout=6)
+        LOG(f"✅ CHAVE DE ENERGIA DA 1.0 = PIO{pio}, gravada na placa, e "
+            "hibernação LIGADA. A partir daqui esta fechadura corta o próprio "
+            "trilho quando fica ociosa e religa na conexão — como as 1.5.", "ok")
+        STATUS("gate10", "ok"); return True
+
+    LOG("Nenhum dos pinos cortou a energia. Duas leituras possíveis: (a) esta "
+        "1.0 não tem o retrofit do MOSFET (sem a plaquinha verde no cabo da "
+        "bateria) — e aí não há o que ativar; (b) o gate está no PIO4, que o "
+        "módulo não deixa controlar pelo ar. Nos dois casos a placa segue "
+        "funcionando como antes, sempre alimentada.", "warn")
+    STATUS("gate10", "fail"); return False
 
 
 def act_testar_hibernacao(serial, mcu, mosfet="8"):
@@ -2588,6 +2747,24 @@ PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- ⭐ v2.29 — FI 1.0 SOMENTE. Na 1.0 o MOSFET foi retrofit placa a placa e
+         o gate ficou em PIOs diferentes; por isso ele é DESCOBERTO (corta pelo
+         ar, vê qual pino cala o MCU) em vez de presumido. Não toca na FI 1.5:
+         a ação recusa qualquer placa que não se declare 1.0. -->
+    <div style="margin-top:18px;padding:12px;border:1px dashed var(--amber);border-radius:10px">
+      <div style="font-weight:600;margin-bottom:6px">🔋 Chave de energia da FI 1.0</div>
+      <div style="color:var(--muted);font-size:13px;margin-bottom:10px">
+        Só para <b>FI 1.0</b> (chip 328/328P) com a plaquinha verde no cabo da
+        bateria. A bancada testa um pino por vez pelo ar e grava o que
+        realmente corta — as tentativas erradas são inofensivas. Ao encontrar,
+        liga a hibernação: a partir daí a placa corta o próprio trilho quando
+        fica ociosa, como as 1.5. Requer firmware ≥ 2.28 e o app fechado no
+        celular.</div>
+      <div class="row" style="flex-wrap:wrap;gap:8px">
+        <button id="btn-gate10">🔎 Descobrir e ativar (FI 1.0)</button>
+      </div>
+    </div>
+
     <!-- ⭐ v2.13: teste de HIBERNAÇÃO visível (validação do MOSFET). Fora do
          fluxo numerado de propósito — é teste de engenharia, sob demanda.
          Usa o campo "Pino MOSFET" da tela 1: 12 = teste por UPTIME (auto,
@@ -2784,6 +2961,7 @@ function renderSteps(){
   if($("#btn-hib-off"))   $("#btn-hib-off").onclick=(e)=>runStep("hib-off", e.currentTarget);
   if($("#btn-laudo"))       $("#btn-laudo").onclick=(e)=>runStep("laudo", e.currentTarget);
   if($("#btn-corrigir-ar")) $("#btn-corrigir-ar").onclick=(e)=>runStep("corrigir-ar", e.currentTarget);
+  if($("#btn-gate10"))      $("#btn-gate10").onclick=(e)=>runStep("gate10", e.currentTarget);
 }
 
 let STEP_STATE={};
@@ -3298,6 +3476,10 @@ class Handler(BaseHTTPRequestHandler):
         # Auditoria/conserto PELO AR — os dois passos que atendem a frota em
         # campo sem abrir a placa. O LAUDO é somente leitura (seguro em porta de
         # cliente); o CORRIGIR aplica só o que está divergente.
+        # ⭐ v2.29 — SÓ FI 1.0: descobre a chave de energia pelo ar e grava.
+        # A própria função recusa qualquer placa que não seja 1.0.
+        if step == "gate10":
+            return {"ok": bool(act_descobrir_gate10(serial, mcu))}
         if step == "laudo":
             return {"ok": bool(act_laudo(serial, b.get("mosfet", "8")))}
         if step == "corrigir-ar":
