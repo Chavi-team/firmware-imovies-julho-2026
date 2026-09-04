@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.30.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.30.1"                # versão desta bancada (bump a cada release)
 
 
 def _versao_do_hex(caminho: str) -> str:
@@ -119,7 +119,7 @@ def _versao_do_hex(caminho: str) -> str:
 # digitada. É o que vai para devices.firmware_version.
 FIRMWARE_VERSION = _versao_do_hex(HEX)
 VERSION_DATE = "2026-09-04"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.30.0: REGRAVAÇÃO de placa hibernada — o Gravar acorda a placa sozinho. Caso real (04/09, 38 de 40 placas): numa FI com mosfet já provisionada o corte FUNCIONA desde a v2.25.0 — o módulo ocioso dorme, o gate cai e o trilho do MCU é cortado. Bateria dentro, chip SEM energia: o USBasp encontra um chip apagado e falha com 'target does not answer (0x01)', idêntico a cabo solto. Placa virgem nunca corta (módulo de fábrica não dorme), então a gravação 'sempre funcionou' — regravar placa com corte ativo era situação inédita. Como em PWRM1 o módulo dormindo CONTINUA anunciando (manuais 5.2/1010: só AT+SLEEP tira do ar), o Gravar e o Validar agora, ao ver o chip mudo no cabo, procuram a fechadura por Bluetooth, CONECTAM (a conexão ergue o gate e religa o trilho) e repetem o avrdude com a conexão segura; ela é solta quando o cabo termina, para o Provisionar/Conectar enxergarem o módulo no scan. O resgate só conecta no alvo exato ou em módulo virgem (regras de segurança do scan de sempre — nunca em outro serial). Mensagens de erro refeitas: com o trilho religado e o chip ainda mudo, a causa é física (cabo ISP/berço/bateria/JP3 do clone USBasp) e o log agora diz isso. · Firmware v2.28.0 embutido (inalterado)."
+VERSION_NOTES = "Bancada v2.30.1: o resgate por Bluetooth agora dá VEREDITO. Caso de campo (04/09, CH003FI003027): a conexão religou e o chip seguiu mudo no cabo — faltava saber de que lado está o defeito. Depois de conectar, a bancada manda TST-PING pelo rádio: PONG = a placa está VIVA e energizada, então falha no cabo é 100% CONTATO físico do ISP (RESET/SCK/MISO/MOSI/GND no berço, pino 1 invertido, gravador) — o log agora diz isso com todas as letras e inocenta a placa. Sem PONG = lê BEFC/AFTC/PIO8/PWRM do módulo pelo ar (ficam no log para diagnóstico remoto) e ergue o PIO8 na marra (AT+PIO81, não persistente — não bricka), cobrindo placa cujo gate não está no AFTC; pinga de novo e registra o veredito. Espera pós-conexão subiu de 1s para 3s (step-up + boot). · Firmware v2.28.0 embutido (inalterado)."
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -1018,6 +1018,9 @@ MCU_REAL = {}
 # 5.2 p.42 / 1010 p.40 — só AT+SLEEP tira do ar): a conexão BLE ergue o gate
 # (AFTC/PIO2) e religa o MCU. A conexão precisa ficar SEGURA enquanto o cabo
 # trabalha — desconectar no meio devolve a placa ao estado que o corte decidir.
+_RESGATE_PONG = False   # último resgate: o MCU respondeu PONG pelo rádio?
+
+
 def _religar_por_ble(serial):
     alvo = serial[2:] if serial.upper().startswith("CH") else serial
     LOG("⚡ A placa pode estar HIBERNANDO (mosfet cortou o trilho: bateria "
@@ -1042,7 +1045,39 @@ def _religar_por_ble(serial):
         return False
     LOG("  ✓ Conectado — a conexão segura o TRILHO LIGADO enquanto o cabo "
         "grava. Não desconecte nada agora.", "ok")
-    time.sleep(1.0)   # step-up + MCU energizam antes do próximo toque do ISP
+    time.sleep(3.0)   # step-up + boot do MCU antes de perguntar/gravar
+    # ⭐ v2.30.1 — VEREDITO PELO RÁDIO: com a conexão de pé dá para saber se o
+    # chip ganhou energia de verdade. PONG = MCU vivo e RODANDO → se o cabo
+    # ainda falhar, a causa é 100% física (RESET/SCK/MISO/MOSI sem contato no
+    # berço, cabo invertido, gravador). Sem PONG = o trilho pode continuar
+    # cortado (gate fora do AFTC desta placa): lemos a config real do módulo
+    # pelo ar e erguemos o PIO8 na marra (AT+PIO81 — NÃO persistente, manual:
+    # volta ao BEFC no próximo power-up; não bricka).
+    global _RESGATE_PONG
+    _RESGATE_PONG = False
+    for _ping in range(3):
+        ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=3.0)
+        if ok:
+            _RESGATE_PONG = True
+            LOG("  ✓ O MCU respondeu PONG pelo rádio — a placa TEM energia e o "
+                "chip está RODANDO. Qualquer falha do cabo agora é CONTATO "
+                "físico do ISP, não a placa.", "ok")
+            break
+    if not _RESGATE_PONG:
+        LOG("  Sem PONG — lendo a config do módulo pelo ar e erguendo o gate "
+            "na marra (PIO8)...", "warn")
+        for q in ("AT+VERS?", "AT+BEFC?", "AT+AFTC?", "AT+PIO8?", "AT+PWRM?"):
+            BLE.cmd(q, ["OK", "ERRO", "+"], timeout=2.5)
+        BLE.cmd("AT+PIO81", ["OK", "ERRO"], timeout=2.5)
+        time.sleep(2.0)
+        ok, _ = BLE.cmd("TST-PING", ["PONG"], timeout=3.0)
+        if ok:
+            _RESGATE_PONG = True
+            LOG("  ✓ PONG depois do AT+PIO81 — o gate desta placa NÃO estava no "
+                "AFTC (a conexão sozinha não religava). Trilho ligado agora.", "ok")
+        else:
+            LOG("  Ainda sem PONG — se o cabo falhar de novo, envie ESTE log "
+                "completo: as respostas AT acima dizem o estado real do módulo.", "warn")
     return True
 
 
@@ -1165,13 +1200,23 @@ def act_gravar(serial, mcu, mosfet="8"):
                 "NÃO resolve — o USBasp travou e precisa ser religado.", "err")
     elif "does not answer" in low or "initialization failed" in low:
         if BLE.conectado():
-            # O resgate religou o trilho e MESMO ASSIM o chip não falou: agora
-            # sim o problema é físico, do lado do cabo/gravador.
-            LOG("✗ O chip não respondeu NEM com o trilho religado por Bluetooth — "
-                "o problema é FÍSICO. ⇒ Reencaixe o cabo no conector ISP (pino 1 "
-                "certo, pinos firmes), confira a carga da bateria, use USB direto "
-                "(sem hub) e, se o USBasp for clone, feche o jumper JP3 (slow SCK). "
-                "Depois clique Gravar de novo.", "err")
+            if _RESGATE_PONG:
+                # O MCU FALOU pelo rádio e ficou mudo no cabo: a placa está viva
+                # e energizada — só o caminho ISP não fecha circuito.
+                LOG("✗ VEREDITO: a placa está VIVA (respondeu PONG pelo rádio) e "
+                    "mesmo assim o cabo não a encontrou. O problema é 100% no "
+                    "CAMINHO DO CABO: pino sem contato no conector/berço ISP "
+                    "(RESET, SCK, MISO, MOSI ou GND), cabo invertido (pino 1!), "
+                    "ou o próprio gravador. ⇒ Reencaixe o cabo, confira o pino 1, "
+                    "teste o gravador/berço da estação antiga e, em USBasp clone, "
+                    "feche o jumper JP3 (slow SCK). NÃO é a placa.", "err")
+            else:
+                LOG("✗ O chip não respondeu no cabo NEM deu sinal de vida pelo "
+                    "rádio, mesmo conectado — o trilho desta placa pode continuar "
+                    "cortado (gate fora do alcance do resgate) ou o chip está sem "
+                    "clock. ⇒ Envie o print DESTE log completo (as respostas AT "
+                    "acima mostram o estado real do módulo) e teste a placa na "
+                    "estação antiga.", "err")
         else:
             LOG("✗ O chip não respondeu ao gravador. Se esta placa JÁ FOI GRAVADA "
                 "antes, ela pode estar HIBERNANDO (trilho cortado pelo mosfet) — "
