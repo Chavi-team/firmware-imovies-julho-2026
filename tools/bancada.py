@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.29.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.30.0"                # versão desta bancada (bump a cada release)
 
 
 def _versao_do_hex(caminho: str) -> str:
@@ -118,8 +118,8 @@ def _versao_do_hex(caminho: str) -> str:
 # Versão do FIRMWARE que esta bancada grava — LIDA do próprio .hex, nunca
 # digitada. É o que vai para devices.firmware_version.
 FIRMWARE_VERSION = _versao_do_hex(HEX)
-VERSION_DATE = "2026-09-02"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.29.0 + firmware v2.28.0: a FI 1.0 passa a usar o MOSFET. Até aqui o firmware novo mantinha o trilho da 1.0 SEMPRE LIGADO de propósito — o retrofit dela foi feito placa a placa e o gate ficou em PIOs diferentes (7/8/9 no upload antigo, 4/5/6/7 na esteira at.js), e uma máscara com o pino errado deixa a placa sem caminho de volta. Agora o gate é DESCOBERTO em vez de presumido: o novo passo \"Descobrir e ativar (FI 1.0)\" corta pelo ar um pino por vez e vê qual deles cala o MCU (o mesmo mecanismo que provou o gate da CH003FI002910 em 02/08); ao encontrar, religa, confirma que a placa volta, grava o pino na própria fechadura (EEPROM 926, byte novo) e liga a hibernação. Tentativa errada é inofensiva e nada é gravado sem prova. As máscaras da 1.0 seguem como estão (todos os candidatos altos) — é a rede de segurança dela: gate errado simplesmente não corta, em vez de brickar. ⚠️ NADA da FI 1.5 mudou: a ação recusa qualquer placa que não se declare 1.0 no TST-INFO, o byte 926 só é lido quando a placa é 1.0, e o caminho de corte da 1.5 continua o mesmo da v2.27.0. Placas 1.0 já em campo continuam sem cortar até alguém rodar o passo novo — o byte nasce zerado de propósito."
+VERSION_DATE = "2026-09-04"               # data desta versão (ISO; bump a cada release)
+VERSION_NOTES = "Bancada v2.30.0: REGRAVAÇÃO de placa hibernada — o Gravar acorda a placa sozinho. Caso real (04/09, 38 de 40 placas): numa FI com mosfet já provisionada o corte FUNCIONA desde a v2.25.0 — o módulo ocioso dorme, o gate cai e o trilho do MCU é cortado. Bateria dentro, chip SEM energia: o USBasp encontra um chip apagado e falha com 'target does not answer (0x01)', idêntico a cabo solto. Placa virgem nunca corta (módulo de fábrica não dorme), então a gravação 'sempre funcionou' — regravar placa com corte ativo era situação inédita. Como em PWRM1 o módulo dormindo CONTINUA anunciando (manuais 5.2/1010: só AT+SLEEP tira do ar), o Gravar e o Validar agora, ao ver o chip mudo no cabo, procuram a fechadura por Bluetooth, CONECTAM (a conexão ergue o gate e religa o trilho) e repetem o avrdude com a conexão segura; ela é solta quando o cabo termina, para o Provisionar/Conectar enxergarem o módulo no scan. O resgate só conecta no alvo exato ou em módulo virgem (regras de segurança do scan de sempre — nunca em outro serial). Mensagens de erro refeitas: com o trilho religado e o chip ainda mudo, a causa é física (cabo ISP/berço/bateria/JP3 do clone USBasp) e o log agora diz isso. · Firmware v2.28.0 embutido (inalterado)."
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -1007,6 +1007,45 @@ def _placa_de(mcu):
 MCU_REAL = {}
 
 
+# ⭐ v2.30 — RESGATE DO TRILHO CORTADO (caso real: 38 de 40 placas em 04/09).
+# Numa FI com mosfet JÁ PROVISIONADA o corte funciona de verdade desde a
+# v2.25.0: o módulo ocioso dorme, o gate cai e o trilho do MCU é CORTADO —
+# bateria dentro, chip SEM energia. O ISP encontra um chip apagado e falha com
+# "target does not answer (0x01)", que parece defeito de cabo mas não é.
+# Placa VIRGEM nunca corta (módulo de fábrica não dorme) — por isso a gravação
+# "sempre funcionou": regravar placa com corte ativo é situação nova.
+# Em PWRM1 o módulo dormindo CONTINUA anunciando e aceitando conexão (manuais
+# 5.2 p.42 / 1010 p.40 — só AT+SLEEP tira do ar): a conexão BLE ergue o gate
+# (AFTC/PIO2) e religa o MCU. A conexão precisa ficar SEGURA enquanto o cabo
+# trabalha — desconectar no meio devolve a placa ao estado que o corte decidir.
+def _religar_por_ble(serial):
+    alvo = serial[2:] if serial.upper().startswith("CH") else serial
+    LOG("⚡ A placa pode estar HIBERNANDO (mosfet cortou o trilho: bateria "
+        "dentro, chip desligado). Tentando ACORDÁ-LA por Bluetooth...", "hi")
+    if BLE.conectado():
+        BLE.disconnect()
+    try:
+        addr = BLE.scan(alvo, timeout=8.0)
+    except Exception as e:
+        LOG(f"  (Bluetooth indisponível para o resgate: {e})", "warn")
+        return False
+    if not addr:
+        LOG("  Nenhum módulo compatível no ar — se esta placa é NOVA (nunca "
+            "gravada), o problema é físico: cabo ISP/berço/bateria.", "warn")
+        return False
+    try:
+        BLE.connect(addr)
+    except Exception as e:
+        LOG(f"  (conexão de resgate falhou: {e})", "warn")
+        return False
+    if not BLE.conectado():
+        return False
+    LOG("  ✓ Conectado — a conexão segura o TRILHO LIGADO enquanto o cabo "
+        "grava. Não desconecte nada agora.", "ok")
+    time.sleep(1.0)   # step-up + MCU energizam antes do próximo toque do ISP
+    return True
+
+
 def act_gravar(serial, mcu, mosfet="8"):
     STATUS("gravar", "run")
     os.makedirs(BIN_DIR, exist_ok=True)
@@ -1067,15 +1106,20 @@ def act_gravar(serial, mcu, mosfet="8"):
         # 1º toque ("target does not answer") e funciona logo em seguida —
         # visto em produção 11/07 (2 de 7 exigiam um 2º clique). Re-tenta 1×
         # sozinho antes de devolver erro pro operador.
+        cmd_fuses = _avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
+                                      "-U", f"lfuse:w:{lfuse}:m", "-U", "hfuse:w:0xD7:m",
+                                      "-U", f"efuse:w:{efuse}:m"]
         for _contato in (1, 2):
-            rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
-                            "-U", f"lfuse:w:{lfuse}:m", "-U", "hfuse:w:0xD7:m",
-                            "-U", f"efuse:w:{efuse}:m"])
+            rc, out = _exec(cmd_fuses)
             if rc == 0 or "does not answer" not in out.lower():
                 break
             LOG("Gravador não respondeu no 1º contato — tentando de novo em 2s "
                 "(não mexa no cabo)...", "warn")
             time.sleep(2)
+        # ⭐ v2.30: chip mudo no cabo = possível trilho cortado (regravação de
+        # placa hibernada). Acorda por BLE, segura a conexão e tenta de novo.
+        if rc != 0 and "does not answer" in out.lower() and _religar_por_ble(serial):
+            rc, out = _exec(cmd_fuses)
         if rc == 0:
             # ESTÁGIO 2a (-B 8): EEPROM no modo LENTO de propósito — o tempo de
             # escrita de EEPROM é do SILÍCIO (~3,4ms/byte): 10,75s no rápido ×
@@ -1120,8 +1164,21 @@ def act_gravar(serial, mcu, mosfet="8"):
                 "computador, espere 5s e RECONECTE (direto, sem hub). Clicar de novo "
                 "NÃO resolve — o USBasp travou e precisa ser religado.", "err")
     elif "does not answer" in low or "initialization failed" in low:
-        LOG("✗ O chip não respondeu ao gravador. ⇒ Firme o cabo no conector ISP da "
-            "placa e confirme a BATERIA dentro. Depois clique Gravar de novo.", "err")
+        if BLE.conectado():
+            # O resgate religou o trilho e MESMO ASSIM o chip não falou: agora
+            # sim o problema é físico, do lado do cabo/gravador.
+            LOG("✗ O chip não respondeu NEM com o trilho religado por Bluetooth — "
+                "o problema é FÍSICO. ⇒ Reencaixe o cabo no conector ISP (pino 1 "
+                "certo, pinos firmes), confira a carga da bateria, use USB direto "
+                "(sem hub) e, se o USBasp for clone, feche o jumper JP3 (slow SCK). "
+                "Depois clique Gravar de novo.", "err")
+        else:
+            LOG("✗ O chip não respondeu ao gravador. Se esta placa JÁ FOI GRAVADA "
+                "antes, ela pode estar HIBERNANDO (trilho cortado pelo mosfet) — "
+                "verifique se o Bluetooth deste computador está LIGADO e clique "
+                "Gravar de novo: a bancada acorda a placa pelo ar sozinha. Se é "
+                "placa NOVA: firme o cabo no conector ISP e confirme a BATERIA "
+                "dentro.", "err")
     else:
         LOG("✗ Gravação falhou. Verifique bateria DENTRO e contato firme do USBasp.", "err")
     STATUS("gravar", "fail"); return False
@@ -1151,10 +1208,27 @@ def act_validar(serial, mcu):
             break
         if "signature" not in out.lower():
             break
+    # ⭐ v2.30: mesma proteção do Gravar — placa hibernada (trilho cortado)
+    # também é muda na RELEITURA. Acorda por BLE e relê uma vez.
+    if rc != 0 and "does not answer" in out.lower() and _religar_por_ble(serial):
+        m = MCU_REAL.get(serial, preferido)
+        rc, out = _exec(_avrdude_cmd() + ["-P", "usb", "-c", AVR_PROG, "-p", m, "-b", "19200", "-B", "8",
+                        "-U", f"eeprom:r:{eep}:r"])
+        if rc == 0:
+            MCU_REAL[serial] = m
     if rc != 0 or not os.path.exists(eep):
+        if BLE.conectado():
+            BLE.disconnect()
         LOG("✗ Não consegui reler a fechadura.", "err"); STATUS("validar", "fail"); return False
     with open(eep, "rb") as f:
         data = f.read()
+    # ⭐ v2.30: se o cabo trabalhou com a placa segurada por BLE (resgate do
+    # trilho), o USBasp já terminou — solta a conexão AGORA para o módulo
+    # voltar a anunciar (Provisionar/Conectar fazem o próprio scan; conexão
+    # presa aqui os deixaria cegos).
+    if BLE.conectado():
+        LOG("  (soltando a conexão de resgate — o módulo volta a anunciar)", "hi")
+        BLE.disconnect()
     ser_lido = bytes(data[769:780]).split(b"\x00")[0].decode(errors="replace")
     esperado = serial[2:]
     sd = seeds_de(serial)
