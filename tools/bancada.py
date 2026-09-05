@@ -80,7 +80,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.30.1"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.31.0"                # versão desta bancada (bump a cada release)
 
 
 def _versao_do_hex(caminho: str) -> str:
@@ -1433,6 +1433,9 @@ def _auditar(alvo, mosfet_pin):
 def act_laudo(alvo, mosfet_pin="8"):
     """SOMENTE LEITURA — audita uma fechadura em campo e emite o laudo.
     Não escreve absolutamente nada; seguro para rodar em porta de cliente."""
+    # O nome no ar é o serial SEM "CH" (como em todos os outros passos). Sem
+    # isto o scan blindado marcava a PRÓPRIA fechadura como "outro serial" (⛔).
+    alvo = alvo[2:] if alvo.upper().startswith("CH") else alvo
     addr, achados, _bruto = _auditar(alvo, mosfet_pin)
     if achados is None:
         return False
@@ -1442,16 +1445,25 @@ def act_laudo(alvo, mosfet_pin="8"):
             "conectado nela (feche o app), ou o módulo não está em MODE2.", "err")
         return False
     ruins = [a for a in achados if not a[3]]
+    # STATUS=A é de fábrica em parte dos módulos (ATm 5 pinos) e o AT+STATUS0 é
+    # rejeitado em MODE2 — divergência REAL porém incorrigível e inócua (pino sem
+    # trilha). Aparece no laudo como tolerada; não reprova nem aciona o CORRIGIR.
+    tolerados = [a for a in ruins if a[0] == "AT+STATUS?" and a[2]]
+    ruins = [a for a in ruins if a not in tolerados]
     for p, e, lido, ok, _c, k in achados:
         alvo_txt = f"{p[3:-1]:<7}"
         if ok:
             LOG(f"  ✓ {alvo_txt} {lido}")
         elif not lido:
             LOG(f"  ? {alvo_txt} (sem resposta)", "warn")
+        elif any(a[0] == p for a in tolerados):
+            LOG(f"  ↷ {alvo_txt} {lido}  (esperado {e}; de fábrica neste módulo, "
+                "incorrigível pelo ar e inócuo — tolerado)", "warn")
         else:
             LOG(f"  ✗ {alvo_txt} {lido}  (esperado {e}){'  ← CRÍTICO' if k else ''}", "err")
     if not ruins:
-        LOG("✅ LAUDO: configuração do módulo ÍNTEGRA — nada a corrigir.", "ok")
+        LOG("✅ LAUDO: configuração do módulo ÍNTEGRA — nada a corrigir."
+            + (" (STATUS de fábrica tolerado)" if tolerados else ""), "ok")
         return True
     criticos = [a for a in ruins if a[5]]
     LOG(f"⚠️ LAUDO: {len(ruins)} divergência(s), {len(criticos)} crítica(s). "
@@ -1463,6 +1475,7 @@ def act_corrigir_ar(alvo, mosfet_pin="8"):
     """Aplica PELO AR apenas os parâmetros divergentes (conserto cirúrgico).
     Não usa a receita inteira: quanto menos se escreve numa fechadura em campo,
     menor o risco. Termina com AT+RESET só se algo mudou."""
+    alvo = alvo[2:] if alvo.upper().startswith("CH") else alvo
     addr, achados, _bruto = _auditar(alvo, mosfet_pin)
     if achados is None:
         return False
@@ -1493,12 +1506,26 @@ def act_corrigir_ar(alvo, mosfet_pin="8"):
         LOG(f"⛔ ABORTADO por segurança: {motivo}", "err")
         return False
 
+    # ⚠️ STATUS=A é de fábrica em parte dos módulos ("Soft ATm" 5 pinos: PIO10/11
+    # fixos) e o AT+STATUS0 é REJEITADO em MODE2 (parâmetro válido = pino 5..11,
+    # manual p.28) — corrigir é impossível pelo ar. Visto na 003FI002910 e na
+    # 003FI002283 (05/09). Fica no LAUDO como aviso; aqui só pularíamos em vão.
+    incorrigiveis = [a for a in ruins if a[0] == "AT+STATUS?"]
+    ruins = [a for a in ruins if a[0] != "AT+STATUS?"]
+    for p, e, lido, *_ in incorrigiveis:
+        LOG(f"  ↷ {p[3:-1]} {lido} (esperado {e}) não é corrigível pelo ar "
+            "neste módulo — ignorando (inócuo: pino sem trilha).", "warn")
+    if not ruins:
+        LOG("✅ Nada (corrigível) a corrigir.", "ok")
+        return True
+
     # PWRM0 primeiro acorda um módulo com herança de sleep; o PWRM definitivo
-    # vai por último, imediatamente antes do RESET.
+    # vai por último, imediatamente antes do RESET. SEMPRE restaurar o PWRM1:
+    # o PWRM0 inicial é nosso — sem isto, corrigir qualquer outro parâmetro
+    # deixava o módulo acordado p/ sempre (dreno de bateria + corte nunca cai).
     cmds = ["AT+PWRM0"]
     cmds += [c for p, _e, _l, _ok, c, _k in ruins if p != "AT+PWRM?"]
-    if any(p == "AT+PWRM?" for p, *_ in ruins):
-        cmds.append("AT+PWRM1")
+    cmds.append("AT+PWRM1")
     cmds.append("AT+RESET")
 
     LOG(f"🔧 Corrigindo {len(ruins)} parâmetro(s) de '{alvo}' pelo ar:", "hi")
