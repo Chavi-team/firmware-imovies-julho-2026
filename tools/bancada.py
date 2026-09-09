@@ -73,6 +73,36 @@ SEED_MAX_RANGE = 429496729
 SEED_SECRET = os.getenv("SEED_SECRET", "CHAVI")
 AVR_PROG = os.getenv("AVR_PROG", "usbasp")
 BAUD_CABO = 2400
+
+# ---------------------------------------------------------------------------
+# CONEXÃO INTELIGENTE (CI) — gravação por cabo.
+# A CI é ESP32 (não AVR): grava com ESPTOOL por USB-TTL, com 4 binários
+# PRÉ-COMPILADOS (não tem seeds/mosfet/EEPROM como a FI). A identidade dela é o
+# MAC do rádio (o serial CHZZZCIXXXXX é só rótulo/cadastro no core, não vai no
+# firmware). Os .bin vêm de packaging/firmware-ci (bundlados no pacote).
+CI_BIN_DIR = os.path.join(RES, "firmware-ci") if FROZEN else os.path.join(ROOT, "packaging", "firmware-ci")
+CI_APP = os.path.join(CI_BIN_DIR, "CI_v4.ino.bin")
+CI_BOOTLOADER = os.path.join(CI_BIN_DIR, "CI_v4.ino.bootloader.bin")
+CI_PARTITIONS = os.path.join(CI_BIN_DIR, "CI_v4.ino.partitions.bin")
+CI_BOOTAPP0 = os.path.join(CI_BIN_DIR, "boot_app0.bin")
+CI_BAUD = 921600
+
+
+def _esptool_cmd():
+    """esptool p/ gravar a CI (ESP32): embutido no pacote, senão o do core esp32
+    do Arduino (como o flash.sh da CI), senão o do PATH/pip."""
+    exe = "esptool.exe" if os.name == "nt" else "esptool"
+    bundled = os.path.join(RES, "esptool", exe)
+    if os.path.exists(bundled):
+        return [bundled]
+    import glob
+    for base in ("~/Library/Arduino15", "~/.arduino15",
+                 "~/AppData/Local/Arduino15"):
+        hits = glob.glob(os.path.join(os.path.expanduser(base),
+                         "packages/esp32/tools/esptool_py/**/" + exe), recursive=True)
+        if hits:
+            return [hits[0]]
+    return ["esptool"]  # pip / PATH
 API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 
 # ---------------------------------------------------------------------------
@@ -1227,6 +1257,47 @@ def act_gravar(serial, mcu, mosfet="8"):
     else:
         LOG("✗ Gravação falhou. Verifique bateria DENTRO e contato firme do USBasp.", "err")
     STATUS("gravar", "fail"); return False
+
+
+def act_gravar_ci(serial, porta=None):
+    """Grava o firmware da CONEXÃO INTELIGENTE (ESP32) por cabo USB-TTL.
+
+    Diferente da FI: sem seeds, sem mosfet, sem EEPROM, sem placa 328. São 4
+    binários pré-compilados (bootloader + partições + boot_app0 + app) gravados
+    com esptool. A identidade da CI é o MAC do rádio — o `serial` aqui é só
+    rótulo (o cadastro da CI é no CORE, por série, não neste backend de imóveis).
+    """
+    STATUS("gravar-ci", "run")
+    faltando = [os.path.basename(p) for p in (CI_BOOTLOADER, CI_PARTITIONS, CI_BOOTAPP0, CI_APP)
+                if not os.path.exists(p)]
+    if faltando:
+        LOG("Firmware da CI não embutido no pacote (falta: " + ", ".join(faltando) +
+            "). Regere packaging/firmware-ci.", "err")
+        STATUS("gravar-ci", "fail"); return False
+    porta = porta or Cabo.porta_provavel()
+    if not porta:
+        LOG("Cabo USB-TTL não encontrado. Ligue o conversor e confira o GPIO0→GND "
+            "(modo gravação), TX↔RX cruzados e 3,3 V.", "err")
+        STATUS("gravar-ci", "fail"); return False
+    LOG(f"Gravando firmware da CI (ESP32) em {serial or 'CI'} pela porta {porta}. "
+        "NÃO mexa no cabo agora.", "hi")
+    # Gravação COMPLETA (placa de bancada é virgem): bootloader + partições +
+    # boot_app0 + app, os mesmos 4 offsets do flash.sh --completo.
+    cmd = _esptool_cmd() + ["--chip", "esp32", "--port", porta, "--baud", str(CI_BAUD),
+                            "write_flash", "-z",
+                            "0x1000", CI_BOOTLOADER,
+                            "0x8000", CI_PARTITIONS,
+                            "0xe000", CI_BOOTAPP0,
+                            "0x10000", CI_APP]
+    rc, _ = _exec(cmd)
+    if rc != 0:
+        LOG("✗ Gravação da CI falhou. Confira: GPIO0 em GND ao ligar (modo download), "
+            "TX↔RX CRUZADOS, alimentação 3,3 V e a porta escolhida.", "err")
+        STATUS("gravar-ci", "fail"); return False
+    LOG("✔ CI gravada. Solte o GPIO0, reinicie a alimentação e confirme no painel "
+        "(Saúde das Conexões) que ela aparece 'Respondendo'. Depois cadastre-a no "
+        "sistema pela série.", "ok")
+    STATUS("gravar-ci", "ok"); return True
 
 
 def act_validar(serial, mcu):
@@ -2824,14 +2895,22 @@ PAGE = r"""<!DOCTYPE html>
     <h1>Nova fechadura</h1>
     <div class="sub">Digite o número de série impresso na etiqueta</div>
     <div class="card">
+      <div class="row center" style="margin-bottom:12px">
+        <label style="color:var(--muted);font-size:14px">O que vai gravar?</label>
+        <select id="tipo">
+          <option value="fi" selected>Fechadura (FI)</option>
+          <option value="ci">Conexão Inteligente (CI)</option>
+        </select>
+      </div>
       <div class="mask">
         <span class="pfx">CH</span>
         <input id="ggg" inputmode="numeric" maxlength="3" placeholder="003">
-        <span class="pfx">FI</span>
+        <span class="pfx" id="pfx-tipo">FI</span>
         <input id="nnn" inputmode="numeric" maxlength="6" placeholder="002585">
       </div>
       <div class="prev" id="prev"></div>
       <div class="seeds" id="seeds"></div>
+      <div id="fi-only">
       <div class="row center" style="margin-top:16px">
         <label style="color:var(--muted);font-size:14px">Placa</label>
         <!-- só a GERAÇÃO da placa; o chip exato (328/328P/328PB) a gravação
@@ -2852,6 +2931,14 @@ PAGE = r"""<!DOCTYPE html>
         <span style="color:var(--muted);font-size:12px">
           A plaquinha verde emendada no cabo da bateria = tem MOSFET. Quase todas
           usam o pino 13; as opções 11 e 14 existem para placas FI 1.0 antigas.
+        </span>
+      </div>
+      </div>
+      <!-- CI: sem seeds/placa/mosfet — só uma nota do cabo -->
+      <div id="ci-only" class="hide row center" style="margin-top:12px">
+        <span style="color:var(--muted);font-size:12px">
+          Conexão Inteligente (ESP32): grave pelo cabo USB-TTL — GPIO0 em GND ao
+          ligar, TX↔RX cruzados, 3,3 V. Sem seeds, placa ou MOSFET.
         </span>
       </div>
     </div>
@@ -2877,7 +2964,7 @@ PAGE = r"""<!DOCTYPE html>
          podem ser abertas. Não usa cabo e não depende do MCU: em AT+MODE2 o
          módulo aceita comandos AT vindos do celular/bancada, então dá para
          AUDITAR e CORRIGIR a configuração do rádio à distância. -->
-    <div style="margin-top:18px;padding:12px;border:1px dashed var(--amber);border-radius:10px">
+    <div id="campo-ar" style="margin-top:18px;padding:12px;border:1px dashed var(--amber);border-radius:10px">
       <div style="font-weight:600;margin-bottom:6px">📡 Fechadura em campo (pelo ar, sem cabo)</div>
       <div style="color:var(--muted);font-size:13px;margin-bottom:10px">
         Para unidades <b>já instaladas</b>. Basta estar perto da fechadura e ter
@@ -3027,7 +3114,7 @@ const TESTES = [
   // Hibernação (⚡): agora é fluxo AUTOMATIZADO na seção de RECUPERAÇÃO
   // (Testar/Ativar/Desativar), que valida o ciclo corta→religa sozinho.
 ];
-let SERIAL="", MCU="m328pb", busy=false;
+let SERIAL="", MCU="m328pb", TIPO="fi", busy=false;
 
 const $ = s=>document.querySelector(s);
 const ggg=$("#ggg"), nnn=$("#nnn");
@@ -3039,7 +3126,7 @@ function padFI(v){ v=(v||"").replace(/\\D/g,""); return v ? v.padStart(6,'0').sl
 
 function serialAtual(){
   const g=padCH(ggg.value), n=padFI(nnn.value);
-  return (g && n) ? ("CH"+g+"FI"+n) : null;
+  return (g && n) ? ("CH"+g+(TIPO==="ci"?"CI":"FI")+n) : null;
 }
 
 function onlyDigits(e){
@@ -3051,11 +3138,25 @@ function onlyDigits(e){
 async function prev(){
   const s=serialAtual();
   if(s){ $("#prev").textContent="→  "+s; $("#prev").style.color="var(--ok)"; $("#btn-next").disabled=false;
-    $("#btn-ble-direct").disabled=false;
+    // "JÁ GRAVADA (BLE)" é fluxo de FI; na CI não se aplica.
+    $("#btn-ble-direct").disabled=(TIPO==="ci");
+    // A CI não tem seeds (identidade é o MAC); só a FI mostra o preview.
+    if(TIPO==="ci"){ $("#seeds").textContent=""; return; }
     const r=await fetch("/api/seeds?serial="+s).then(r=>r.json());
     $("#seeds").textContent="seeds: "+r.seeds.join(" · ");
-  } else { $("#prev").textContent="digite o canal (CH) e o nº (FI) — completo com zeros à esquerda"; $("#prev").style.color="var(--err)";
+  } else { $("#prev").textContent="digite o canal (CH) e o nº — completo com zeros à esquerda"; $("#prev").style.color="var(--err)";
     $("#seeds").textContent=""; $("#btn-next").disabled=true; $("#btn-ble-direct").disabled=true; }
+}
+// Alterna FI ↔ CI: troca o infixo da série, esconde os campos de FI (placa/
+// mosfet/seeds) e ajusta os passos. A CI é ESP32 e só precisa gravar o firmware.
+function onTipo(){
+  TIPO = ($("#tipo") && $("#tipo").value) || "fi";
+  $("#pfx-tipo").textContent = (TIPO==="ci") ? "CI" : "FI";
+  const ci = (TIPO==="ci");
+  $("#fi-only").classList.toggle("hide", ci);
+  $("#ci-only").classList.toggle("hide", !ci);
+  if($("#btn-ble-direct")) $("#btn-ble-direct").style.display = ci ? "none" : "";
+  prev();
 }
 ggg.addEventListener("input",onlyDigits); nnn.addEventListener("input",onlyDigits);
 // AO SAIR do campo, mostra já preenchido com os zeros à esquerda.
@@ -3065,6 +3166,13 @@ ggg.addEventListener("keydown",e=>{if(e.key==="Enter"){ if(ggg.value) ggg.value=
 nnn.addEventListener("keydown",e=>{if(e.key==="Enter"){ if(nnn.value) nnn.value=padFI(nnn.value); prev(); if(!$("#btn-next").disabled)irPassos(); }});
 $("#btn-next").onclick=irPassos;
 $("#btn-ble-direct").onclick=irPassosBle;
+if($("#tipo")) $("#tipo").addEventListener("change", onTipo);
+
+// Passos da CI: um só — gravar o firmware pelo cabo. Sem teste/certificar/
+// cadastro (a CI se cadastra no core, por série).
+const PASSOS_CI = [
+  ["gravar-ci","1 · Gravar firmware","Grava o firmware da Conexão Inteligente (ESP32) pelo cabo USB-TTL. Quando terminar, é só finalizar."],
+];
 
 function irPassos(){
   SERIAL=serialAtual(); MCU=$("#mcu").value;
@@ -3085,7 +3193,9 @@ function voltar(){ $("#tela-passos").classList.add("hide"); $("#tela-serial").cl
 
 function renderSteps(){
   const c=$("#steps"); c.innerHTML=""; STEP_STATE={};
-  for(const [k,t,d] of PASSOS){
+  const ci=(TIPO==="ci");
+  const passos = ci ? PASSOS_CI : PASSOS;
+  for(const [k,t,d] of passos){
     const el=document.createElement("div"); el.className="step"; el.id="step-"+k;
     el.innerHTML=`<div class="chip" id="chip-${k}">○</div>
       <div class="t"><b>${t}</b><div>${d}</div></div>
@@ -3096,6 +3206,9 @@ function renderSteps(){
   }
   atualizaPassoAtivo();   // 1º passo já nasce destacado
   const comp=$("#comp"); comp.innerHTML="";
+  // Testes de peça e recuperação pelo ar são exclusivos da FI. Na CI, some tudo.
+  if($("#campo-ar")) $("#campo-ar").style.display = ci ? "none" : "";
+  if(ci) return;
   for(const t of TESTES){ const b=document.createElement("button");
     b.textContent=t.label; b.onclick=(e)=>teste1(t, e.currentTarget); comp.appendChild(b); }
   // RECUPERAÇÃO (botões estáticos na TELA 2) — HTML OCULTO a pedido do
@@ -3600,6 +3713,10 @@ class Handler(BaseHTTPRequestHandler):
                 f"v{_UPDATE.get('latest')}) — atualize antes de gravar.", "err")
             return {"ok": False, "desatualizada": True,
                     "erro": f"bancada v{BANCADA_VERSION} desatualizada — baixe a v{_UPDATE.get('latest')}"}
+        # CONEXÃO INTELIGENTE: gravação por cabo (esptool). Fica ANTES da trava de
+        # DEV — é uma gravação legítima, como "gravar" da FI, e roda em dev também.
+        if step == "gravar-ci":
+            return {"ok": bool(act_gravar_ci(serial, b.get("porta")))}
         # ⚡ MODO DEV: só Gravar/Validar rodam de verdade. Os demais passos são
         # PULADOS com aviso (nunca "aprovados" em silêncio) e Cadastrar é
         # BLOQUEADO — fechadura de iteração não entra no backend.

@@ -54,6 +54,26 @@ avr_dir = os.path.join(PKG, "avrdude", plat)
 if os.path.isdir(avr_dir):
     datas.append((avr_dir, "avrdude"))
 
+# ⭐ Firmware da CONEXÃO INTELIGENTE (ESP32): 4 .bin pré-compilados p/ gravar por
+# cabo (esptool). A CI não é AVR — não usa avrdude/.hex/seeds. Versionados em
+# packaging/firmware-ci/ (a bancada de campo não tem arduino-cli). Vão para
+# "firmware-ci/" dentro do pacote (o bancada.py lê de RES/firmware-ci).
+ci_dir = os.path.join(PKG, "firmware-ci")
+_ci_bins = ["CI_v4.ino.bin", "CI_v4.ino.bootloader.bin",
+            "CI_v4.ino.partitions.bin", "boot_app0.bin"]
+if all(os.path.exists(os.path.join(ci_dir, b)) for b in _ci_bins):
+    datas.append((ci_dir, "firmware-ci"))
+else:
+    raise SystemExit("firmware-ci/*.bin da CI não encontrado em packaging/firmware-ci/ "
+                     "(gere com o build da CI_v4 e copie os 4 .bin)")
+
+# esptool standalone p/ gravar a CI (ESP32), se preparado em
+# packaging/esptool/<plat>/ (como o avrdude). Sem ele, no dev a bancada usa o
+# esptool do core esp32 do Arduino; no pacote Windows é preciso este binário.
+esptool_dir = os.path.join(PKG, "esptool", plat)
+if os.path.isdir(esptool_dir):
+    datas.append((esptool_dir, "esptool"))
+
 block_cipher = None
 
 # Coleta TUDO do bleak e do backend CoreBluetooth (pyobjc): o connect no macOS

@@ -9,6 +9,11 @@ packaging/dist/
 packaging/build/
 packaging/.venv-build/
 packaging/avrdude/
+# esptool standalone (ferramenta, provida no build — como o avrdude)
+packaging/esptool/
+# firmware da CI (.bin) — CONTÉM o OTA_TOKEN (segredo compartilhado), então NÃO
+# entra no git. Fica local p/ dev e é provido ao build do release (ver README).
+packaging/firmware-ci/
 .DS_Store
 **/.DS_Store
 
