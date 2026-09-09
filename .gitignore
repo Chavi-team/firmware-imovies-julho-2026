@@ -9,11 +9,13 @@ packaging/dist/
 packaging/build/
 packaging/.venv-build/
 packaging/avrdude/
-# esptool standalone (ferramenta, provida no build — como o avrdude)
+# esptool standalone (ferramenta) — não usamos binário externo (esptool é módulo
+# pip, chamado em-processo). Ignorado caso alguém queira embarcar um standalone.
 packaging/esptool/
-# firmware da CI (.bin) — CONTÉM o OTA_TOKEN (segredo compartilhado), então NÃO
-# entra no git. Fica local p/ dev e é provido ao build do release (ver README).
-packaging/firmware-ci/
+# NOTA: packaging/firmware-ci/*.bin (firmware da CI) É VERSIONADO — por decisão do
+# Leonardo (09/09), no repo PRIVADO, para o build Windows tê-lo. Contém o
+# OTA_TOKEN (segredo de baixa sensibilidade, já embutido em toda CI). Se um dia
+# for preciso rotacionar o token, regerar os bins e trocar no core.
 .DS_Store
 **/.DS_Store
 

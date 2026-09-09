@@ -102,7 +102,35 @@ def _esptool_cmd():
                          "packages/esp32/tools/esptool_py/**/" + exe), recursive=True)
         if hits:
             return [hits[0]]
-    return ["esptool"]  # pip / PATH
+    return ["esptool"]  # sem binário: sinaliza p/ rodar em-processo
+
+
+def _esptool_run(args):
+    """Roda o esptool com `args` (sem o nome do programa) e devolve (rc, saída).
+
+    Dev / pacote com binário standalone → subprocess (log ao vivo via _exec).
+    Pacote PyInstaller SEM binário externo → esptool EM-PROCESSO (é Python puro,
+    empacotado como módulo) — evita ter de embarcar/baixar um esptool.exe."""
+    cmd = _esptool_cmd()
+    if cmd[0] != "esptool":
+        return _exec(cmd + args)
+    try:
+        import esptool, io, contextlib
+        LOG("$ esptool " + " ".join(args), "hi")
+        buf = io.StringIO()
+        rc = 0
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            try:
+                esptool.main(args)
+            except SystemExit as e:
+                rc = int(e.code) if e.code else 0
+        for ln in buf.getvalue().splitlines():
+            if ln.strip():
+                LOG("  " + ln)
+        return rc, buf.getvalue()
+    except Exception as e:
+        LOG(f"esptool não disponível: {e}", "err")
+        return 1, str(e)
 API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 
 # ---------------------------------------------------------------------------
@@ -110,7 +138,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.31.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.32.0"                # versão desta bancada (bump a cada release)
 
 
 def _versao_do_hex(caminho: str) -> str:
@@ -148,8 +176,8 @@ def _versao_do_hex(caminho: str) -> str:
 # Versão do FIRMWARE que esta bancada grava — LIDA do próprio .hex, nunca
 # digitada. É o que vai para devices.firmware_version.
 FIRMWARE_VERSION = _versao_do_hex(HEX)
-VERSION_DATE = "2026-09-04"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.30.1: o resgate por Bluetooth agora dá VEREDITO. Caso de campo (04/09, CH003FI003027): a conexão religou e o chip seguiu mudo no cabo — faltava saber de que lado está o defeito. Depois de conectar, a bancada manda TST-PING pelo rádio: PONG = a placa está VIVA e energizada, então falha no cabo é 100% CONTATO físico do ISP (RESET/SCK/MISO/MOSI/GND no berço, pino 1 invertido, gravador) — o log agora diz isso com todas as letras e inocenta a placa. Sem PONG = lê BEFC/AFTC/PIO8/PWRM do módulo pelo ar (ficam no log para diagnóstico remoto) e ergue o PIO8 na marra (AT+PIO81, não persistente — não bricka), cobrindo placa cujo gate não está no AFTC; pinga de novo e registra o veredito. Espera pós-conexão subiu de 1s para 3s (step-up + boot). · Firmware v2.28.0 embutido (inalterado)."
+VERSION_DATE = "2026-09-09"               # data desta versão (ISO; bump a cada release)
+VERSION_NOTES = "Bancada v2.32.0: agora grava também a CONEXÃO INTELIGENTE (CI, ESP32) por cabo USB-TTL — no início escolha 'FI ou CI?'. Em CI a série vira CHZZZCIXXXXX, some placa/mosfet/pino e seeds, e o passo é só 'Gravar firmware' (esptool, 4 offsets). Serve para terceirizar a gravação da CI. · v2.30.1: o resgate por Bluetooth agora dá VEREDITO. Caso de campo (04/09, CH003FI003027): a conexão religou e o chip seguiu mudo no cabo — faltava saber de que lado está o defeito. Depois de conectar, a bancada manda TST-PING pelo rádio: PONG = a placa está VIVA e energizada, então falha no cabo é 100% CONTATO físico do ISP (RESET/SCK/MISO/MOSI/GND no berço, pino 1 invertido, gravador) — o log agora diz isso com todas as letras e inocenta a placa. Sem PONG = lê BEFC/AFTC/PIO8/PWRM do módulo pelo ar (ficam no log para diagnóstico remoto) e ergue o PIO8 na marra (AT+PIO81, não persistente — não bricka), cobrindo placa cujo gate não está no AFTC; pinga de novo e registra o veredito. Espera pós-conexão subiu de 1s para 3s (step-up + boot). · Firmware v2.28.0 embutido (inalterado)."
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -1283,13 +1311,12 @@ def act_gravar_ci(serial, porta=None):
         "NÃO mexa no cabo agora.", "hi")
     # Gravação COMPLETA (placa de bancada é virgem): bootloader + partições +
     # boot_app0 + app, os mesmos 4 offsets do flash.sh --completo.
-    cmd = _esptool_cmd() + ["--chip", "esp32", "--port", porta, "--baud", str(CI_BAUD),
-                            "write_flash", "-z",
-                            "0x1000", CI_BOOTLOADER,
-                            "0x8000", CI_PARTITIONS,
-                            "0xe000", CI_BOOTAPP0,
-                            "0x10000", CI_APP]
-    rc, _ = _exec(cmd)
+    rc, _ = _esptool_run(["--chip", "esp32", "--port", porta, "--baud", str(CI_BAUD),
+                          "write_flash", "-z",
+                          "0x1000", CI_BOOTLOADER,
+                          "0x8000", CI_PARTITIONS,
+                          "0xe000", CI_BOOTAPP0,
+                          "0x10000", CI_APP])
     if rc != 0:
         LOG("✗ Gravação da CI falhou. Confira: GPIO0 em GND ao ligar (modo download), "
             "TX↔RX CRUZADOS, alimentação 3,3 V e a porta escolhida.", "err")

@@ -81,8 +81,10 @@ block_cipher = None
 # funciona mas o connect quebra ("Error -3 while decompressing"/backend faltando).
 from PyInstaller.utils.hooks import collect_all
 _hidden, _datas, _bins = [], list(datas), []
+# `esptool` vai como MÓDULO (Python puro) e é chamado em-processo pelo bancada.py
+# p/ gravar a CI — assim o pacote não precisa de um esptool.exe externo.
 for _pkg in ("bleak", "CoreBluetooth", "libdispatch", "objc",
-             "Foundation", "AppKit", "WebKit"):
+             "Foundation", "AppKit", "WebKit", "esptool"):
     try:
         b, d, h = collect_all(_pkg)
         _bins += b; _datas += d; _hidden += h
@@ -96,7 +98,8 @@ a = Analysis(
     datas=_datas,
     hiddenimports=_hidden + ["bleak", "serial", "serial.tools.list_ports", "requests",
                    "webview", "webview.platforms.cocoa", "webview.platforms.winforms",
-                   "objc", "Foundation", "WebKit", "AppKit", "CoreBluetooth", "libdispatch"],
+                   "objc", "Foundation", "WebKit", "AppKit", "CoreBluetooth", "libdispatch",
+                   "esptool"],
     hookspath=[],
     runtime_hooks=[],
     excludes=["tkinter", "matplotlib", "numpy", "PIL"],

@@ -31,7 +31,7 @@ jobs:
           python-version: '3.11'
 
       - name: Dependências Python
-        run: pip install pyinstaller bleak pyserial requests pywebview
+        run: pip install pyinstaller bleak pyserial requests pywebview esptool
 
       - name: Dependências macOS (pyobjc)
         if: matrix.plat == 'mac'
