@@ -138,7 +138,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.32.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.33.0"                # versão desta bancada (bump a cada release)
 
 
 def _versao_do_hex(caminho: str) -> str:
@@ -177,7 +177,7 @@ def _versao_do_hex(caminho: str) -> str:
 # digitada. É o que vai para devices.firmware_version.
 FIRMWARE_VERSION = _versao_do_hex(HEX)
 VERSION_DATE = "2026-09-09"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.32.0: agora grava também a CONEXÃO INTELIGENTE (CI, ESP32) por cabo USB-TTL — no início escolha 'FI ou CI?'. Em CI a série vira CHZZZCIXXXXX, some placa/mosfet/pino e seeds, e o passo é só 'Gravar firmware' (esptool, 4 offsets). Serve para terceirizar a gravação da CI. · v2.30.1: o resgate por Bluetooth agora dá VEREDITO. Caso de campo (04/09, CH003FI003027): a conexão religou e o chip seguiu mudo no cabo — faltava saber de que lado está o defeito. Depois de conectar, a bancada manda TST-PING pelo rádio: PONG = a placa está VIVA e energizada, então falha no cabo é 100% CONTATO físico do ISP (RESET/SCK/MISO/MOSI/GND no berço, pino 1 invertido, gravador) — o log agora diz isso com todas as letras e inocenta a placa. Sem PONG = lê BEFC/AFTC/PIO8/PWRM do módulo pelo ar (ficam no log para diagnóstico remoto) e ergue o PIO8 na marra (AT+PIO81, não persistente — não bricka), cobrindo placa cujo gate não está no AFTC; pinga de novo e registra o veredito. Espera pós-conexão subiu de 1s para 3s (step-up + boot). · Firmware v2.28.0 embutido (inalterado)."
+VERSION_NOTES = "Bancada v2.33.0: (1) a gravação da CI agora APAGA O FLASH INTEIRO antes de gravar (esptool --erase-all). Sem isso, um chip REUSADO mantinha o Wi-Fi antigo no NVS, o firmware tentava conectar numa rede ausente e NUNCA caía em provisionamento — a CI sumia do scan BLE do app E do broker (caso de campo 09/09: 7 CIs limpas instalaram, as reusadas não apareciam). Agora todo chip sai limpo → provisionamento no 1º boot. O OTA NÃO faz esse erase (só grava a partição do app, preserva Wi-Fi/senha/série). (2) Firmware da CI embutido atualizado para v423 (guarda o nº de série no NVS via config|serie e reporta no heartbeat; core auto-nomeia). · Bancada v2.32.0: agora grava também a CONEXÃO INTELIGENTE (CI, ESP32) por cabo USB-TTL — no início escolha 'FI ou CI?'. Em CI a série vira CHZZZCIXXXXX, some placa/mosfet/pino e seeds, e o passo é só 'Gravar firmware' (esptool, 4 offsets). Serve para terceirizar a gravação da CI. · v2.30.1: o resgate por Bluetooth agora dá VEREDITO. Caso de campo (04/09, CH003FI003027): a conexão religou e o chip seguiu mudo no cabo — faltava saber de que lado está o defeito. Depois de conectar, a bancada manda TST-PING pelo rádio: PONG = a placa está VIVA e energizada, então falha no cabo é 100% CONTATO físico do ISP (RESET/SCK/MISO/MOSI/GND no berço, pino 1 invertido, gravador) — o log agora diz isso com todas as letras e inocenta a placa. Sem PONG = lê BEFC/AFTC/PIO8/PWRM do módulo pelo ar (ficam no log para diagnóstico remoto) e ergue o PIO8 na marra (AT+PIO81, não persistente — não bricka), cobrindo placa cujo gate não está no AFTC; pinga de novo e registra o veredito. Espera pós-conexão subiu de 1s para 3s (step-up + boot). · Firmware v2.28.0 embutido (inalterado)."
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -1309,10 +1309,17 @@ def act_gravar_ci(serial, porta=None):
         STATUS("gravar-ci", "fail"); return False
     LOG(f"Gravando firmware da CI (ESP32) em {serial or 'CI'} pela porta {porta}. "
         "NÃO mexa no cabo agora.", "hi")
-    # Gravação COMPLETA (placa de bancada é virgem): bootloader + partições +
-    # boot_app0 + app, os mesmos 4 offsets do flash.sh --completo.
+    # Gravação COMPLETA + APAGAR O FLASH INTEIRO (`--erase-all`): bootloader +
+    # partições + boot_app0 + app, os mesmos 4 offsets do flash.sh --completo.
+    # O `--erase-all` é essencial em chip REUSADO: sem ele o `write_flash` só
+    # sobrescreve os offsets e o NVS antigo sobrevive — inclusive Wi-Fi/senha de
+    # uma configuração anterior. Aí o firmware acha que "tem rede" (temRede()),
+    # tenta conectar numa rede que não existe aqui e NUNCA cai em provisionamento:
+    # a CI não anuncia CHAVIWIFI (some do scan do app) nem chega ao broker (some
+    # do core). Foi o caso de campo (09/09): 7 CIs limpas instalaram, as reusadas
+    # sumiam. Apagar tudo garante NVS vazio → provisionamento no 1º boot, sempre.
     rc, _ = _esptool_run(["--chip", "esp32", "--port", porta, "--baud", str(CI_BAUD),
-                          "write_flash", "-z",
+                          "write_flash", "-z", "--erase-all",
                           "0x1000", CI_BOOTLOADER,
                           "0x8000", CI_PARTITIONS,
                           "0xe000", CI_BOOTAPP0,
