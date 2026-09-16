@@ -1,8 +1,23 @@
-EI 2.0 (project_version 2.0.0)
+Fechadura EI 1.5 — nome oficial (projeto do firmware: EI_2_0, versão 2.0.1)
 
 Fonte: /usr/local/var/www/vhosts/chavi.com.br/firmware-ei-novo
-Commit do fonte: d7e091c (2026-08-05, "descrição da alteração")
 Build: 2026-09-16, ESP-IDF v5.5.4 (Docker espressif/idf:v5.5.4), target esp32c6
+
+Novidades da 2.0.1 (vs 2.0.0 de d7e091c):
+- OTA dirigido pelo CORE (mesmo esquema da CI): manifesto por device em
+  /api/v2/conexoes/ota/manifesto?tipo=ei com header X-CI-Token, download em
+  streaming com SHA-256 conferido, anti-downgrade, MQTT pausado durante o
+  TLS do OTA (lição da CI de 09/09).
+- Auto-check de OTA: ~2 min após a rede subir e a cada 24 h — a frota
+  converge para a versão-alvo sozinha (sem precisar de config|ota).
+- Rollback de bootloader habilitado (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE):
+  imagem nova só é confirmada quando a sessão MQTT fecha; senão reverte.
+- Partições OTA ampliadas para 0x1F0000 (folga 3% → 13%). ⚠️ Tabela nova SÓ
+  entra por gravação completa de cabo (bancada); OTA não regrava tabela.
+- ⚠️ O token do OTA (EI_OTA_TOKEN = CI_OTA_TOKEN do core) está EMBUTIDO
+  nestes .bin. O header components/ota/include/ota_token.h é gitignored —
+  para rebuildar, recriar a partir do ota_token.h.example com o valor do
+  .env do core.
 
 Gravação (espelha o build/flasher_args.json — a bancada usa isto no
 act_gravar_ei):
@@ -15,9 +30,9 @@ act_gravar_ei):
 
 ⚠️ Modo download do ESP32-C6: BOOT = GPIO9 em GND ao energizar (não é o
 GPIO0 como no ESP32 clássico da CI).
-⚠️ App com só 3% de folga na partição ota (0x1B2630 de 0x1C0000) — o
-próximo crescimento do firmware pode estourar; aí é rever a partitions.csv.
 
 Para regerar: docker run --rm -v <firmware-ei-novo>:/project -w /project \
   espressif/idf:v5.5.4 idf.py build
-e copiar os 4 .bin de build/ para cá (nomes acima).
+e copiar os 4 .bin de build/ para cá (nomes acima). Publicar OTA: copiar o
+EI_2_0.bin novo como ei-<versão>.bin para /home/ubuntu/chavi-firmware no
+servidor e apontar o alvo (Equipamento.ciFirmwareAlvo ou EI_FIRMWARE_ALVO).
