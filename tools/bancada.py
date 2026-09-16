@@ -1340,15 +1340,23 @@ def act_gravar_ci(serial, porta=None):
     # a CI não anuncia CHAVIWIFI (some do scan do app) nem chega ao broker (some
     # do core). Foi o caso de campo (09/09): 7 CIs limpas instalaram, as reusadas
     # sumiam. Apagar tudo garante NVS vazio → provisionamento no 1º boot, sempre.
-    rc, _ = _esptool_run(["--chip", "esp32", "--port", porta, "--baud", str(CI_BAUD),
-                          "write_flash", "-z", "--erase-all",
-                          "0x1000", CI_BOOTLOADER,
-                          "0x8000", CI_PARTITIONS,
-                          "0xe000", CI_BOOTAPP0,
-                          "0x10000", CI_APP])
+    rc, out = _esptool_run(["--chip", "esp32", "--port", porta, "--baud", str(CI_BAUD),
+                            "write_flash", "-z", "--erase-all",
+                            "0x1000", CI_BOOTLOADER,
+                            "0x8000", CI_PARTITIONS,
+                            "0xe000", CI_BOOTAPP0,
+                            "0x10000", CI_APP])
     if rc != 0:
-        LOG("✗ Gravação da CI falhou. Confira: GPIO0 em GND ao ligar (modo download), "
-            "TX↔RX CRUZADOS, alimentação 3,3 V e a porta escolhida.", "err")
+        # 🛡️ TRAVA DE MODELO (espelho da EI 1.5): chip real ≠ `--chip esp32` faz
+        # o esptool recusar sem escrever nada — ex.: uma EI 1.5 (ESP32-C6) posta
+        # no berço com "CI" selecionado.
+        if "This chip is" in out or "Wrong --chip" in out:
+            LOG("✗ MODELO ERRADO NO BERÇO: o chip conectado NÃO é o ESP32 clássico "
+                "da CI (se for ESP32-C6, isso é uma fechadura EI 1.5). NADA foi "
+                "gravado. Selecione o modelo certo na tela inicial.", "err")
+        else:
+            LOG("✗ Gravação da CI falhou. Confira: GPIO0 em GND ao ligar (modo download), "
+                "TX↔RX CRUZADOS, alimentação 3,3 V e a porta escolhida.", "err")
         STATUS("gravar-ci", "fail"); return False
     LOG("✔ CI gravada. Solte o GPIO0, reinicie a alimentação e confirme no painel "
         "(Saúde das Conexões) que ela aparece 'Respondendo'. Depois cadastre-a no "
@@ -1387,16 +1395,26 @@ def act_gravar_ei(serial, porta=None):
     # acha que tem rede, tenta conectar numa rede ausente e nunca cai em
     # provisionamento (não anuncia CHAVIEGPI). Chip sempre sai LIMPO daqui.
     # Os --flash_* espelham o flasher_args.json do idf.py (dio / 80m / 4MB).
-    rc, _ = _esptool_run(["--chip", "esp32c6", "--port", porta, "--baud", str(EI_BAUD),
-                          "write_flash", "-z", "--erase-all",
-                          "--flash_mode", "dio", "--flash_freq", "80m", "--flash_size", "4MB",
-                          "0x0", EI_BOOTLOADER,
-                          "0x8000", EI_PARTITIONS,
-                          "0xf000", EI_OTADATA,
-                          "0x20000", EI_APP])
+    rc, out = _esptool_run(["--chip", "esp32c6", "--port", porta, "--baud", str(EI_BAUD),
+                            "write_flash", "-z", "--erase-all",
+                            "--flash_mode", "dio", "--flash_freq", "80m", "--flash_size", "4MB",
+                            "0x0", EI_BOOTLOADER,
+                            "0x8000", EI_PARTITIONS,
+                            "0xf000", EI_OTADATA,
+                            "0x20000", EI_APP])
     if rc != 0:
-        LOG("✗ Gravação da EI 1.5 falhou. Confira: BOOT (GPIO9) em GND ao ligar "
-            "(modo download), TX↔RX CRUZADOS, alimentação 3,3 V e a porta escolhida.", "err")
+        # 🛡️ TRAVA DE MODELO: o esptool detecta o chip real e RECUSA gravar com
+        # `--chip` errado ("This chip is ESP32[-...] not ESP32-C6") — nada é
+        # escrito. É o que impede queimar firmware da EI 1.5 numa EI 1.0 ou CI
+        # (ambas ESP32 clássico). Traduzimos o erro para o operador.
+        if "This chip is" in out or "Wrong --chip" in out:
+            LOG("✗ MODELO ERRADO NO BERÇO: o chip conectado NÃO é o ESP32-C6 da "
+                "EI 1.5 (parece ESP32 clássico — EI 1.0 ou CI). NADA foi gravado. "
+                "Confira o modelo da placa: a opção 'EI 1.5' grava SOMENTE a "
+                "fechadura EI 1.5.", "err")
+        else:
+            LOG("✗ Gravação da EI 1.5 falhou. Confira: BOOT (GPIO9) em GND ao ligar "
+                "(modo download), TX↔RX CRUZADOS, alimentação 3,3 V e a porta escolhida.", "err")
         STATUS("gravar-ei", "fail"); return False
     LOG("✔ EI 1.5 gravada. Solte o BOOT (GPIO9), reinicie a alimentação e confira "
         "que ela anuncia CHAVIEGPI no Bluetooth (modo provisionamento). Depois "

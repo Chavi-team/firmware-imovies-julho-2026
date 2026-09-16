@@ -14,6 +14,9 @@ Novidades da 2.0.1 (vs 2.0.0 de d7e091c):
   imagem nova só é confirmada quando a sessão MQTT fecha; senão reverte.
 - Partições OTA ampliadas para 0x1F0000 (folga 3% → 13%). ⚠️ Tabela nova SÓ
   entra por gravação completa de cabo (bancada); OTA não regrava tabela.
+- Identidade de MODELO no MQTT: o registro (type:list) e todo status de OTA
+  saem com "modelo":"EI 1.5" e "fw_bin" — é o que distingue uma EI 1.5 de
+  uma EI 1.0 no broker (o fw_ei "323/324" legado é igual nos dois).
 - ⚠️ O token do OTA (EI_OTA_TOKEN = CI_OTA_TOKEN do core) está EMBUTIDO
   nestes .bin. O header components/ota/include/ota_token.h é gitignored —
   para rebuildar, recriar a partir do ota_token.h.example com o valor do
