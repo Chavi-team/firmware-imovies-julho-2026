@@ -16,6 +16,9 @@ packaging/esptool/
 # Leonardo (09/09), no repo PRIVADO, para o build Windows tê-lo. Contém o
 # OTA_TOKEN (segredo de baixa sensibilidade, já embutido em toda CI). Se um dia
 # for preciso rotacionar o token, regerar os bins e trocar no core.
+# NOTA: packaging/firmware-ei/*.bin (firmware da EI 2.0, ESP32-C6) segue a MESMA
+# decisão — versionado no repo privado para o build Windows. Regerar com
+# `idf.py build` no firmware-ei-novo (ver packaging/firmware-ei/VERSAO.txt).
 .DS_Store
 **/.DS_Store
 

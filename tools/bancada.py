@@ -6,14 +6,18 @@ bancada.py — Assistente de bancada das fechaduras Chavi FI (app web local).
 Roda um servidor local e abre a interface no NAVEGADOR (renderiza bonito e
 confiável — nada de Tkinter). Feito para um leigo montar 300 fechaduras:
 
-  Tela 1 — digita o serial na máscara:  CH [xxx] FI [xxxxxx]
-  Tela 2 — passos com ✓/✗, na ordem:
+  Tela 1 — escolhe O QUE gravar (FI / CI / EI 2.0) e digita o serial na
+           máscara:  CH [xxx] FI|CI|EI [xxxxxx]
+  Tela 2 — passos com ✓/✗. Para a FI, na ordem:
      1. Gravar firmware      (cabo USBasp / avrdude)
      2. Validar gravação     (relê o chip: serial + seeds)
      3. Conectar (BLE)        (scan pelo nome = serial sem "CH", PING→PONG)
      4. Auto-teste           (buzzer, LEDs, motor A/B, bateria, módulo BLE)
      5. Cadastrar no sistema  (backend admin/devices, só o serial)
      6. Finalizar             (próxima fechadura)
+  Para a CI (ESP32) e a EI 2.0 (ESP32-C6) o passo é UM só: gravar os .bin
+  pré-compilados pelo cabo USB-TTL com esptool (sem seeds/mosfet/cadastro —
+  a identidade delas é o MAC do rádio; ver act_gravar_ci / act_gravar_ei).
 
 Rode por  ./tools/bancada.sh  (cuida do venv, do PATH e das dependências).
 """
@@ -87,6 +91,24 @@ CI_PARTITIONS = os.path.join(CI_BIN_DIR, "CI_v4.ino.partitions.bin")
 CI_BOOTAPP0 = os.path.join(CI_BIN_DIR, "boot_app0.bin")
 CI_BAUD = 921600
 
+# ---------------------------------------------------------------------------
+# EI 2.0 — a fechadura EI nova (ESP32-C6, projeto ESP-IDF `firmware-ei-novo`).
+# Mesmo modelo da CI: esptool por cabo USB-TTL, binários PRÉ-COMPILADOS, sem
+# seeds/mosfet/EEPROM. A identidade é o MAC do rádio (o serial CHZZZEIXXXXXX é
+# só rótulo; o BLE anuncia CHAVIEGPI até ativar). Os .bin vêm de
+# packaging/firmware-ei (bundlados no pacote).
+# ⚠️ Os OFFSETS são DIFERENTES da CI: no ESP32-C6 o bootloader mora em 0x0
+# (não 0x1000), o otadata em 0xF000 e o app em 0x20000 (partitions.csv do
+# projeto, tabela OTA custom). Não existe boot_app0 — isso é do core Arduino
+# (CI); o ESP-IDF usa ota_data_initial.bin. Receita copiada do
+# build/flasher_args.json gerado pelo `idf.py build`.
+EI_BIN_DIR = os.path.join(RES, "firmware-ei") if FROZEN else os.path.join(ROOT, "packaging", "firmware-ei")
+EI_APP = os.path.join(EI_BIN_DIR, "EI_2_0.bin")
+EI_BOOTLOADER = os.path.join(EI_BIN_DIR, "bootloader.bin")
+EI_PARTITIONS = os.path.join(EI_BIN_DIR, "partition-table.bin")
+EI_OTADATA = os.path.join(EI_BIN_DIR, "ota_data_initial.bin")
+EI_BAUD = 921600
+
 
 def _esptool_cmd():
     """esptool p/ gravar a CI (ESP32): embutido no pacote, senão o do core esp32
@@ -138,7 +160,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.33.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.34.0"                # versão desta bancada (bump a cada release)
 
 
 def _versao_do_hex(caminho: str) -> str:
@@ -176,8 +198,8 @@ def _versao_do_hex(caminho: str) -> str:
 # Versão do FIRMWARE que esta bancada grava — LIDA do próprio .hex, nunca
 # digitada. É o que vai para devices.firmware_version.
 FIRMWARE_VERSION = _versao_do_hex(HEX)
-VERSION_DATE = "2026-09-09"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.33.0: (1) a gravação da CI agora APAGA O FLASH INTEIRO antes de gravar (esptool --erase-all). Sem isso, um chip REUSADO mantinha o Wi-Fi antigo no NVS, o firmware tentava conectar numa rede ausente e NUNCA caía em provisionamento — a CI sumia do scan BLE do app E do broker (caso de campo 09/09: 7 CIs limpas instalaram, as reusadas não apareciam). Agora todo chip sai limpo → provisionamento no 1º boot. O OTA NÃO faz esse erase (só grava a partição do app, preserva Wi-Fi/senha/série). (2) Firmware da CI embutido atualizado para v423 (guarda o nº de série no NVS via config|serie e reporta no heartbeat; core auto-nomeia). · Bancada v2.32.0: agora grava também a CONEXÃO INTELIGENTE (CI, ESP32) por cabo USB-TTL — no início escolha 'FI ou CI?'. Em CI a série vira CHZZZCIXXXXX, some placa/mosfet/pino e seeds, e o passo é só 'Gravar firmware' (esptool, 4 offsets). Serve para terceirizar a gravação da CI. · v2.30.1: o resgate por Bluetooth agora dá VEREDITO. Caso de campo (04/09, CH003FI003027): a conexão religou e o chip seguiu mudo no cabo — faltava saber de que lado está o defeito. Depois de conectar, a bancada manda TST-PING pelo rádio: PONG = a placa está VIVA e energizada, então falha no cabo é 100% CONTATO físico do ISP (RESET/SCK/MISO/MOSI/GND no berço, pino 1 invertido, gravador) — o log agora diz isso com todas as letras e inocenta a placa. Sem PONG = lê BEFC/AFTC/PIO8/PWRM do módulo pelo ar (ficam no log para diagnóstico remoto) e ergue o PIO8 na marra (AT+PIO81, não persistente — não bricka), cobrindo placa cujo gate não está no AFTC; pinga de novo e registra o veredito. Espera pós-conexão subiu de 1s para 3s (step-up + boot). · Firmware v2.28.0 embutido (inalterado)."
+VERSION_DATE = "2026-09-16"               # data desta versão (ISO; bump a cada release)
+VERSION_NOTES = "Bancada v2.34.0: agora grava também a FECHADURA EI 2.0 (ESP32-C6, projeto ESP-IDF firmware-ei-novo) por cabo USB-TTL — nova opção no seletor 'O que vai gravar?'. Em EI a série vira CHZZZEIXXXXXX, somem placa/mosfet/seeds e o passo é só 'Gravar firmware' (esptool --chip esp32c6, 4 offsets do ESP-IDF: 0x0 bootloader · 0x8000 partições · 0xF000 otadata · 0x20000 app, com --erase-all — chip reusado sai limpo e cai em provisionamento). ⚠️ O pino de modo download da EI 2.0 é o BOOT (GPIO9), não o GPIO0 da CI. Depois de gravada ela anuncia CHAVIEGPI no Bluetooth. Bônus: o destaque de 'passo ativo' agora funciona também nos fluxos CI/EI. · Bancada v2.33.0: (1) a gravação da CI agora APAGA O FLASH INTEIRO antes de gravar (esptool --erase-all). Sem isso, um chip REUSADO mantinha o Wi-Fi antigo no NVS, o firmware tentava conectar numa rede ausente e NUNCA caía em provisionamento — a CI sumia do scan BLE do app E do broker (caso de campo 09/09: 7 CIs limpas instalaram, as reusadas não apareciam). Agora todo chip sai limpo → provisionamento no 1º boot. O OTA NÃO faz esse erase (só grava a partição do app, preserva Wi-Fi/senha/série). (2) Firmware da CI embutido atualizado para v423 (guarda o nº de série no NVS via config|serie e reporta no heartbeat; core auto-nomeia). · Bancada v2.32.0: agora grava também a CONEXÃO INTELIGENTE (CI, ESP32) por cabo USB-TTL — no início escolha 'FI ou CI?'. Em CI a série vira CHZZZCIXXXXX, some placa/mosfet/pino e seeds, e o passo é só 'Gravar firmware' (esptool, 4 offsets). Serve para terceirizar a gravação da CI. · v2.30.1: o resgate por Bluetooth agora dá VEREDITO. Caso de campo (04/09, CH003FI003027): a conexão religou e o chip seguiu mudo no cabo — faltava saber de que lado está o defeito. Depois de conectar, a bancada manda TST-PING pelo rádio: PONG = a placa está VIVA e energizada, então falha no cabo é 100% CONTATO físico do ISP (RESET/SCK/MISO/MOSI/GND no berço, pino 1 invertido, gravador) — o log agora diz isso com todas as letras e inocenta a placa. Sem PONG = lê BEFC/AFTC/PIO8/PWRM do módulo pelo ar (ficam no log para diagnóstico remoto) e ergue o PIO8 na marra (AT+PIO81, não persistente — não bricka), cobrindo placa cujo gate não está no AFTC; pinga de novo e registra o veredito. Espera pós-conexão subiu de 1s para 3s (step-up + boot). · Firmware v2.28.0 embutido (inalterado)."
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -1332,6 +1354,54 @@ def act_gravar_ci(serial, porta=None):
         "(Saúde das Conexões) que ela aparece 'Respondendo'. Depois cadastre-a no "
         "sistema pela série.", "ok")
     STATUS("gravar-ci", "ok"); return True
+
+
+def act_gravar_ei(serial, porta=None):
+    """Grava o firmware da EI 2.0 (ESP32-C6) por cabo USB-TTL.
+
+    Mesmo desenho da CI (act_gravar_ci): binários pré-compilados + esptool, sem
+    seeds/mosfet/EEPROM — a identidade da EI 2.0 é o MAC do rádio, o `serial`
+    aqui é só rótulo. Diferenças em relação à CI:
+      · chip é `esp32c6` (RISC-V), não `esp32`;
+      · modo download é o botão/pino BOOT = GPIO9 em GND ao ligar (no C6 o
+        GPIO0 é um pino comum — a dica de "GPIO0 em GND" da CI NÃO vale aqui);
+      · offsets do ESP-IDF: 0x0 bootloader · 0x8000 tabela de partições ·
+        0xF000 ota_data_initial · 0x20000 app (sem boot_app0).
+    """
+    STATUS("gravar-ei", "run")
+    faltando = [os.path.basename(p) for p in (EI_BOOTLOADER, EI_PARTITIONS, EI_OTADATA, EI_APP)
+                if not os.path.exists(p)]
+    if faltando:
+        LOG("Firmware da EI 2.0 não embutido no pacote (falta: " + ", ".join(faltando) +
+            "). Regere packaging/firmware-ei (idf.py build no firmware-ei-novo).", "err")
+        STATUS("gravar-ei", "fail"); return False
+    porta = porta or Cabo.porta_provavel()
+    if not porta:
+        LOG("Cabo USB-TTL não encontrado. Ligue o conversor e confira o BOOT "
+            "(GPIO9)→GND ao energizar (modo gravação), TX↔RX cruzados e 3,3 V.", "err")
+        STATUS("gravar-ei", "fail"); return False
+    LOG(f"Gravando firmware da EI 2.0 (ESP32-C6) em {serial or 'EI'} pela porta {porta}. "
+        "NÃO mexa no cabo agora.", "hi")
+    # `--erase-all` pelo MESMO motivo da CI (caso de campo 09/09): a EI 2.0
+    # guarda Wi-Fi/senha no NVS — num chip REUSADO, sem apagar tudo, o firmware
+    # acha que tem rede, tenta conectar numa rede ausente e nunca cai em
+    # provisionamento (não anuncia CHAVIEGPI). Chip sempre sai LIMPO daqui.
+    # Os --flash_* espelham o flasher_args.json do idf.py (dio / 80m / 4MB).
+    rc, _ = _esptool_run(["--chip", "esp32c6", "--port", porta, "--baud", str(EI_BAUD),
+                          "write_flash", "-z", "--erase-all",
+                          "--flash_mode", "dio", "--flash_freq", "80m", "--flash_size", "4MB",
+                          "0x0", EI_BOOTLOADER,
+                          "0x8000", EI_PARTITIONS,
+                          "0xf000", EI_OTADATA,
+                          "0x20000", EI_APP])
+    if rc != 0:
+        LOG("✗ Gravação da EI 2.0 falhou. Confira: BOOT (GPIO9) em GND ao ligar "
+            "(modo download), TX↔RX CRUZADOS, alimentação 3,3 V e a porta escolhida.", "err")
+        STATUS("gravar-ei", "fail"); return False
+    LOG("✔ EI 2.0 gravada. Solte o BOOT (GPIO9), reinicie a alimentação e confira "
+        "que ela anuncia CHAVIEGPI no Bluetooth (modo provisionamento). Depois "
+        "cole a etiqueta da série e siga o cadastro no sistema.", "ok")
+    STATUS("gravar-ei", "ok"); return True
 
 
 def act_validar(serial, mcu):
@@ -2934,6 +3004,7 @@ PAGE = r"""<!DOCTYPE html>
         <select id="tipo">
           <option value="fi" selected>Fechadura (FI)</option>
           <option value="ci">Conexão Inteligente (CI)</option>
+          <option value="ei">Fechadura EI 2.0 (ESP32)</option>
         </select>
       </div>
       <div class="mask">
@@ -2968,11 +3039,20 @@ PAGE = r"""<!DOCTYPE html>
         </span>
       </div>
       </div>
-      <!-- CI: sem seeds/placa/mosfet — só uma nota do cabo -->
+      <!-- CI/EI 2.0: sem seeds/placa/mosfet — só uma nota do cabo.
+           ⚠️ A dica do pino de gravação é DIFERENTE: CI (ESP32 clássico) usa
+           GPIO0; EI 2.0 (ESP32-C6) usa o BOOT = GPIO9. -->
       <div id="ci-only" class="hide row center" style="margin-top:12px">
         <span style="color:var(--muted);font-size:12px">
           Conexão Inteligente (ESP32): grave pelo cabo USB-TTL — GPIO0 em GND ao
           ligar, TX↔RX cruzados, 3,3 V. Sem seeds, placa ou MOSFET.
+        </span>
+      </div>
+      <div id="ei-only" class="hide row center" style="margin-top:12px">
+        <span style="color:var(--muted);font-size:12px">
+          Fechadura EI 2.0 (ESP32-C6): grave pelo cabo USB-TTL — BOOT (GPIO9) em
+          GND ao ligar, TX↔RX cruzados, 3,3 V. Sem seeds, placa ou MOSFET; depois
+          de gravar ela anuncia CHAVIEGPI no Bluetooth (provisionamento).
         </span>
       </div>
     </div>
@@ -3158,9 +3238,13 @@ const ggg=$("#ggg"), nnn=$("#nnn");
 function padCH(v){ v=(v||"").replace(/\\D/g,""); return v ? v.padStart(3,'0').slice(-3) : ''; }
 function padFI(v){ v=(v||"").replace(/\\D/g,""); return v ? v.padStart(6,'0').slice(-6) : ''; }
 
+// Infixo da série conforme o tipo: FI (fechadura AVR), CI (Conexão
+// Inteligente) ou EI (fechadura EI 2.0, ESP32-C6). Formato: CH GGG XX NNNNNN.
+function infixoTipo(){ return TIPO==="ci" ? "CI" : (TIPO==="ei" ? "EI" : "FI"); }
+
 function serialAtual(){
   const g=padCH(ggg.value), n=padFI(nnn.value);
-  return (g && n) ? ("CH"+g+(TIPO==="ci"?"CI":"FI")+n) : null;
+  return (g && n) ? ("CH"+g+infixoTipo()+n) : null;
 }
 
 function onlyDigits(e){
@@ -3172,24 +3256,27 @@ function onlyDigits(e){
 async function prev(){
   const s=serialAtual();
   if(s){ $("#prev").textContent="→  "+s; $("#prev").style.color="var(--ok)"; $("#btn-next").disabled=false;
-    // "JÁ GRAVADA (BLE)" é fluxo de FI; na CI não se aplica.
-    $("#btn-ble-direct").disabled=(TIPO==="ci");
-    // A CI não tem seeds (identidade é o MAC); só a FI mostra o preview.
-    if(TIPO==="ci"){ $("#seeds").textContent=""; return; }
+    // "JÁ GRAVADA (BLE)" é fluxo de FI; na CI/EI 2.0 não se aplica.
+    $("#btn-ble-direct").disabled=(TIPO!=="fi");
+    // CI/EI 2.0 não têm seeds (identidade é o MAC); só a FI mostra o preview.
+    if(TIPO!=="fi"){ $("#seeds").textContent=""; return; }
     const r=await fetch("/api/seeds?serial="+s).then(r=>r.json());
     $("#seeds").textContent="seeds: "+r.seeds.join(" · ");
   } else { $("#prev").textContent="digite o canal (CH) e o nº — completo com zeros à esquerda"; $("#prev").style.color="var(--err)";
     $("#seeds").textContent=""; $("#btn-next").disabled=true; $("#btn-ble-direct").disabled=true; }
 }
-// Alterna FI ↔ CI: troca o infixo da série, esconde os campos de FI (placa/
-// mosfet/seeds) e ajusta os passos. A CI é ESP32 e só precisa gravar o firmware.
+// Alterna FI ↔ CI ↔ EI 2.0: troca o infixo da série, esconde os campos de FI
+// (placa/mosfet/seeds) e ajusta os passos. CI e EI 2.0 são ESP32 e só precisam
+// gravar o firmware (cada uma com a própria nota de cabo — o pino de download
+// difere: GPIO0 na CI, BOOT/GPIO9 na EI 2.0).
 function onTipo(){
   TIPO = ($("#tipo") && $("#tipo").value) || "fi";
-  $("#pfx-tipo").textContent = (TIPO==="ci") ? "CI" : "FI";
-  const ci = (TIPO==="ci");
-  $("#fi-only").classList.toggle("hide", ci);
-  $("#ci-only").classList.toggle("hide", !ci);
-  if($("#btn-ble-direct")) $("#btn-ble-direct").style.display = ci ? "none" : "";
+  $("#pfx-tipo").textContent = infixoTipo();
+  const esp = (TIPO!=="fi");
+  $("#fi-only").classList.toggle("hide", esp);
+  $("#ci-only").classList.toggle("hide", TIPO!=="ci");
+  $("#ei-only").classList.toggle("hide", TIPO!=="ei");
+  if($("#btn-ble-direct")) $("#btn-ble-direct").style.display = esp ? "none" : "";
   prev();
 }
 ggg.addEventListener("input",onlyDigits); nnn.addEventListener("input",onlyDigits);
@@ -3207,6 +3294,13 @@ if($("#tipo")) $("#tipo").addEventListener("change", onTipo);
 const PASSOS_CI = [
   ["gravar-ci","1 · Gravar firmware","Grava o firmware da Conexão Inteligente (ESP32) pelo cabo USB-TTL. Quando terminar, é só finalizar."],
 ];
+// Passos da EI 2.0: idem CI — um só. A identidade é o MAC do rádio; a série é
+// rótulo, e o vínculo com o sistema acontece na ativação/provisionamento.
+const PASSOS_EI = [
+  ["gravar-ei","1 · Gravar firmware","Grava o firmware da EI 2.0 (ESP32-C6) pelo cabo USB-TTL. Quando terminar, é só finalizar."],
+];
+// Lista de passos do TIPO atual — usada no render e no destaque do passo ativo.
+function passosAtuais(){ return TIPO==="ci" ? PASSOS_CI : (TIPO==="ei" ? PASSOS_EI : PASSOS); }
 
 function irPassos(){
   SERIAL=serialAtual(); MCU=$("#mcu").value;
@@ -3227,8 +3321,8 @@ function voltar(){ $("#tela-passos").classList.add("hide"); $("#tela-serial").cl
 
 function renderSteps(){
   const c=$("#steps"); c.innerHTML=""; STEP_STATE={};
-  const ci=(TIPO==="ci");
-  const passos = ci ? PASSOS_CI : PASSOS;
+  const esp=(TIPO!=="fi");   // CI ou EI 2.0: fluxo curto, sem testes de peça
+  const passos = passosAtuais();
   for(const [k,t,d] of passos){
     const el=document.createElement("div"); el.className="step"; el.id="step-"+k;
     el.innerHTML=`<div class="chip" id="chip-${k}">○</div>
@@ -3240,9 +3334,10 @@ function renderSteps(){
   }
   atualizaPassoAtivo();   // 1º passo já nasce destacado
   const comp=$("#comp"); comp.innerHTML="";
-  // Testes de peça e recuperação pelo ar são exclusivos da FI. Na CI, some tudo.
-  if($("#campo-ar")) $("#campo-ar").style.display = ci ? "none" : "";
-  if(ci) return;
+  // Testes de peça e recuperação pelo ar são exclusivos da FI. Na CI/EI 2.0,
+  // some tudo.
+  if($("#campo-ar")) $("#campo-ar").style.display = esp ? "none" : "";
+  if(esp) return;
   for(const t of TESTES){ const b=document.createElement("button");
     b.textContent=t.label; b.onclick=(e)=>teste1(t, e.currentTarget); comp.appendChild(b); }
   // RECUPERAÇÃO (botões estáticos na TELA 2) — HTML OCULTO a pedido do
@@ -3271,7 +3366,9 @@ function setChip(step,state){
 // já concluídos ganham .done (apagam um pouco). A transição do CSS faz o
 // anterior encolher e o próximo crescer suavemente.
 function atualizaPassoAtivo(){
-  const ordem = PASSOS.map(p=>p[0]);
+  // ⭐ usa os passos do TIPO atual — antes era sempre PASSOS (da FI), então na
+  // CI o passo "gravar-ci" nunca ganhava o destaque de ativo.
+  const ordem = passosAtuais().map(p=>p[0]);
   let ativo = ordem.find(k=>STEP_STATE[k]==="run");
   if(!ativo) ativo = ordem.find(k=>STEP_STATE[k]!=="ok" && STEP_STATE[k]!=="skip");   // 1º pendente/falho
   for(const k of ordem){
@@ -3747,10 +3844,13 @@ class Handler(BaseHTTPRequestHandler):
                 f"v{_UPDATE.get('latest')}) — atualize antes de gravar.", "err")
             return {"ok": False, "desatualizada": True,
                     "erro": f"bancada v{BANCADA_VERSION} desatualizada — baixe a v{_UPDATE.get('latest')}"}
-        # CONEXÃO INTELIGENTE: gravação por cabo (esptool). Fica ANTES da trava de
-        # DEV — é uma gravação legítima, como "gravar" da FI, e roda em dev também.
+        # CONEXÃO INTELIGENTE e EI 2.0: gravação por cabo (esptool). Ficam ANTES
+        # da trava de DEV — são gravações legítimas, como "gravar" da FI, e
+        # rodam em dev também.
         if step == "gravar-ci":
             return {"ok": bool(act_gravar_ci(serial, b.get("porta")))}
+        if step == "gravar-ei":
+            return {"ok": bool(act_gravar_ei(serial, b.get("porta")))}
         # ⚡ MODO DEV: só Gravar/Validar rodam de verdade. Os demais passos são
         # PULADOS com aviso (nunca "aprovados" em silêncio) e Cadastrar é
         # BLOQUEADO — fechadura de iteração não entra no backend.

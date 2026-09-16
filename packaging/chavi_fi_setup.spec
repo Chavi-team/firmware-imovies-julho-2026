@@ -67,6 +67,20 @@ else:
     raise SystemExit("firmware-ci/*.bin da CI não encontrado em packaging/firmware-ci/ "
                      "(gere com o build da CI_v4 e copie os 4 .bin)")
 
+# ⭐ Firmware da FECHADURA EI 2.0 (ESP32-C6, projeto ESP-IDF firmware-ei-novo):
+# 4 .bin pré-compilados p/ gravar por cabo (esptool --chip esp32c6). Offsets
+# DIFERENTES da CI (0x0/0x8000/0xF000/0x20000, sem boot_app0 — ver
+# act_gravar_ei no bancada.py). Versionados em packaging/firmware-ei/; vão para
+# "firmware-ei/" dentro do pacote (o bancada.py lê de RES/firmware-ei).
+ei_dir = os.path.join(PKG, "firmware-ei")
+_ei_bins = ["EI_2_0.bin", "bootloader.bin", "partition-table.bin",
+            "ota_data_initial.bin"]
+if all(os.path.exists(os.path.join(ei_dir, b)) for b in _ei_bins):
+    datas.append((ei_dir, "firmware-ei"))
+else:
+    raise SystemExit("firmware-ei/*.bin da EI 2.0 não encontrado em packaging/firmware-ei/ "
+                     "(gere com `idf.py build` no firmware-ei-novo e copie os 4 .bin)")
+
 # esptool standalone p/ gravar a CI (ESP32), se preparado em
 # packaging/esptool/<plat>/ (como o avrdude). Sem ele, no dev a bancada usa o
 # esptool do core esp32 do Arduino; no pacote Windows é preciso este binário.
