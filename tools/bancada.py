@@ -127,6 +127,24 @@ def _esptool_cmd():
     return ["esptool"]  # sem binário: sinaliza p/ rodar em-processo
 
 
+def _esptool_suporta_c6():
+    """(ok, descrição) — o esptool que vamos usar conhece o ESP32-C6?
+
+    O suporte ao C6 entrou no esptool **4.6**. A resolução do binário
+    (`_esptool_cmd`) pode cair no esptool que veio com o core ESP32 do Arduino,
+    que em instalações antigas é 3.x/4.2 — aí a gravação da EI 1.5 morre com
+    "Unknown chip type" / "Wrong --chip argument", e o operador não tem como
+    adivinhar que o problema é a ferramenta, não a placa.
+    """
+    rc, out = _esptool_run(["version"])
+    txt = (out or "").strip()
+    m = re.search(r"v?(\d+)\.(\d+)(?:\.(\d+))?", txt)
+    if rc != 0 or not m:
+        return True, txt or "versão desconhecida"  # na dúvida, deixa tentar
+    maior, menor = int(m.group(1)), int(m.group(2))
+    return (maior, menor) >= (4, 6), f"v{m.group(0).lstrip('v')}"
+
+
 def _esptool_run(args):
     """Roda o esptool com `args` (sem o nome do programa) e devolve (rc, saída).
 
@@ -160,7 +178,7 @@ API_BASE_DEFAULT = "https://api-imoveis.chavi.com.br/v2/api"
 # A bancada é empacotada (PyInstaller) e publicada nos GitHub Releases via tag
 # "bancada-v*" (ver .github/workflows/build-bancada.yml). O app NÃO se auto-
 # atualiza; aqui só CHECAMOS se há versão mais nova e mostramos um aviso.
-BANCADA_VERSION = "2.34.0"                # versão desta bancada (bump a cada release)
+BANCADA_VERSION = "2.35.0"                # versão desta bancada (bump a cada release)
 
 
 def _versao_do_hex(caminho: str) -> str:
@@ -199,7 +217,7 @@ def _versao_do_hex(caminho: str) -> str:
 # digitada. É o que vai para devices.firmware_version.
 FIRMWARE_VERSION = _versao_do_hex(HEX)
 VERSION_DATE = "2026-09-16"               # data desta versão (ISO; bump a cada release)
-VERSION_NOTES = "Bancada v2.34.0: agora grava também a FECHADURA EI 1.5 (ESP32-C6, projeto ESP-IDF firmware-ei-novo) por cabo USB-TTL — nova opção no seletor 'O que vai gravar?'. Em EI a série vira CHZZZEIXXXXXX, somem placa/mosfet/seeds e o passo é só 'Gravar firmware' (esptool --chip esp32c6, 4 offsets do ESP-IDF: 0x0 bootloader · 0x8000 partições · 0xF000 otadata · 0x20000 app, com --erase-all — chip reusado sai limpo e cai em provisionamento). ⚠️ O pino de modo download da EI 1.5 é o BOOT (GPIO9), não o GPIO0 da CI. Depois de gravada ela anuncia CHAVIEGPI no Bluetooth. Bônus: o destaque de 'passo ativo' agora funciona também nos fluxos CI/EI. · Bancada v2.33.0: (1) a gravação da CI agora APAGA O FLASH INTEIRO antes de gravar (esptool --erase-all). Sem isso, um chip REUSADO mantinha o Wi-Fi antigo no NVS, o firmware tentava conectar numa rede ausente e NUNCA caía em provisionamento — a CI sumia do scan BLE do app E do broker (caso de campo 09/09: 7 CIs limpas instalaram, as reusadas não apareciam). Agora todo chip sai limpo → provisionamento no 1º boot. O OTA NÃO faz esse erase (só grava a partição do app, preserva Wi-Fi/senha/série). (2) Firmware da CI embutido atualizado para v423 (guarda o nº de série no NVS via config|serie e reporta no heartbeat; core auto-nomeia). · Bancada v2.32.0: agora grava também a CONEXÃO INTELIGENTE (CI, ESP32) por cabo USB-TTL — no início escolha 'FI ou CI?'. Em CI a série vira CHZZZCIXXXXX, some placa/mosfet/pino e seeds, e o passo é só 'Gravar firmware' (esptool, 4 offsets). Serve para terceirizar a gravação da CI. · v2.30.1: o resgate por Bluetooth agora dá VEREDITO. Caso de campo (04/09, CH003FI003027): a conexão religou e o chip seguiu mudo no cabo — faltava saber de que lado está o defeito. Depois de conectar, a bancada manda TST-PING pelo rádio: PONG = a placa está VIVA e energizada, então falha no cabo é 100% CONTATO físico do ISP (RESET/SCK/MISO/MOSI/GND no berço, pino 1 invertido, gravador) — o log agora diz isso com todas as letras e inocenta a placa. Sem PONG = lê BEFC/AFTC/PIO8/PWRM do módulo pelo ar (ficam no log para diagnóstico remoto) e ergue o PIO8 na marra (AT+PIO81, não persistente — não bricka), cobrindo placa cujo gate não está no AFTC; pinga de novo e registra o veredito. Espera pós-conexão subiu de 1s para 3s (step-up + boot). · Firmware v2.28.0 embutido (inalterado)."
+VERSION_NOTES = "Bancada v2.35.0: a EI 1.5 grava pelo **USB-C da própria placa** — o ESP32-C6 tem USB Serial/JTAG nativo e NÃO precisa de conversor USB-TTL. A detecção de porta só conhecia conversores (CP210x/CH340/FTDI/PL2303), então no Windows a porta da EI ('USB JTAG/serial debug unit') não era vista e a bancada recusava gravar com 'Cabo USB-TTL não encontrado' — com o cabo plugado e funcionando. Agora a porta nativa é reconhecida pelo VID da Espressif (303A) e pelo nome, e ao gravar EI ela tem PRIORIDADE sobre um conversor esquecido na mesa (na FI/CI a ordem se inverte). As dicas de erro do caminho USB-C passaram a ser as que fazem sentido nele (BOOT+RESET para modo download, cabo de DADOS, porta livre de monitor serial) em vez de TX/RX cruzados e 3,3 V, que não existem aí. Também: se o esptool disponível for anterior à 4.6 (sem suporte ao ESP32-C6), a bancada avisa ANTES de tentar, em vez de estourar 'Unknown chip type' no meio. · Bancada v2.34.0: agora grava também a FECHADURA EI 1.5 (ESP32-C6, projeto ESP-IDF firmware-ei-novo) por cabo USB-TTL — nova opção no seletor 'O que vai gravar?'. Em EI a série vira CHZZZEIXXXXXX, somem placa/mosfet/seeds e o passo é só 'Gravar firmware' (esptool --chip esp32c6, 4 offsets do ESP-IDF: 0x0 bootloader · 0x8000 partições · 0xF000 otadata · 0x20000 app, com --erase-all — chip reusado sai limpo e cai em provisionamento). ⚠️ O pino de modo download da EI 1.5 é o BOOT (GPIO9), não o GPIO0 da CI. Depois de gravada ela anuncia CHAVIEGPI no Bluetooth. Bônus: o destaque de 'passo ativo' agora funciona também nos fluxos CI/EI. · Bancada v2.33.0: (1) a gravação da CI agora APAGA O FLASH INTEIRO antes de gravar (esptool --erase-all). Sem isso, um chip REUSADO mantinha o Wi-Fi antigo no NVS, o firmware tentava conectar numa rede ausente e NUNCA caía em provisionamento — a CI sumia do scan BLE do app E do broker (caso de campo 09/09: 7 CIs limpas instalaram, as reusadas não apareciam). Agora todo chip sai limpo → provisionamento no 1º boot. O OTA NÃO faz esse erase (só grava a partição do app, preserva Wi-Fi/senha/série). (2) Firmware da CI embutido atualizado para v423 (guarda o nº de série no NVS via config|serie e reporta no heartbeat; core auto-nomeia). · Bancada v2.32.0: agora grava também a CONEXÃO INTELIGENTE (CI, ESP32) por cabo USB-TTL — no início escolha 'FI ou CI?'. Em CI a série vira CHZZZCIXXXXX, some placa/mosfet/pino e seeds, e o passo é só 'Gravar firmware' (esptool, 4 offsets). Serve para terceirizar a gravação da CI. · v2.30.1: o resgate por Bluetooth agora dá VEREDITO. Caso de campo (04/09, CH003FI003027): a conexão religou e o chip seguiu mudo no cabo — faltava saber de que lado está o defeito. Depois de conectar, a bancada manda TST-PING pelo rádio: PONG = a placa está VIVA e energizada, então falha no cabo é 100% CONTATO físico do ISP (RESET/SCK/MISO/MOSI/GND no berço, pino 1 invertido, gravador) — o log agora diz isso com todas as letras e inocenta a placa. Sem PONG = lê BEFC/AFTC/PIO8/PWRM do módulo pelo ar (ficam no log para diagnóstico remoto) e ergue o PIO8 na marra (AT+PIO81, não persistente — não bricka), cobrindo placa cujo gate não está no AFTC; pinga de novo e registra o veredito. Espera pós-conexão subiu de 1s para 3s (step-up + boot). · Firmware v2.28.0 embutido (inalterado)."
 GITHUB_REPO = "Chavi-team/firmware-imovies-julho-2026"
 # O repo acima é PRIVADO → a API de releases dá 404 sem token. Então a checagem de
 # atualização lê um BEACON PÚBLICO (repo Chavi-team/chavi-bancada-latest, latest.json)
@@ -515,16 +533,62 @@ class Cabo:
         return [(p.device, f"{p.device} — {p.description or ''}".strip())
                 for p in lp.comports()]
 
+    # USB nativo do ESP32 (Serial/JTAG embutido no próprio chip): VID da
+    # Espressif. A EI 1.5 (ESP32-C6) tem conector USB-C NA PLACA — não precisa
+    # de conversor USB-TTL. No Windows essa porta se apresenta como
+    # "USB JTAG/serial debug unit"; no macOS/Linux, como `usbmodem`/`ttyACM`.
+    VID_ESPRESSIF = 0x303A
+    _CHAVES_CONVERSOR = ("usbserial", "usbmodem", "cp210", "ch340", "ch910",
+                         "ftdi", "pl2303", "wch", "slab")
+    _CHAVES_USB_NATIVO = ("jtag", "espressif", "ttyacm", "usb single serial")
+
     @staticmethod
-    def porta_provavel():
+    def _e_usb_nativo(p):
+        hay = f"{p.device} {p.description} {p.manufacturer}".lower()
+        return getattr(p, "vid", None) == Cabo.VID_ESPRESSIF or any(
+            k in hay for k in Cabo._CHAVES_USB_NATIVO)
+
+    @staticmethod
+    def porta_e_nativa(device):
+        """`True` se este device é o USB da própria placa (ESP32 nativo)."""
         import serial.tools.list_ports as lp
-        chaves = ("usbserial", "usbmodem", "cp210", "ch340", "ch910",
-                  "ftdi", "pl2303", "wch", "slab")
         for p in lp.comports():
-            hay = f"{p.device} {p.description} {p.manufacturer}".lower()
-            if any(k in hay for k in chaves):
-                return p.device
-        return None
+            if p.device == device:
+                return Cabo._e_usb_nativo(p)
+        return False
+
+    @staticmethod
+    def portas():
+        import serial.tools.list_ports as lp
+        out = []
+        for p in lp.comports():
+            marca = " (USB da placa)" if Cabo._e_usb_nativo(p) else ""
+            out.append((p.device, f"{p.device} — {p.description or ''}{marca}".strip()))
+        return out
+
+    @staticmethod
+    def porta_provavel(preferir_usb_nativo=False):
+        """A porta mais provável do que está no berço.
+
+        ⚠️ 18/09/2026: a heurística só conhecia CONVERSORES USB-TTL (CP210x,
+        CH340, FTDI…) porque FI e CI só têm UART. A **EI 1.5 grava pelo USB-C da
+        própria placa** — o ESP32-C6 tem USB Serial/JTAG nativo —, e essa porta
+        não casa com nenhuma daquelas chaves: a bancada dizia "Cabo USB-TTL não
+        encontrado" com o cabo plugado e funcionando. Agora as duas famílias são
+        reconhecidas, e quem grava a EI prefere a porta nativa quando as duas
+        estão presentes (um conversor esquecido na mesa não rouba a vez).
+        """
+        import serial.tools.list_ports as lp
+        nativas, conversores = [], []
+        for p in lp.comports():
+            if Cabo._e_usb_nativo(p):
+                nativas.append(p.device)
+            else:
+                hay = f"{p.device} {p.description} {p.manufacturer}".lower()
+                if any(k in hay for k in Cabo._CHAVES_CONVERSOR):
+                    conversores.append(p.device)
+        ordem = (nativas + conversores) if preferir_usb_nativo else (conversores + nativas)
+        return ordem[0] if ordem else None
 
     def conectar(self, porta):
         import serial
@@ -1383,12 +1447,26 @@ def act_gravar_ei(serial, porta=None):
         LOG("Firmware da EI 1.5 não embutido no pacote (falta: " + ", ".join(faltando) +
             "). Regere packaging/firmware-ei (idf.py build no firmware-ei-novo).", "err")
         STATUS("gravar-ei", "fail"); return False
-    porta = porta or Cabo.porta_provavel()
-    if not porta:
-        LOG("Cabo USB-TTL não encontrado. Ligue o conversor e confira o BOOT "
-            "(GPIO9)→GND ao energizar (modo gravação), TX↔RX cruzados e 3,3 V.", "err")
+    ok_c6, versao_esptool = _esptool_suporta_c6()
+    if not ok_c6:
+        LOG(f"✗ O esptool disponível ({versao_esptool}) não conhece o ESP32-C6 — "
+            "o suporte entrou na 4.6. NADA foi gravado. Atualize o esptool "
+            "(pacote Windows: embarque um esptool ≥ 4.6 em packaging/esptool/; "
+            "no dev: `pip install -U esptool`).", "err")
         STATUS("gravar-ei", "fail"); return False
-    LOG(f"Gravando firmware da EI 1.5 (ESP32-C6) em {serial or 'EI'} pela porta {porta}. "
+
+    # A EI 1.5 tem USB-C na própria placa (Serial/JTAG nativo do C6) — esse é o
+    # caminho normal de gravação. O conversor USB-TTL continua valendo para
+    # quem preferir a UART, por isso a porta nativa é só PREFERIDA, não exigida.
+    porta = porta or Cabo.porta_provavel(preferir_usb_nativo=True)
+    if not porta:
+        LOG("Nenhuma porta serial encontrada. Ligue o cabo USB-C na EI 1.5 (ou o "
+            "conversor USB-TTL) e confira: em Windows a placa aparece como "
+            "'USB JTAG/serial debug unit'; se nada aparecer, o cabo pode ser só de "
+            "carga (sem dados) — troque por um cabo de dados.", "err")
+        STATUS("gravar-ei", "fail"); return False
+    LOG(f"Gravando firmware da EI 1.5 (ESP32-C6) em {serial or 'EI'} pela porta {porta}"
+        f"{' — USB da própria placa' if Cabo.porta_e_nativa(porta) else ''}. "
         "NÃO mexa no cabo agora.", "hi")
     # `--erase-all` pelo MESMO motivo da CI (caso de campo 09/09): a EI 1.5
     # guarda Wi-Fi/senha no NVS — num chip REUSADO, sem apagar tudo, o firmware
@@ -1412,6 +1490,15 @@ def act_gravar_ei(serial, porta=None):
                 "EI 1.5 (parece ESP32 clássico — EI 1.0 ou CI). NADA foi gravado. "
                 "Confira o modelo da placa: a opção 'EI 1.5' grava SOMENTE a "
                 "fechadura EI 1.5.", "err")
+        elif Cabo.porta_e_nativa(porta):
+            # Pelo USB-C da placa não existe TX/RX nem 3,3 V para conferir: as
+            # causas reais são outras, e repetir a receita da UART só faz o
+            # operador procurar defeito onde não há.
+            LOG("✗ Gravação da EI 1.5 falhou pelo USB da placa. Confira, nesta ordem: "
+                "(1) segure o botão BOOT (GPIO9) e toque o RESET — solte o BOOT depois — "
+                "para entrar em modo download; (2) o cabo precisa ser de DADOS (cabo só "
+                "de carga enumera nada); (3) feche qualquer monitor serial aberto nessa "
+                "porta; (4) alimente a placa.", "err")
         else:
             LOG("✗ Gravação da EI 1.5 falhou. Confira: BOOT (GPIO9) em GND ao ligar "
                 "(modo download), TX↔RX CRUZADOS, alimentação 3,3 V e a porta escolhida.", "err")
